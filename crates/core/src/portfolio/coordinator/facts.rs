@@ -276,8 +276,8 @@ const SPLIT_QUOTES_BEFORE_DAYS: i64 = 10;
 const SPLIT_QUOTES_AFTER_DAYS: i64 = 31;
 
 /// Quotes of one window: every observation from `start` through `end`, plus
-/// each asset's last observation before `start`, so a price carries into the
-/// window exactly as it would through the whole range.
+/// each asset's last observation before `start` (the sparse read's seed), so a
+/// price carries into the window exactly as it would through the whole range.
 pub fn window_quotes(
     deps: &FactSources,
     asset_ids: &[String],
@@ -287,20 +287,13 @@ pub fn window_quotes(
     if asset_ids.is_empty() || start > end {
         return Ok(Vec::new());
     }
-    let mut rows: Vec<crate::quotes::Quote> = match start.pred_opt() {
-        Some(before) => deps
-            .quotes
-            .get_latest_quotes_as_of(asset_ids, before)?
-            .into_values()
-            .collect(),
-        None => Vec::new(),
-    };
     let symbols: HashSet<String> = asset_ids.iter().cloned().collect();
-    rows.extend(
-        deps.quotes
-            .get_sparse_quotes_in_range(&symbols, start, end)?,
-    );
-    Ok(rows.iter().map(raw_quote).collect())
+    Ok(deps
+        .quotes
+        .get_sparse_quotes_in_range(&symbols, start, end)?
+        .iter()
+        .map(raw_quote)
+        .collect())
 }
 
 pub struct LoadedFacts {
