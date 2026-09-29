@@ -19,6 +19,7 @@ use crate::diagnostics::{Diagnostic, DiagnosticCode};
 use crate::error::EngineError;
 use crate::model::*;
 use crate::resolve::FxResolver;
+use crate::scope::transfer_closure;
 
 /// Positions below this effective quantity are treated as closed.
 const QUANTITY_THRESHOLD: Decimal = Decimal::from_parts(1, 0, 0, false, 8);
@@ -35,6 +36,20 @@ pub fn project(
     fx: &FxResolver<'_>,
     start: Option<ProjectionState>,
     range: DateRange,
+) -> Result<ProjectionBundle, EngineError> {
+    project_accounts(ledger, facts, fx, start, range, None)
+}
+
+/// [`project`] of `accounts` and every account they share a transfer pair
+/// with, transitively (a pair's lots and flows need both legs); `None` folds
+/// every account. A later window must be folded with the same accounts.
+pub fn project_accounts(
+    ledger: &CompiledLedger,
+    facts: &CanonicalFacts,
+    fx: &FxResolver<'_>,
+    start: Option<ProjectionState>,
+    range: DateRange,
+    accounts: Option<&BTreeSet<AccountId>>,
 ) -> Result<ProjectionBundle, EngineError> {
     if range.start > range.end {
         return Err(EngineError::InvertedRange {
@@ -90,8 +105,12 @@ pub fn project(
     // keyframe: chunking must not move or duplicate keyframes (I2).
     let mut eligible_from: BTreeMap<&AccountId, NaiveDate> = BTreeMap::new();
     let mut fresh_first_day: BTreeMap<&AccountId, NaiveDate> = BTreeMap::new();
+    let scope = accounts.map(|requested| transfer_closure(facts, requested.iter().cloned()));
     for (id, account) in &facts.accounts {
         if account.archived || account.tracking == TrackingMode::Holdings {
+            continue;
+        }
+        if scope.as_ref().is_some_and(|scope| !scope.contains(id)) {
             continue;
         }
         if state.accounts.contains_key(id) {

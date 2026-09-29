@@ -205,6 +205,13 @@ pub(super) async fn execute(context: &RunContext, plan: &Plan) -> Result<RunComp
         return Ok(RunCompletion::default());
     };
     let folds = !plan.refold.is_empty();
+    // Only the refolded accounts fold (the kernel adds their transfer closure).
+    let folded_accounts: Arc<BTreeSet<AccountId>> = Arc::new(
+        plan.refold
+            .keys()
+            .map(|id| AccountId::new(id.as_str()))
+            .collect(),
+    );
     let as_of = resolved.facts.policy().as_of;
     let range = if folds {
         resolved.range()
@@ -252,6 +259,7 @@ pub(super) async fn execute(context: &RunContext, plan: &Plan) -> Result<RunComp
                     .unwrap_or_default()
             };
             FoldStep {
+                accounts: Arc::clone(&folded_accounts),
                 state: state.take(),
                 seed,
                 active: refold,
@@ -415,9 +423,10 @@ fn row_end(resolved: &Resolved, window: DateRange) -> Option<NaiveDate> {
     (window.end < resolved.facts.policy().as_of).then_some(window.end)
 }
 
-/// A window of the fold: the state carried in, the seeds of the accounts the
-/// window writes, and those writers.
+/// A window of the fold: the accounts folded, the state carried in, the seeds
+/// of the accounts the window writes, and those writers.
 struct FoldStep {
+    accounts: Arc<BTreeSet<AccountId>>,
     state: Option<ProjectionState>,
     seed: BTreeMap<AccountId, AccountState>,
     active: Vec<Writer>,
@@ -508,8 +517,14 @@ fn run_window(
     };
     let fold = match fold {
         Some(step) => {
-            let bundle =
-                engine::project(&resolved.ledger, &resolved.facts, &fx, step.state, window)?;
+            let bundle = engine::project_accounts(
+                &resolved.ledger,
+                &resolved.facts,
+                &fx,
+                step.state,
+                window,
+                Some(&step.accounts),
+            )?;
             Some((bundle, step.seed, step.active))
         }
         None => None,

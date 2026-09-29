@@ -11,8 +11,8 @@ use serde_json::Value;
 use support::*;
 use wealthfolio_portfolio_engine::model::*;
 use wealthfolio_portfolio_engine::{
-    aggregate_scope, project, value_window, DiagnosticCode, QuoteSurface, Resolved,
-    ResolvedSurfaces, ValueInputs, Window,
+    aggregate_scope, project, project_accounts, value_window, DiagnosticCode, QuoteSurface,
+    Resolved, ResolvedSurfaces, ValueInputs, Window,
 };
 
 const DUST: Decimal = Decimal::from_parts(1, 0, 0, false, 8);
@@ -130,6 +130,115 @@ fn p_chunk_partitions_are_equivalent() {
             let right = serde_json::to_value(&one_shot.series).unwrap();
             assert_same(&scenario.id, "P-RESOLVE (chunked value)", &left, &right);
         }
+    }
+}
+
+/// P-SCOPE: folding some accounts (the kernel adds their transfer closure)
+/// yields exactly their part of the fold of every account, and reports
+/// nothing the full fold does not.
+#[test]
+fn p_scope_a_scoped_fold_is_its_part_of_the_full_fold() {
+    for scenario in corpus() {
+        let pipeline = Pipeline::from_scenario(&scenario);
+        let fx = pipeline.fx();
+        let full_diagnostics = bundle_view(&pipeline.bundle)["diagnostics"].clone();
+        for (id, account) in pipeline.facts().accounts() {
+            let requested = BTreeSet::from([id.clone()]);
+            let scoped = project_accounts(
+                pipeline.ledger(),
+                pipeline.facts(),
+                &fx,
+                None,
+                pipeline.range(),
+                Some(&requested),
+            )
+            .expect("scoped fold");
+            let folded: BTreeSet<AccountId> = scoped.final_state.accounts.keys().cloned().collect();
+            if !account.archived && account.tracking != TrackingMode::Holdings {
+                assert!(folded.contains(id), "{}: P-SCOPE folds {id}", scenario.id);
+            }
+            assert_same(
+                &scenario.id,
+                &format!("P-SCOPE {id}"),
+                &bundle_view(&restrict(&scoped, &folded, pipeline.facts())),
+                &bundle_view(&restrict(&pipeline.bundle, &folded, pipeline.facts())),
+            );
+            let full: BTreeSet<String> = full_diagnostics
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|d| d.to_string())
+                .collect();
+            for diagnostic in bundle_view(&scoped)["diagnostics"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                assert!(
+                    full.contains(&diagnostic.to_string()),
+                    "{}: P-SCOPE {id} reports {diagnostic} the full fold does not",
+                    scenario.id
+                );
+            }
+        }
+    }
+}
+
+/// `bundle` restricted to `accounts`: their keyframes, states, in-flight
+/// transfers, disposals, closures and the diagnostics of their activities.
+fn restrict(
+    bundle: &ProjectionBundle,
+    accounts: &BTreeSet<AccountId>,
+    facts: &CanonicalFacts,
+) -> ProjectionBundle {
+    let owned = facts
+        .activities()
+        .iter()
+        .filter(|a| accounts.contains(&a.account));
+    let activities: BTreeSet<&str> = owned.clone().map(|a| a.id.as_str()).collect();
+    let groups: BTreeSet<&str> = owned.filter_map(|a| a.source_group_id.as_deref()).collect();
+    ProjectionBundle {
+        keyframes: bundle
+            .keyframes
+            .iter()
+            .filter(|(id, _)| accounts.contains(*id))
+            .map(|(id, frames)| (id.clone(), frames.clone()))
+            .collect(),
+        final_state: ProjectionState {
+            date: bundle.final_state.date,
+            accounts: bundle
+                .final_state
+                .accounts
+                .iter()
+                .filter(|(id, _)| accounts.contains(*id))
+                .map(|(id, state)| (id.clone(), state.clone()))
+                .collect(),
+            transfer_cache: bundle
+                .final_state
+                .transfer_cache
+                .iter()
+                .filter(|(group, _)| groups.contains(group.as_str()))
+                .map(|(group, lots)| (group.clone(), lots.clone()))
+                .collect(),
+        },
+        disposals: bundle
+            .disposals
+            .iter()
+            .filter(|d| accounts.contains(&d.account))
+            .cloned()
+            .collect(),
+        closures: bundle
+            .closures
+            .iter()
+            .filter(|c| accounts.contains(&c.account))
+            .cloned()
+            .collect(),
+        diagnostics: bundle
+            .diagnostics
+            .iter()
+            .filter(|d| activities.contains(d.source.as_str()))
+            .cloned()
+            .collect(),
     }
 }
 

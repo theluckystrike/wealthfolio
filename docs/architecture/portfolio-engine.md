@@ -153,9 +153,10 @@ with `@all` from the beginning, so the first run rebuilds everything.
 | Facts changed (the account, a partner, an asset, FX, policy) | **Refold**  | fold from the first activity; rewrite rows from the day                |
 
 Holdings-mode accounts only revalue: their facts are observed snapshots. A
-refold is not resumed from a stored state: folding from the first activity in
-memory, without valuing or writing the windows before the stale day, is cheap
-next to the writes it avoids, and needs no checkpoint table.
+refold is not resumed from a stored state: folding the refolded accounts (and
+their transfer partners) from the first activity in memory, without valuing or
+writing the windows before the stale day, is cheap next to the writes it avoids,
+and needs no checkpoint table. Accounts that only revalue are not folded.
 
 **Windows.** A run walks its range in one pass of windows (calendar years), cut
 at each day an account starts rewriting. The fold carries its state from window
@@ -390,6 +391,13 @@ pub fn project(
     fx: &FxResolver<'_>,             // acquisition-date FX for lot basis
     start: Option<ProjectionState>,  // None = from genesis
     range: DateRange,
+) -> Result<ProjectionBundle, EngineError>;
+
+/// `project` of some accounts and their transfer closure (a pair's lots and
+/// flows need both legs); the part of the full fold they own (P-SCOPE).
+pub fn project_accounts(
+    /* project's inputs */
+    accounts: Option<&BTreeSet<AccountId>>,
 ) -> Result<ProjectionBundle, EngineError>;
 
 /// 5. Price the states from the resolved surfaces; report per-day status and

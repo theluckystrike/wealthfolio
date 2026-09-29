@@ -34,16 +34,14 @@ pub struct FactsRequest {
     pub range: DateRange,
 }
 
-pub fn facts_needed(facts: &CanonicalFacts, scope: &[AccountId], range: DateRange) -> FactsRequest {
-    let policy = &facts.policy;
-    let base = policy
-        .major_currency(policy.base_currency.as_str())
-        .to_string();
-
-    // Transfer closure, transitively: every account sharing a pair with an
-    // account already in the closure, until no new account appears. A fold
-    // must cover the whole chain (A -> B -> C) or B's second pair has one leg.
-    let mut accounts: BTreeSet<AccountId> = scope.iter().cloned().collect();
+/// Transfer closure, transitively: every account sharing a pair with an
+/// account already in the closure, until no new account appears. A fold must
+/// cover the whole chain (A -> B -> C) or B's second pair has one leg.
+pub(crate) fn transfer_closure(
+    facts: &CanonicalFacts,
+    scope: impl IntoIterator<Item = AccountId>,
+) -> BTreeSet<AccountId> {
+    let mut accounts: BTreeSet<AccountId> = scope.into_iter().collect();
     loop {
         let before = accounts.len();
         for activity in &facts.activities {
@@ -56,9 +54,18 @@ pub fn facts_needed(facts: &CanonicalFacts, scope: &[AccountId], range: DateRang
             }
         }
         if accounts.len() == before {
-            break;
+            return accounts;
         }
     }
+}
+
+pub fn facts_needed(facts: &CanonicalFacts, scope: &[AccountId], range: DateRange) -> FactsRequest {
+    let policy = &facts.policy;
+    let base = policy
+        .major_currency(policy.base_currency.as_str())
+        .to_string();
+
+    let accounts = transfer_closure(facts, scope.iter().cloned());
 
     let incomplete_groups: BTreeSet<String> = facts
         .activities

@@ -34,7 +34,7 @@ pub use measure::{
 };
 pub use normalize::{normalize, normalize_quotes, Normalized};
 pub use project::lot_records;
-pub use project::project;
+pub use project::{project, project_accounts};
 pub use resolve::{
     resolve_surfaces, FxResolver, FxSurface, QuoteSurface, ResolvedSurfaces, SplitEvent,
 };
