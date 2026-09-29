@@ -1730,15 +1730,25 @@ fn _assert_instrument_type_in_scope(_: Option<InstrumentType>) {}
 // ------------------------------------------------------------ projections
 
 use crate::portfolio::projection::{
-    AccountProjection, ProjectionCheckpoint, ProjectionStoreTrait, ProjectionWatermark,
+    MarkerScope, ProjectionMarker, ProjectionStoreTrait, RejectedActivity, RunCompletion,
+    WindowRows, GENESIS,
 };
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Default)]
+struct MarkerRow {
+    dirty_from: Option<NaiveDate>,
+    version: i64,
+    rejections: Vec<RejectedActivity>,
+}
+
 /// Projection store over the other doubles (not transactional; tests only).
+/// The SQLite store's markers come from triggers; here tests `mark` what
+/// they change in the doubles.
 pub struct InMemoryProjectionStore {
-    watermarks: RwLock<HashMap<String, ProjectionWatermark>>,
-    checkpoints: RwLock<HashMap<String, Vec<ProjectionCheckpoint>>>,
-    /// Number of upcoming persists that fail (retry tests).
+    markers: RwLock<BTreeMap<String, MarkerRow>>,
+    valued: RwLock<HashSet<String>>,
+    /// Number of upcoming writes that fail (retry tests).
     failures_to_inject: std::sync::atomic::AtomicUsize,
     snapshots: Arc<dyn SnapshotRepositoryTrait>,
     lots: Arc<dyn LotRepositoryTrait>,
@@ -1746,47 +1756,39 @@ pub struct InMemoryProjectionStore {
 }
 
 impl InMemoryProjectionStore {
+    /// Starts like a migrated database: everything stale.
     pub fn new(
         snapshots: Arc<dyn SnapshotRepositoryTrait>,
         lots: Arc<dyn LotRepositoryTrait>,
         valuations: Arc<dyn ValuationRepositoryTrait>,
     ) -> Self {
-        Self {
-            watermarks: RwLock::new(HashMap::new()),
-            checkpoints: RwLock::new(HashMap::new()),
+        let store = Self {
+            markers: RwLock::new(BTreeMap::new()),
+            valued: RwLock::new(HashSet::new()),
             failures_to_inject: std::sync::atomic::AtomicUsize::new(0),
             snapshots,
             lots,
             valuations,
-        }
+        };
+        store.mark(MarkerScope::All, GENESIS);
+        store
     }
 
-    /// Makes the next `count` persists fail with a storage error.
+    /// Makes the next `count` writes fail with a storage error.
     pub fn fail_next_persists(&self, count: usize) {
         self.failures_to_inject
             .store(count, std::sync::atomic::Ordering::SeqCst);
     }
-}
 
-#[async_trait]
-impl ProjectionStoreTrait for InMemoryProjectionStore {
-    fn get_watermarks(&self, account_ids: &[String]) -> Result<Vec<ProjectionWatermark>> {
-        let watermarks = self.watermarks.read().unwrap_or_else(|p| p.into_inner());
-        Ok(account_ids
-            .iter()
-            .filter_map(|id| watermarks.get(id).cloned())
-            .collect())
+    /// What a SQLite trigger records for a fact change.
+    pub fn mark(&self, scope: MarkerScope, from: NaiveDate) {
+        let mut markers = self.markers.write().unwrap_or_else(|p| p.into_inner());
+        let row = markers.entry(scope.key()).or_default();
+        row.dirty_from = Some(row.dirty_from.map_or(from, |day| day.min(from)));
+        row.version += 1;
     }
 
-    fn get_checkpoints(&self, account_ids: &[String]) -> Result<Vec<ProjectionCheckpoint>> {
-        let checkpoints = self.checkpoints.read().unwrap_or_else(|p| p.into_inner());
-        Ok(account_ids
-            .iter()
-            .flat_map(|id| checkpoints.get(id).cloned().unwrap_or_default())
-            .collect())
-    }
-
-    async fn persist_account_projection(&self, projection: AccountProjection) -> Result<()> {
+    fn injected_failure(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
         let pending = self.failures_to_inject.load(Ordering::SeqCst);
         if pending > 0 {
@@ -1795,92 +1797,160 @@ impl ProjectionStoreTrait for InMemoryProjectionStore {
                 "injected projection persist failure".to_string(),
             ));
         }
-        let account_id = projection.account_id.clone();
-        let since = projection.since;
-        if let Some(snapshots) = &projection.snapshots {
-            match since {
-                Some(since) => {
-                    let stale: Vec<NaiveDate> = self
-                        .snapshots
-                        .get_snapshots_by_account(&account_id, None, None)?
-                        .into_iter()
-                        .filter(|s| {
-                            s.source == SnapshotSource::Calculated && s.snapshot_date >= since
-                        })
-                        .map(|s| s.snapshot_date)
-                        .collect();
-                    self.snapshots
-                        .delete_snapshots_for_account_and_dates(&account_id, &stale)
-                        .await?;
-                    self.snapshots.save_snapshots(snapshots).await?;
-                }
-                None => {
-                    self.snapshots
-                        .overwrite_all_snapshots_for_account(&account_id, snapshots)
-                        .await?;
-                }
-            }
-        }
-        if let Some(lots) = &projection.lots {
-            let mut rows: Vec<LotRecord> = match since {
-                Some(since) => self
-                    .lots
-                    .get_all_lots_for_account(&account_id)
-                    .await?
-                    .into_iter()
-                    .filter(|lot| {
-                        lot.is_closed
-                            && lot
-                                .close_date
-                                .as_deref()
-                                .and_then(|d| d.parse::<NaiveDate>().ok())
-                                .is_some_and(|d| d < since)
-                    })
-                    .collect(),
-                None => Vec::new(),
-            };
-            rows.extend(lots.iter().cloned());
-            self.lots
-                .replace_lots_for_account(&account_id, &rows)
-                .await?;
-        }
-        if let Some(disposals) = &projection.disposals {
-            let mut rows: Vec<LotDisposal> = match since {
-                Some(since) => self
-                    .lots
-                    .get_lot_disposals_for_account(&account_id)
-                    .await?
-                    .into_iter()
-                    .filter(|d| {
-                        d.disposal_date
-                            .parse::<NaiveDate>()
-                            .is_ok_and(|date| date < since)
-                    })
-                    .collect(),
-                None => Vec::new(),
-            };
-            rows.extend(disposals.iter().cloned());
-            self.lots
-                .sync_lot_disposals_for_account(&account_id, &[], &rows, true)
-                .await?;
-        }
-        self.valuations
-            .replace_valuations_for_account(&account_id, since, &projection.valuations)
-            .await?;
-        if let Some(checkpoints) = &projection.checkpoints {
-            let mut store = self.checkpoints.write().unwrap_or_else(|p| p.into_inner());
-            let rows = store.entry(account_id.clone()).or_default();
-            match since {
-                Some(since) => rows.retain(|c| c.date < since),
-                None => rows.clear(),
-            }
-            rows.extend(checkpoints.iter().cloned());
-            rows.sort_by_key(|c| c.date);
-        }
-        self.watermarks
-            .write()
+        Ok(())
+    }
+}
+
+fn in_window(day: NaiveDate, start: NaiveDate, end: Option<NaiveDate>) -> bool {
+    day >= start && end.is_none_or(|end| day <= end)
+}
+
+#[async_trait]
+impl ProjectionStoreTrait for InMemoryProjectionStore {
+    fn pending_markers(&self) -> Result<Vec<ProjectionMarker>> {
+        let markers = self.markers.read().unwrap_or_else(|p| p.into_inner());
+        Ok(markers
+            .iter()
+            .filter_map(|(key, row)| {
+                Some(ProjectionMarker {
+                    scope: MarkerScope::parse(key),
+                    dirty_from: row.dirty_from?,
+                    version: row.version,
+                })
+            })
+            .collect())
+    }
+
+    fn last_valued_days(&self) -> Result<HashMap<String, NaiveDate>> {
+        let valued: Vec<String> = self
+            .valued
+            .read()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(account_id, projection.watermark);
+            .iter()
+            .cloned()
+            .collect();
+        let mut days = HashMap::new();
+        for account in valued {
+            if let Some(last) = self
+                .valuations
+                .get_historical_valuations(&account, None, None)?
+                .iter()
+                .map(|v| v.valuation_date)
+                .max()
+            {
+                days.insert(account, last);
+            }
+        }
+        Ok(days)
+    }
+
+    fn rejections(&self, account_ids: &[String]) -> Result<Vec<RejectedActivity>> {
+        let markers = self.markers.read().unwrap_or_else(|p| p.into_inner());
+        Ok(account_ids
+            .iter()
+            .filter_map(|id| markers.get(id))
+            .flat_map(|row| row.rejections.clone())
+            .collect())
+    }
+
+    async fn write_window(&self, rows: Vec<WindowRows>) -> Result<()> {
+        self.injected_failure()?;
+        for window in rows {
+            let account = window.account_id.clone();
+            if let Some(snapshots) = &window.snapshots {
+                let stale: Vec<NaiveDate> = self
+                    .snapshots
+                    .get_snapshots_by_account(&account, None, None)?
+                    .into_iter()
+                    .filter(|s| {
+                        s.source == SnapshotSource::Calculated
+                            && in_window(s.snapshot_date, window.start, window.end)
+                    })
+                    .map(|s| s.snapshot_date)
+                    .collect();
+                self.snapshots
+                    .delete_snapshots_for_account_and_dates(&account, &stale)
+                    .await?;
+                self.snapshots.save_snapshots(snapshots).await?;
+            }
+            let mut kept: Vec<_> = self
+                .valuations
+                .get_historical_valuations(&account, None, None)?
+                .into_iter()
+                .filter(|v| !in_window(v.valuation_date, window.start, window.end))
+                .collect();
+            kept.extend(window.valuations);
+            self.valuations
+                .replace_valuations_for_account(&account, None, &kept)
+                .await?;
+            self.valued
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(account);
+        }
+        Ok(())
+    }
+
+    async fn complete_run(&self, completion: RunCompletion) -> Result<()> {
+        self.injected_failure()?;
+        for book in completion.lot_books {
+            let account = &book.account_id;
+            let parse = |raw: &str| raw.parse::<NaiveDate>().ok();
+            let mut lots: Vec<LotRecord> = self
+                .lots
+                .get_all_lots_for_account(account)
+                .await?
+                .into_iter()
+                .filter(|lot| {
+                    lot.is_closed
+                        && lot
+                            .close_date
+                            .as_deref()
+                            .and_then(parse)
+                            .is_some_and(|closed| closed < book.since)
+                })
+                .collect();
+            lots.extend(book.lots);
+            self.lots.replace_lots_for_account(account, &lots).await?;
+            let mut disposals: Vec<LotDisposal> = self
+                .lots
+                .get_lot_disposals_for_account(account)
+                .await?
+                .into_iter()
+                .filter(|d| parse(&d.disposal_date).is_some_and(|day| day < book.since))
+                .collect();
+            disposals.extend(book.disposals);
+            self.lots
+                .sync_lot_disposals_for_account(account, &[], &disposals, true)
+                .await?;
+        }
+        let mut markers = self.markers.write().unwrap_or_else(|p| p.into_inner());
+        for (account, rejected) in completion.rejections {
+            markers.entry(account).or_default().rejections = rejected;
+        }
+        for marker in completion.consumed {
+            let key = marker.scope.key();
+            if markers
+                .get(&key)
+                .is_some_and(|row| row.version == marker.version)
+            {
+                match marker.scope {
+                    MarkerScope::Account(_) => {
+                        if let Some(row) = markers.get_mut(&key) {
+                            row.dirty_from = None;
+                        }
+                    }
+                    _ => {
+                        markers.remove(&key);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn invalidate(&self, scope: MarkerScope, from: NaiveDate) -> Result<()> {
+        self.mark(scope, from);
         Ok(())
     }
 }

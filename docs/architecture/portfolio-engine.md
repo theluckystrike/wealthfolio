@@ -53,13 +53,14 @@ rebuilds safe to run by default.
 
 ### Scope boundaries
 
-- No event sourcing, CQRS, message brokers, durable queues or dirty-ledger
-  tables. Consistency is re-derived from facts on demand (§3.3).
+- No event sourcing, CQRS, message brokers or durable queues. What is stale is
+  recorded where facts change: SQLite triggers write markers to one table,
+  `projection_state` (§3.3).
 - No microservices, actor frameworks, dependency-injection containers or
   incremental-computation frameworks. This stays a modular monolith.
 - No new formats for the existing read models: sparse keyframes, dense daily
-  valuation rows, lot and disposal rows keep their shapes. Two additive tables
-  support the lifecycle: `projection_watermarks` and `projection_checkpoints`.
+  valuation rows, lot and disposal rows keep their shapes. One additive table
+  supports the lifecycle: `projection_state`.
 - Market-data fetching, broker sync, device sync and the frontend are outside
   this architecture.
 - Cost basis is FIFO. LIFO and pooled average cost are designed for but not
@@ -122,56 +123,64 @@ facts is kernel.
 **Persistence shapes.** Snapshots are sparse keyframes (first day and activity
 days); valuations are dense daily rows. The kernel emits the dense series and
 the shell keeps the existing cadence. Lots and disposals are read models derived
-from the same projection state. Each account's rows and its watermark are
-written in **one transaction**, so a projection never half-lands.
+from the same projection state. Rows are written one window at a time (§3.3);
+the lot book, the rejections and the cleared markers are committed together at
+the end of a run.
 
 ### 3.3 Recalculation lifecycle
 
-Hosts suspend, close and restart mid-work. Rather than durable messaging, the
-architecture re-derives what is stale from the facts themselves.
+Hosts suspend, close and restart mid-work, and mobile apps are killed between a
+write and its recalculation. So what is stale is recorded where facts change, in
+the same transaction.
 
-**Facts fingerprint.** Each account carries a `projection_watermarks` row: the
-fingerprint of every fact source the kernel read, the day the projection covers,
-and when it ran. The fingerprint contains the account's activity count and last
-edit, the same for its transfer counterparties, the account row and its
-accounting settings, the referenced asset rows, a content hash of observed
-snapshots, the policy (base currency, timezone), and **content hashes** of the
-quotes and FX rates read. Market data is hashed by day and value, not by row
-timestamp, so a provider re-upserting identical closes does not make every
-account stale.
+**Markers.** Triggers write rows of `projection_state`: an account id (its
+activities, accounting settings or observed snapshots changed: refold it),
+`a:<asset>` (the asset's kind, quote currency, instrument type or contract
+multiplier changed: refold its holders), `q:<asset>` (its prices changed:
+revalue its holders) and `@all` (an FX rate, the base currency or the timezone
+changed: refold everything). Each carries the first stale day and a version
+every write bumps. An activity marks its account from the day before its UTC
+date (its local day is within a day of it) and its transfer partners from
+theirs. The projection's own calculated rows mark nothing. The migration starts
+with `@all` from the beginning, so the first run rebuilds everything.
 
-**Plans.** A job compares each account's current fingerprint against its
-watermark and picks the cheapest correct path:
+**Plans.** A job maps the markers onto accounts and picks one path per account:
 
-| Verdict                                                                         | Plan        | Work                                                              |
-| ------------------------------------------------------------------------------- | ----------- | ----------------------------------------------------------------- |
-| Fingerprint matches, projection covers today                                    | **Skip**    | nothing                                                           |
-| Only quotes, FX or the day moved                                                | **Revalue** | re-run `value` over stored keyframes; rewrite valuation rows only |
-| Facts changed and a checkpoint precedes the change                              | **Resume**  | fold from that checkpoint; replace rows from there on             |
-| No usable checkpoint, undated deletion, settings change, or an explicit rebuild | **Full**    | fold from the first activity                                      |
+| Verdict                                                      | Plan        | Work                                                                   |
+| ------------------------------------------------------------ | ----------- | ---------------------------------------------------------------------- |
+| Nothing marked, valuations reach today                       | —           | nothing is loaded                                                      |
+| Prices changed, or the day moved                             | **Revalue** | value stored keyframes (or observed snapshots) from the day; rows only |
+| Facts changed (the account, a partner, an asset, FX, policy) | **Refold**  | fold from the first activity; rewrite rows from the day                |
 
-**Checkpoints.** The fold runs in chunks; each chunk's end state is stored per
-account in `projection_checkpoints` (calendar year ends plus the last projected
-day), carrying the in-flight transfer cache so a paired transfer survives a
-chunk boundary. A resume rebuilds the closure's state from those rows and hands
-it to `project` as its starting state. Chunk equivalence (I2) is what makes this
-identical to a full fold.
+Holdings-mode accounts only revalue: their facts are observed snapshots. A
+refold is not resumed from a stored state: folding from the first activity in
+memory, without valuing or writing the windows before the stale day, is cheap
+next to the writes it avoids, and needs no checkpoint table.
 
-**Dating a change.** Activity events carry the earliest changed instant into the
-job, so a deletion — whose row no longer exists to date — can still resume.
-Edits and insertions are dated from their rows. An undated change falls back to
-a full fold.
+**Windows.** A run walks its range in windows (calendar years). Each window is
+folded from the previous window's state, valued from that state with the
+window's quotes plus each asset's last quote before it, and written before the
+next window is read, so memory holds one window plus the running state however
+long the history. Activities, FX rates and observed snapshots load whole; the
+provider-adjusted splits are resolved once from the quotes around each split.
+Window invariance (P-WIN) makes a windowed run equal to one run over the range.
 
-**Job discipline.** Jobs are serialised per account by lock, never skipped, so a
-later request always sees the facts it was raised for. In-process failures
-(storage, engine) retry with backoff; per-account validation failures are final
-and reported individually. Event batches debounce with a bounded maximum wait,
-so a sustained event stream cannot postpone work indefinitely.
+**Completion.** After the last window a run commits, in one transaction, the lot
+books of the refolded accounts (open lots and lots closed since the stale day),
+their disposals, the activities the fold rejected, and clears the markers it
+read, each only if its version is unchanged: a fact written during the run keeps
+its marker for the next one. A failed run clears nothing.
+
+**Job discipline.** Jobs run one at a time and are never skipped, so a later
+request always sees the markers left by the facts it was raised for. In-process
+failures (storage, engine) retry with backoff; per-account validation failures
+are final and reported individually. Event batches debounce with a bounded
+maximum wait, so a sustained event stream cannot postpone work indefinitely.
 
 **Entry points.** One idempotent consistency pass serves cold start, the
 frontend's return to the foreground, the periodic market-data sync, and
-device-sync apply. Stale accounts also surface in the health check with a repair
-action.
+device-sync apply. Stale accounts (pending markers, or valuations ending before
+today) also surface in the health check with a repair action.
 
 **Scoping.** Facts load by account and transfer group, transitively: a job reads
 its scope's transfer closure, never the whole activity table. Archived accounts
@@ -458,7 +467,10 @@ done and thrown away.
 - Inputs are data-complete. An unresolvable rate is a typed degradation and a
   diagnostic, never a fetch, a silent `rate = 1`, or an unconverted addition.
 - Chunking is the caller's right: `project` and `value` may run over sub-ranges
-  with the state folded forward. `resolve_surfaces` is never chunked.
+  with the state folded forward; `value_window` values a window from the state
+  before it. Quote surfaces may be windowed with each asset's last observation
+  before the window; FX surfaces and adjusted splits are resolved over the whole
+  range.
 - Per-activity atomicity: a rejected activity contributes a diagnostic and zero
   state mutation, never a partial application; the legs of a composite (DRIP:
   income then buy) are rejected together (EDGE-DRIP-01). Valuation and
@@ -597,7 +609,7 @@ Testable contract; the property suite (§5) encodes each one.
 - FX nearest-neighbour resolution may look forward in time. A valuation is
   deterministic given the surface, and the surface is part of the facts; a
   late-arriving rate changing history is therefore a recalculation trigger for
-  the shell (the market-data fingerprint), not a kernel concern.
+  the shell (the quote marker a rate write leaves), not a kernel concern.
 
 ### 4.8 Memory envelope and scoping
 
@@ -707,12 +719,13 @@ diagnostic, never a bucket key.
   never upgrades under aggregation.
 - **Deferred flow** — a compile-stage flow whose amount needs a later stage's
   output; finalised in `value`, consumed by `measure`.
-- **Watermark** — the per-account record of the last projection: the facts
-  fingerprint it was computed from, the day it covers and when it ran.
-- **Checkpoint** — the projection state at a chunk boundary, stored per account,
-  from which a later run resumes.
-- **Plan** — the verdict for one account in one job: skip, revalue, resume or
-  full.
+- **Marker** — a `projection_state` row a trigger writes with a fact change:
+  what is stale (an account, an asset's facts or prices, everything) and from
+  which day.
+- **Window** — the slice of a run's range folded, valued and written before the
+  next one is read.
+- **Plan** — the verdict for one account in one job: refold or revalue, from a
+  day.
 - **Scope** — the set of accounts a computation covers. Internal transfers net
   to zero inside it; everything crossing its boundary is an external flow.
 - **Transfer closure** — the scope plus every account sharing a transfer group

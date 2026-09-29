@@ -58,9 +58,6 @@ pub struct PortfolioRequestPayload {
     /// (the user asked for a recalculation).
     #[serde(default)]
     pub force_full: bool,
-    /// Earliest instant a fact changed, when the event carries it.
-    #[serde(default)]
-    pub earliest_change_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl PortfolioRequestPayload {
@@ -76,7 +73,6 @@ pub struct PortfolioRequestPayloadBuilder {
     account_ids: Option<Vec<String>>,
     market_sync_mode: MarketSyncMode,
     force_full: bool,
-    earliest_change_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl PortfolioRequestPayloadBuilder {
@@ -98,19 +94,12 @@ impl PortfolioRequestPayloadBuilder {
         self
     }
 
-    /// Earliest instant a fact changed, when known.
-    pub fn earliest_change_at(mut self, at: Option<chrono::DateTime<chrono::Utc>>) -> Self {
-        self.earliest_change_at = at;
-        self
-    }
-
     /// Builds the PortfolioRequestPayload.
     pub fn build(self) -> PortfolioRequestPayload {
         PortfolioRequestPayload {
             account_ids: self.account_ids,
             market_sync_mode: self.market_sync_mode,
             force_full: self.force_full,
-            earliest_change_at: self.earliest_change_at,
         }
     }
 }

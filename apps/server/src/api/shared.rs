@@ -58,9 +58,6 @@ pub struct PortfolioRequestBody {
     /// Rebuild from the first activity even when the accounts are fresh.
     #[serde(default)]
     pub force_full: bool,
-    /// Earliest instant a fact changed, when known.
-    #[serde(default)]
-    pub earliest_change_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl PortfolioRequestBody {
@@ -69,7 +66,6 @@ impl PortfolioRequestBody {
             account_ids: self.account_ids,
             market_sync_mode: self.market_sync_mode,
             force_full: self.force_full,
-            earliest_change_at: self.earliest_change_at,
         }
     }
 }
@@ -79,7 +75,6 @@ pub struct PortfolioJobConfig {
     pub account_ids: Option<Vec<String>>,
     pub market_sync_mode: MarketSyncMode,
     pub force_full: bool,
-    pub earliest_change_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Enqueue a background portfolio job that will publish SSE events as it runs.
@@ -100,7 +95,6 @@ pub fn trigger_lightweight_portfolio_update(state: Arc<AppState>) {
             account_ids: None,
             market_sync_mode: MarketSyncMode::None,
             force_full: false,
-            earliest_change_at: None,
         },
     );
 }
@@ -114,7 +108,6 @@ pub fn trigger_full_portfolio_recalc(state: Arc<AppState>) {
             account_ids: None,
             market_sync_mode: MarketSyncMode::None,
             force_full: false,
-            earliest_change_at: None,
         },
     );
 }
@@ -228,7 +221,6 @@ impl PortfolioJobConfig {
             account_ids: self.account_ids,
             market_sync: self.market_sync_mode,
             force_full: self.force_full,
-            earliest_change_at: self.earliest_change_at,
         }
     }
 }

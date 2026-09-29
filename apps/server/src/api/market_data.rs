@@ -176,7 +176,6 @@ async fn update_quote(
             account_ids: None,
             market_sync_mode: MarketSyncMode::None,
             force_full: false,
-            earliest_change_at: None,
         },
     );
     Ok(StatusCode::NO_CONTENT)
@@ -195,7 +194,6 @@ async fn delete_quote(
             account_ids: None,
             market_sync_mode: MarketSyncMode::None,
             force_full: false,
-            earliest_change_at: None,
         },
     );
     Ok(StatusCode::NO_CONTENT)
@@ -265,7 +263,6 @@ async fn import_quotes_csv(
             account_ids: None,
             market_sync_mode: MarketSyncMode::None,
             force_full: false,
-            earliest_change_at: None,
         },
     );
 

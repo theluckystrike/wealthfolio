@@ -1,15 +1,16 @@
-//! Coordinator over the in-memory doubles: kernel persistence, freshness
-//! detection and the cold-start repair.
+//! Coordinator over the in-memory doubles: marker-driven refolds and
+//! revalues, windowed persistence, and parity with the kernel goldens.
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use super::*;
 use crate::accounts::{AccountAccountingSettings, AccountRepositoryTrait, CostBasisMethod};
-use crate::activities::ActivityRepositoryTrait;
+use crate::activities::{Activity, ActivityRepositoryTrait};
 use crate::assets::AssetRepositoryTrait;
 use crate::fx::{FxRepositoryTrait, FxService};
 use crate::lots::LotRepositoryTrait;
+use crate::portfolio::projection::GENESIS;
 use crate::portfolio::snapshot::{
     AccountStateSnapshot, SnapshotRepositoryTrait, SnapshotService, SnapshotSource,
 };
@@ -26,7 +27,6 @@ struct Harness {
     fx_repo: Arc<InMemoryFxRepository>,
     valuation_repo: Arc<dyn ValuationRepositoryTrait>,
     snapshot_repo: Arc<dyn SnapshotRepositoryTrait>,
-    sources: FactSources,
     lot_repo: Arc<dyn LotRepositoryTrait>,
     projections: Arc<dyn ProjectionStoreTrait>,
     store: Arc<InMemoryProjectionStore>,
@@ -40,7 +40,12 @@ fn scenario(id: &str) -> Scenario {
         .unwrap_or_else(|| panic!("scenario {id} not found"))
 }
 
+/// Short fixtures: two-day windows exercise every window boundary.
 async fn harness(facts: ScenarioFacts) -> Harness {
+    harness_with(facts, WindowCadence::Days(2)).await
+}
+
+async fn harness_with(facts: ScenarioFacts, cadence: WindowCadence) -> Harness {
     let clock = crate::utils::clock::freeze(as_of_instant(facts.as_of, &facts.timezone));
     let base_currency = Arc::new(RwLock::new(facts.base_currency.clone()));
     let timezone = Arc::new(RwLock::new(facts.timezone.clone()));
@@ -95,17 +100,17 @@ async fn harness(facts: ScenarioFacts) -> Harness {
         quotes: quote_service_dyn,
         fx_rates: fx_repo_dyn,
         snapshots: snapshot_repo.clone(),
+        projections: projections.clone(),
     };
     let coordinator = PortfolioCoordinator::new(CoordinatorDeps {
         base_currency,
         timezone,
-        sources: sources.clone(),
+        sources,
         fx_service,
         snapshot_service,
         projections: projections.clone(),
         lots: lot_repo.clone(),
-        // Short fixtures: a checkpoint every two days exercises the resume path.
-        checkpoint_cadence: CheckpointCadence::EveryDays(2),
+        window_cadence: cadence,
     });
     snapshot_repo
         .save_snapshots(&facts.observed_snapshots)
@@ -122,8 +127,64 @@ async fn harness(facts: ScenarioFacts) -> Harness {
         lot_repo,
         projections,
         store,
-        sources,
         _clock: clock,
+    }
+}
+
+impl Harness {
+    /// Applies activity changes to the doubles and records what the SQLite
+    /// triggers would: each changed row's account from the day before its
+    /// UTC date, and its transfer partners from theirs. `before` holds the
+    /// rows as they were (updates and deletions mark their old date too).
+    fn change_activities(
+        &self,
+        added: Vec<Activity>,
+        updated: Vec<Activity>,
+        removed: &[String],
+        before: &[Activity],
+    ) {
+        let mut changed: Vec<Activity> = added.iter().chain(&updated).cloned().collect();
+        changed.extend(
+            before
+                .iter()
+                .filter(|a| removed.contains(&a.id) || updated.iter().any(|u| u.id == a.id))
+                .cloned(),
+        );
+        self.activity_repo.apply(added, updated, removed);
+        let mut all = before.to_vec();
+        all.extend(changed.iter().cloned());
+        for activity in &changed {
+            self.mark_activity(activity);
+            if let Some(group) = &activity.source_group_id {
+                for partner in all.iter().filter(|a| {
+                    a.source_group_id.as_ref() == Some(group) && a.account_id != activity.account_id
+                }) {
+                    self.mark_activity(partner);
+                }
+            }
+        }
+    }
+
+    fn mark_activity(&self, activity: &Activity) {
+        let day = activity.activity_date.date_naive().pred_opt().unwrap();
+        self.store
+            .mark(MarkerScope::Account(activity.account_id.clone()), day);
+    }
+
+    fn add_quotes(&self, quotes: Vec<Quote>) {
+        for quote in &quotes {
+            self.store.mark(
+                MarkerScope::Prices(quote.asset_id.clone()),
+                quote.timestamp.date_naive(),
+            );
+        }
+        self.quote_service.add_quotes(quotes);
+    }
+
+    fn rows(&self, account: &str) -> Vec<crate::portfolio::valuation::DailyAccountValuation> {
+        self.valuation_repo
+            .get_historical_valuations(account, None, None)
+            .unwrap()
     }
 }
 
@@ -135,10 +196,19 @@ fn request() -> PortfolioJobRequest {
     }
 }
 
+fn plan_of(report: &PortfolioJobReport, account: &str) -> Option<RebuildPlan> {
+    report
+        .plans
+        .iter()
+        .find(|p| p.account_id == account)
+        .map(|p| p.plan)
+}
+
 #[tokio::test]
-async fn run_job_persists_rows_and_records_watermarks() {
+async fn a_run_persists_rows_and_consumes_its_markers() {
     let scenario = scenario("NOM-TRADE-01");
     let harness = harness(scenario.facts()).await;
+    assert!(!harness.projections.pending_markers().unwrap().is_empty());
     let report = harness
         .coordinator
         .run_job(request(), &SilentObserver)
@@ -147,79 +217,34 @@ async fn run_job_persists_rows_and_records_watermarks() {
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     let account = &report.account_ids[0];
-    let valuations = harness
-        .valuation_repo
-        .get_historical_valuations(account, None, None)
-        .unwrap();
+    assert_eq!(
+        plan_of(&report, account),
+        Some(RebuildPlan::Refold { from: GENESIS })
+    );
+    let valuations = harness.rows(account);
     assert!(!valuations.is_empty(), "valuation rows persisted");
     assert!(valuations.iter().all(|v| v.account_id == *account));
-    let snapshots = harness
+    assert!(!harness
         .snapshot_repo
         .get_snapshots_by_account(account, None, None)
-        .unwrap();
-    assert!(!snapshots.is_empty(), "keyframes persisted");
-    let lots = harness
+        .unwrap()
+        .is_empty());
+    assert!(!harness
         .lot_repo
         .get_all_lots_for_account(account)
         .await
-        .unwrap();
-    assert!(!lots.is_empty(), "lot rows persisted");
-    let watermark = harness
-        .projections
-        .get_watermarks(std::slice::from_ref(account))
-        .unwrap();
-    assert_eq!(watermark.len(), 1);
-    assert!(!harness
-        .projections
-        .get_checkpoints(std::slice::from_ref(account))
         .unwrap()
         .is_empty());
+    assert!(harness.projections.pending_markers().unwrap().is_empty());
     assert!(harness.coordinator.stale_accounts().unwrap().is_empty());
-}
 
-#[tokio::test]
-async fn stale_detection_follows_facts_and_market_data() {
-    let scenario = scenario("NOM-TRADE-01");
-    let facts = scenario.facts();
-    let harness = harness(facts.clone()).await;
-    assert_eq!(
-        harness.coordinator.stale_accounts().unwrap()[0].reason,
-        StaleReason::Unprojected
-    );
-    harness
+    // Nothing stale: nothing planned.
+    let again = harness
         .coordinator
         .run_job(request(), &SilentObserver)
         .await
         .unwrap();
-    assert!(harness.coordinator.stale_accounts().unwrap().is_empty());
-
-    // A new quote observation only moves the market-data watermark.
-    let template = facts.quotes[0].clone();
-    harness.quote_service.add_quotes(vec![Quote {
-        id: "late-quote".to_string(),
-        timestamp: template.timestamp + chrono::Duration::days(1),
-        created_at: template.created_at + chrono::Duration::days(30),
-        ..template
-    }]);
-    let stale = harness.coordinator.stale_accounts().unwrap();
-    assert_eq!(stale.len(), 1);
-    assert_eq!(stale[0].reason, StaleReason::MarketDataChanged);
-
-    // A new activity changes the facts.
-    let mut activity = facts.activities[0].clone();
-    activity.id = "late-activity".to_string();
-    activity.activity_date += chrono::Duration::days(1);
-    harness.activity_repo.apply(vec![activity], Vec::new(), &[]);
-    let stale = harness.coordinator.stale_accounts().unwrap();
-    assert_eq!(stale[0].reason, StaleReason::FactsChanged);
-
-    // The cold-start check repairs it.
-    harness
-        .coordinator
-        .ensure_consistent(MarketSyncMode::None, &SilentObserver)
-        .await
-        .unwrap();
-    assert!(harness.coordinator.stale_accounts().unwrap().is_empty());
+    assert!(again.plans.is_empty(), "{:?}", again.plans);
 }
 
 /// The kernel golden of a scenario (the insta header stripped).
@@ -252,10 +277,17 @@ fn same_status(row: &str, golden: &str) -> bool {
 }
 
 /// Every parity scenario through the real fact loading, row mapping and
-/// persistence: the stored valuations, lots and keyframes must equal the
-/// kernel golden (architecture §3.3). Nothing here asserts mere non-emptiness.
+/// persistence, one two-day window at a time and in yearly windows: the
+/// stored valuations, lots and keyframes must equal the kernel golden
+/// (architecture §3.3). Nothing here asserts mere non-emptiness.
 #[tokio::test]
 async fn every_parity_scenario_persists_the_kernel_golden() {
+    for cadence in [WindowCadence::Days(2), WindowCadence::Year] {
+        assert_parity(cadence).await;
+    }
+}
+
+async fn assert_parity(cadence: WindowCadence) {
     let mut compared = 0;
     for scenario in load_all_scenarios()
         .into_iter()
@@ -265,7 +297,7 @@ async fn every_parity_scenario_persists_the_kernel_golden() {
             panic!("{}: no kernel golden", scenario.id);
         };
         let facts = scenario.facts();
-        let harness = harness(facts.clone()).await;
+        let harness = harness_with(facts.clone(), cadence).await;
         let report = harness
             .coordinator
             .run_job(request(), &SilentObserver)
@@ -427,12 +459,11 @@ fn normalized_lots(mut rows: Vec<crate::lots::LotRecord>) -> Vec<crate::lots::Lo
 
 /// LIFE fixtures: after every lifecycle step (appends, backdated edits,
 /// deletions, quote backfills, a new day) the incrementally maintained
-/// projection must equal a fresh run over the same facts, and the
-/// consistency check must find nothing stale.
+/// projection must equal a fresh run over the same facts.
 #[tokio::test]
 async fn lifecycle_steps_match_a_fresh_rebuild() {
     let mut steps_checked = 0;
-    let mut plans_seen: HashSet<String> = HashSet::new();
+    let mut plans_seen: HashSet<&str> = HashSet::new();
     for scenario in load_all_scenarios()
         .into_iter()
         .filter(|s| !s.lifecycle.is_empty())
@@ -445,9 +476,10 @@ async fn lifecycle_steps_match_a_fresh_rebuild() {
             .unwrap();
         for (index, step) in scenario.lifecycle.iter().enumerate() {
             let label = format!("{} step {} ({})", scenario.id, index + 1, step.label);
+            let before = scenario.facts_after(index);
             let after = scenario.facts_after(index + 1);
             crate::utils::clock::set_frozen(as_of_instant(after.as_of, &after.timezone));
-            let by_id = |ids: &[String]| -> Vec<crate::activities::Activity> {
+            let by_id = |ids: &[String]| -> Vec<Activity> {
                 after
                     .activities
                     .iter()
@@ -461,19 +493,27 @@ async fn lifecycle_steps_match_a_fresh_rebuild() {
                 .iter()
                 .map(|a| a.id.clone())
                 .collect();
-            live.activity_repo
-                .apply(by_id(&added), by_id(&updated), &step.remove_activities);
-            let new_quotes: Vec<Quote> = after
-                .quotes
-                .iter()
-                .filter(|q| {
-                    step.add_quotes.iter().any(|spec| {
-                        spec.asset == q.asset_id && spec.day == q.timestamp.date_naive()
+            live.change_activities(
+                by_id(&added),
+                by_id(&updated),
+                &step.remove_activities,
+                &before.activities,
+            );
+            live.add_quotes(
+                after
+                    .quotes
+                    .iter()
+                    .filter(|q| {
+                        step.add_quotes.iter().any(|spec| {
+                            spec.asset == q.asset_id && spec.day == q.timestamp.date_naive()
+                        })
                     })
-                })
-                .cloned()
-                .collect();
-            live.quote_service.add_quotes(new_quotes);
+                    .cloned()
+                    .collect(),
+            );
+            for spec in &step.add_fx_rates {
+                live.store.mark(MarkerScope::All, spec.day);
+            }
             live.fx_repo.add_rates(
                 step.add_fx_rates
                     .iter()
@@ -488,19 +528,15 @@ async fn lifecycle_steps_match_a_fresh_rebuild() {
                 .unwrap();
             assert!(report.failures.is_empty(), "{label}: {:?}", report.failures);
             for plan in &report.plans {
-                plans_seen.insert(
-                    match plan.plan {
-                        RebuildPlan::Full => "full",
-                        RebuildPlan::Resume { .. } => "resume",
-                        RebuildPlan::Revalue => "revalue",
-                        RebuildPlan::Skip => "skip",
-                    }
-                    .to_string(),
-                );
+                plans_seen.insert(match plan.plan {
+                    RebuildPlan::Refold { from } if from == GENESIS => "full",
+                    RebuildPlan::Refold { .. } => "refold",
+                    RebuildPlan::Revalue { .. } => "revalue",
+                });
             }
             assert!(
                 live.coordinator.stale_accounts().unwrap().is_empty(),
-                "{label}: stale after the consistency pass"
+                "{label}: stale after the run"
             );
 
             let fresh = harness(after.clone()).await;
@@ -510,17 +546,9 @@ async fn lifecycle_steps_match_a_fresh_rebuild() {
                 .await
                 .unwrap();
             for account in after.accounts.iter().filter(|a| !a.is_archived) {
-                let incremental = live
-                    .valuation_repo
-                    .get_historical_valuations(&account.id, None, None)
-                    .unwrap();
-                let rebuilt = fresh
-                    .valuation_repo
-                    .get_historical_valuations(&account.id, None, None)
-                    .unwrap();
                 assert_eq!(
-                    normalized_valuations(incremental),
-                    normalized_valuations(rebuilt),
+                    normalized_valuations(live.rows(&account.id)),
+                    normalized_valuations(fresh.rows(&account.id)),
                     "{label}: valuations of {}",
                     account.id
                 );
@@ -545,8 +573,8 @@ async fn lifecycle_steps_match_a_fresh_rebuild() {
         }
     }
     assert!(steps_checked > 0, "no lifecycle steps found");
-    // The equivalence above only proves the fast paths if they ran.
-    for path in ["resume", "revalue", "full"] {
+    // The equivalence above only proves the incremental paths if they ran.
+    for path in ["refold", "revalue"] {
         assert!(
             plans_seen.contains(path),
             "no lifecycle step took the {path} path"
@@ -554,49 +582,38 @@ async fn lifecycle_steps_match_a_fresh_rebuild() {
     }
 }
 
-fn plan_of(report: &PortfolioJobReport, account: &str) -> RebuildPlan {
-    report
-        .plans
-        .iter()
-        .find(|p| p.account_id == account)
-        .unwrap_or_else(|| panic!("no plan for {account}"))
-        .plan
+/// Rows dated before `day` are the first run's rows (same stamp); rows from
+/// `day` were rewritten by the later run.
+fn untouched_before(
+    before: &[crate::portfolio::valuation::DailyAccountValuation],
+    after: &[crate::portfolio::valuation::DailyAccountValuation],
+    day: chrono::NaiveDate,
+) {
+    for row in after {
+        let first = before
+            .iter()
+            .find(|b| b.valuation_date == row.valuation_date);
+        let stamp = first.map(|b| b.calculated_at);
+        if row.valuation_date < day {
+            assert_eq!(
+                Some(row.calculated_at),
+                stamp,
+                "{} rewritten",
+                row.valuation_date
+            );
+        } else {
+            assert_ne!(
+                Some(row.calculated_at),
+                stamp,
+                "{} not rewritten",
+                row.valuation_date
+            );
+        }
+    }
 }
 
 #[tokio::test]
-async fn fresh_accounts_are_skipped_unless_a_full_rebuild_is_forced() {
-    let scenario = scenario("NOM-TRADE-01");
-    let facts = scenario.facts();
-    let account = facts.accounts[0].id.clone();
-    let harness = harness(facts).await;
-    let first = harness
-        .coordinator
-        .run_job(request(), &SilentObserver)
-        .await
-        .unwrap();
-    assert_eq!(plan_of(&first, &account), RebuildPlan::Full);
-    let second = harness
-        .coordinator
-        .run_job(request(), &SilentObserver)
-        .await
-        .unwrap();
-    assert_eq!(plan_of(&second, &account), RebuildPlan::Skip);
-    let forced = harness
-        .coordinator
-        .run_job(
-            PortfolioJobRequest {
-                force_full: true,
-                ..request()
-            },
-            &SilentObserver,
-        )
-        .await
-        .unwrap();
-    assert_eq!(plan_of(&forced, &account), RebuildPlan::Full);
-}
-
-#[tokio::test]
-async fn market_data_and_new_days_revalue_without_reprojecting() {
+async fn a_price_change_revalues_from_its_day_only() {
     let scenario = scenario("NOM-TRADE-01");
     let facts = scenario.facts();
     let account = facts.accounts[0].id.clone();
@@ -605,6 +622,8 @@ async fn market_data_and_new_days_revalue_without_reprojecting() {
         .run_job(request(), &SilentObserver)
         .await
         .unwrap();
+    let first_run = crate::utils::clock::now();
+    let rows_before = live.rows(&account);
     let lots_before = format!(
         "{:#?}",
         live.lot_repo
@@ -614,49 +633,39 @@ async fn market_data_and_new_days_revalue_without_reprojecting() {
     );
 
     let template = facts.quotes[0].clone();
-    live.quote_service.add_quotes(vec![Quote {
+    let late = Quote {
         id: "late-quote".to_string(),
         timestamp: template.timestamp + chrono::Duration::days(1),
         close: template.close * rust_decimal_macros::dec!(1.1),
         ..template
-    }]);
-    let report = live
-        .coordinator
-        .ensure_consistent(MarketSyncMode::None, &SilentObserver)
-        .await
-        .unwrap();
-    assert_eq!(plan_of(&report, &account), RebuildPlan::Revalue);
-
-    let tomorrow = facts.as_of + chrono::Duration::days(1);
-    crate::utils::clock::set_frozen(as_of_instant(tomorrow, &facts.timezone));
-    let report = live
-        .coordinator
-        .ensure_consistent(MarketSyncMode::None, &SilentObserver)
-        .await
-        .unwrap();
-    assert_eq!(plan_of(&report, &account), RebuildPlan::Revalue);
-    let lots_after = format!(
-        "{:#?}",
-        live.lot_repo
-            .get_all_lots_for_account(&account)
-            .await
-            .unwrap()
-    );
-    assert_eq!(lots_before, lots_after, "a revalue never rewrites lots");
-
-    // The revalued rows equal a fresh rebuild over the same facts.
-    let mut fresh_facts = facts.clone();
-    fresh_facts.as_of = tomorrow;
-    fresh_facts.quotes = {
-        let mut quotes = facts.quotes.clone();
-        quotes.push(Quote {
-            id: "late-quote".to_string(),
-            timestamp: facts.quotes[0].timestamp + chrono::Duration::days(1),
-            close: facts.quotes[0].close * rust_decimal_macros::dec!(1.1),
-            ..facts.quotes[0].clone()
-        });
-        quotes
     };
+    let changed_day = late.timestamp.date_naive();
+    crate::utils::clock::set_frozen(first_run + chrono::Duration::hours(1));
+    live.add_quotes(vec![late.clone()]);
+    let report = live
+        .coordinator
+        .ensure_consistent(MarketSyncMode::None, &SilentObserver)
+        .await
+        .unwrap();
+    assert_eq!(
+        plan_of(&report, &account),
+        Some(RebuildPlan::Revalue { from: changed_day })
+    );
+    untouched_before(&rows_before, &live.rows(&account), changed_day);
+    assert_eq!(
+        lots_before,
+        format!(
+            "{:#?}",
+            live.lot_repo
+                .get_all_lots_for_account(&account)
+                .await
+                .unwrap()
+        ),
+        "a revalue never rewrites lots"
+    );
+
+    let mut fresh_facts = facts.clone();
+    fresh_facts.quotes.push(late);
     let fresh = harness(fresh_facts).await;
     fresh
         .coordinator
@@ -664,22 +673,49 @@ async fn market_data_and_new_days_revalue_without_reprojecting() {
         .await
         .unwrap();
     assert_eq!(
-        normalized_valuations(
-            live.valuation_repo
-                .get_historical_valuations(&account, None, None)
-                .unwrap()
-        ),
-        normalized_valuations(
-            fresh
-                .valuation_repo
-                .get_historical_valuations(&account, None, None)
-                .unwrap()
-        )
+        normalized_valuations(live.rows(&account)),
+        normalized_valuations(fresh.rows(&account))
     );
 }
 
 #[tokio::test]
-async fn a_backdated_edit_resumes_from_the_last_checkpoint() {
+async fn a_new_day_revalues_only_the_new_day() {
+    let scenario = scenario("NOM-TRADE-01");
+    let facts = scenario.facts();
+    let account = facts.accounts[0].id.clone();
+    let harness = harness(facts.clone()).await;
+    harness
+        .coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    let rows_before = harness.rows(&account);
+    assert!(harness.coordinator.stale_accounts().unwrap().is_empty());
+
+    let tomorrow = facts.as_of + chrono::Duration::days(1);
+    crate::utils::clock::set_frozen(as_of_instant(tomorrow, &facts.timezone));
+    let stale = harness.coordinator.stale_accounts().unwrap();
+    assert!(!stale.is_empty());
+    assert!(stale.iter().all(|s| s.reason == StaleReason::DayAdvanced));
+
+    let report = harness
+        .coordinator
+        .ensure_consistent(MarketSyncMode::None, &SilentObserver)
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(
+        plan_of(&report, &account),
+        Some(RebuildPlan::Revalue { from: tomorrow })
+    );
+    let rows = harness.rows(&account);
+    assert_eq!(rows.last().unwrap().valuation_date, tomorrow);
+    untouched_before(&rows_before, &rows, tomorrow);
+    assert!(harness.coordinator.stale_accounts().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_backdated_edit_rewrites_from_its_day_only() {
     let scenario = scenario("NOM-TRADE-01");
     let facts = scenario.facts();
     let account = facts.accounts[0].id.clone();
@@ -688,17 +724,9 @@ async fn a_backdated_edit_resumes_from_the_last_checkpoint() {
         .run_job(request(), &SilentObserver)
         .await
         .unwrap();
-    let checkpoints = live
-        .projections
-        .get_checkpoints(std::slice::from_ref(&account))
-        .unwrap();
-    assert!(
-        checkpoints.len() > 1,
-        "two-day cadence leaves several checkpoints"
-    );
+    let first_run = crate::utils::clock::now();
+    let rows_before = live.rows(&account);
 
-    // Edit the latest activity (moving its quantity): the change is dated
-    // late, so the run resumes from the last checkpoint before it.
     let mut edited = facts
         .activities
         .iter()
@@ -706,34 +734,21 @@ async fn a_backdated_edit_resumes_from_the_last_checkpoint() {
         .max_by_key(|a| a.activity_date)
         .unwrap()
         .clone();
-    let edit_day = edited.activity_date.date_naive();
     edited.quantity = edited.quantity.map(|q| q * rust_decimal_macros::dec!(2));
     edited.amount = edited.amount.map(|a| a * rust_decimal_macros::dec!(2));
-    edited.updated_at = as_of_instant(facts.as_of, &facts.timezone) + chrono::Duration::hours(1);
-    live.activity_repo
-        .apply(Vec::new(), vec![edited.clone()], &[]);
+    let dirty_from = edited.activity_date.date_naive().pred_opt().unwrap();
+    crate::utils::clock::set_frozen(first_run + chrono::Duration::hours(1));
+    live.change_activities(Vec::new(), vec![edited.clone()], &[], &facts.activities);
     let report = live
         .coordinator
         .ensure_consistent(MarketSyncMode::None, &SilentObserver)
         .await
         .unwrap();
-    let RebuildPlan::Resume { since } = plan_of(&report, &account) else {
-        panic!("expected a resume, got {:?}", report.plans);
-    };
-    assert!(
-        since <= edit_day,
-        "resume starts on or before the edited day"
+    assert_eq!(
+        plan_of(&report, &account),
+        Some(RebuildPlan::Refold { from: dirty_from })
     );
-    assert!(
-        since
-            > facts
-                .activities
-                .iter()
-                .map(|a| a.activity_date.date_naive())
-                .min()
-                .unwrap(),
-        "resume starts after the first activity"
-    );
+    untouched_before(&rows_before, &live.rows(&account), dirty_from);
 
     let mut after = facts.clone();
     if let Some(slot) = after.activities.iter_mut().find(|a| a.id == edited.id) {
@@ -746,17 +761,8 @@ async fn a_backdated_edit_resumes_from_the_last_checkpoint() {
         .await
         .unwrap();
     assert_eq!(
-        normalized_valuations(
-            live.valuation_repo
-                .get_historical_valuations(&account, None, None)
-                .unwrap()
-        ),
-        normalized_valuations(
-            fresh
-                .valuation_repo
-                .get_historical_valuations(&account, None, None)
-                .unwrap()
-        )
+        normalized_valuations(live.rows(&account)),
+        normalized_valuations(fresh.rows(&account))
     );
     assert_eq!(
         format!(
@@ -782,68 +788,7 @@ async fn a_backdated_edit_resumes_from_the_last_checkpoint() {
 }
 
 #[tokio::test]
-async fn a_resume_does_not_backfill_rows_before_an_account_existed() {
-    // A checkpoint carries an entry for every account the fold covered,
-    // including accounts that held nothing yet. Seeding a valuation keyframe
-    // from such an empty entry emitted zero-value rows for every day between
-    // the checkpoint and the account's first activity, so a resumed run no
-    // longer matched a fold from genesis.
-    let scenario = scenario("NOM-TRADE-01");
-    let mut facts = scenario.facts();
-    let mut late_account = facts.accounts[0].clone();
-    late_account.id = "acc-late".to_string();
-    late_account.name = "Opened later".to_string();
-    facts.accounts.push(late_account);
-
-    let opened_on = facts.as_of;
-    let mut deposit = facts.activities[0].clone();
-    deposit.id = "late-deposit".to_string();
-    deposit.account_id = "acc-late".to_string();
-    deposit.activity_type = "DEPOSIT".to_string();
-    deposit.asset_id = None;
-    deposit.quantity = None;
-    deposit.unit_price = None;
-    deposit.amount = Some(rust_decimal_macros::dec!(500));
-    deposit.activity_date = as_of_instant(opened_on, &facts.timezone);
-    facts.activities.push(deposit);
-
-    let harness = harness(facts.clone()).await;
-    let loaded = facts::load(
-        &harness.sources,
-        &["acc-late".to_string()],
-        &facts.base_currency,
-        &facts.timezone,
-        facts.as_of,
-    )
-    .unwrap();
-
-    // Resume from a day well before the account opened, holding nothing.
-    let resume_day = opened_on - chrono::Duration::days(5);
-    let resume = engine::model::ProjectionState {
-        date: resume_day,
-        accounts: std::collections::BTreeMap::from([(
-            engine::model::AccountId::new("acc-late"),
-            engine::model::AccountState::empty(
-                engine::model::AccountId::new("acc-late"),
-                engine::model::Currency::parse(&facts.base_currency).unwrap(),
-            ),
-        )]),
-        transfer_cache: Default::default(),
-    };
-    let resumed = persist::compute(&loaded, Some(resume), CheckpointCadence::EveryDays(2)).unwrap();
-    let series = resumed
-        .series
-        .get(&engine::model::AccountId::new("acc-late"))
-        .expect("the late account is valued");
-    let first_valued = series.days.first().expect("at least one day").date;
-    assert_eq!(
-        first_valued, opened_on,
-        "valuation starts on the account's first activity, not at the resume point {resume_day}"
-    );
-}
-
-#[tokio::test]
-async fn a_deletion_rebuilds_fully_unless_the_change_is_dated() {
+async fn a_deletion_refolds_from_the_deleted_day() {
     let scenario = scenario("NOM-TRADE-01");
     let facts = scenario.facts();
     let account = facts.accounts[0].id.clone();
@@ -860,53 +805,29 @@ async fn a_deletion_rebuilds_fully_unless_the_change_is_dated() {
         .max_by_key(|a| a.activity_date)
         .unwrap()
         .clone();
-    harness
-        .activity_repo
-        .apply(Vec::new(), Vec::new(), std::slice::from_ref(&removed.id));
-
-    // Without a date the deleted row cannot be placed: full fold.
+    harness.change_activities(
+        Vec::new(),
+        Vec::new(),
+        std::slice::from_ref(&removed.id),
+        &facts.activities,
+    );
     let report = harness
         .coordinator
         .ensure_consistent(MarketSyncMode::None, &SilentObserver)
         .await
         .unwrap();
-    assert_eq!(plan_of(&report, &account), RebuildPlan::Full);
-
-    // With the event's date, a later deletion resumes.
-    harness
-        .activity_repo
-        .apply(vec![removed.clone()], Vec::new(), &[]);
-    harness
-        .coordinator
-        .run_job(request(), &SilentObserver)
-        .await
-        .unwrap();
-    harness
-        .activity_repo
-        .apply(Vec::new(), Vec::new(), std::slice::from_ref(&removed.id));
-    let report = harness
-        .coordinator
-        .run_job(
-            PortfolioJobRequest {
-                earliest_change_at: Some(removed.activity_date),
-                ..request()
-            },
-            &SilentObserver,
-        )
-        .await
-        .unwrap();
-    assert!(
-        matches!(plan_of(&report, &account), RebuildPlan::Resume { .. }),
-        "{:?}",
-        report.plans
+    assert_eq!(
+        plan_of(&report, &account),
+        Some(RebuildPlan::Refold {
+            from: removed.activity_date.date_naive().pred_opt().unwrap()
+        })
     );
 }
 
 #[tokio::test]
-async fn storage_failures_are_retried_with_backoff() {
+async fn failures_keep_the_markers_and_are_retried() {
     let scenario = scenario("NOM-TRADE-01");
-    let facts = scenario.facts();
-    let harness = harness(facts).await;
+    let harness = harness(scenario.facts()).await;
     harness.store.fail_next_persists(1);
     let report = harness
         .coordinator
@@ -929,116 +850,34 @@ async fn storage_failures_are_retried_with_backoff() {
         )
         .await
         .unwrap();
+    assert!(!report.failures.is_empty());
     assert!(report
         .failures
         .iter()
-        .all(|f| f.code == "PROJECTION_PERSIST_FAILED"));
-    assert!(!report.failures.is_empty());
-}
-
-fn scoped(account_ids: Vec<&str>) -> PortfolioJobRequest {
-    PortfolioJobRequest {
-        account_ids: Some(account_ids.into_iter().map(String::from).collect()),
-        market_sync: MarketSyncMode::None,
-        ..PortfolioJobRequest::default()
-    }
-}
-
-fn manual_snapshot(account_id: &str, date: chrono::NaiveDate) -> AccountStateSnapshot {
-    AccountStateSnapshot {
-        id: format!("{account_id}_{date}"),
-        account_id: account_id.to_string(),
-        snapshot_date: date,
-        source: SnapshotSource::ManualEntry,
-        ..AccountStateSnapshot::default()
-    }
-}
-
-fn transfer_legs(
-    facts: &ScenarioFacts,
-) -> (crate::activities::Activity, crate::activities::Activity) {
-    let out = facts
-        .activities
-        .iter()
-        .find(|a| a.activity_type == "TRANSFER_OUT")
-        .expect("transfer out")
-        .clone();
-    let into = facts
-        .activities
-        .iter()
-        .find(|a| a.activity_type == "TRANSFER_IN" && a.source_group_id == out.source_group_id)
-        .expect("paired transfer in")
-        .clone();
-    (out, into)
+        .all(|f| f.code == "PROJECTION_FAILED"));
+    assert!(
+        !harness.projections.pending_markers().unwrap().is_empty(),
+        "a failed run leaves its markers for the next one"
+    );
 }
 
 #[tokio::test]
-async fn concurrent_same_scope_requests_both_run() {
+async fn concurrent_requests_run_one_after_another() {
     let scenario = scenario("NOM-TRADE-01");
     let harness = harness(scenario.facts()).await;
     let first = harness.coordinator.run_job(request(), &SilentObserver);
     let second = harness.coordinator.run_job(request(), &SilentObserver);
     let (first, second) = tokio::join!(first, second);
-    for report in [first.unwrap(), second.unwrap()] {
-        assert!(!report.account_ids.is_empty(), "nothing is skipped");
-        assert!(report.failures.is_empty(), "{:?}", report.failures);
-    }
-    assert!(harness.coordinator.stale_accounts().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn a_new_day_makes_the_projection_stale() {
-    let scenario = scenario("NOM-TRADE-01");
-    let facts = scenario.facts();
-    let harness = harness(facts.clone()).await;
-    harness
-        .coordinator
-        .run_job(request(), &SilentObserver)
-        .await
-        .unwrap();
-    assert!(harness.coordinator.stale_accounts().unwrap().is_empty());
-
-    let tomorrow = facts.as_of + chrono::Duration::days(1);
-    crate::utils::clock::set_frozen(as_of_instant(tomorrow, &facts.timezone));
-    let stale = harness.coordinator.stale_accounts().unwrap();
-    assert!(!stale.is_empty());
-    assert!(stale.iter().all(|s| s.reason == StaleReason::DayAdvanced));
-
-    let report = harness
-        .coordinator
-        .ensure_consistent(MarketSyncMode::None, &SilentObserver)
-        .await
-        .unwrap();
-    assert!(report.failures.is_empty(), "{:?}", report.failures);
-    assert!(harness.coordinator.stale_accounts().unwrap().is_empty());
-    let watermarks = harness
-        .projections
-        .get_watermarks(&report.account_ids)
-        .unwrap();
-    assert!(watermarks.iter().all(|w| w.as_of == tomorrow));
-}
-
-#[tokio::test]
-async fn resyncing_identical_market_data_is_not_stale() {
-    let scenario = scenario("NOM-TRADE-01");
-    let facts = scenario.facts();
-    let harness = harness(facts.clone()).await;
-    harness
-        .coordinator
-        .run_job(request(), &SilentObserver)
-        .await
-        .unwrap();
-    // A provider sync re-upserts the same closes with fresh row timestamps.
-    let resynced: Vec<Quote> = facts
-        .quotes
-        .iter()
-        .map(|q| Quote {
-            id: format!("{}-resync", q.id),
-            created_at: q.created_at + chrono::Duration::days(30),
-            ..q.clone()
-        })
-        .collect();
-    harness.quote_service.add_quotes(resynced);
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert!(first.failures.is_empty() && second.failures.is_empty());
+    // One of them did the work; the other found nothing stale.
+    assert_eq!(
+        [first.plans.is_empty(), second.plans.is_empty()]
+            .iter()
+            .filter(|empty| **empty)
+            .count(),
+        1
+    );
     assert!(harness.coordinator.stale_accounts().unwrap().is_empty());
 }
 
@@ -1067,14 +906,6 @@ async fn a_future_dated_only_account_projects_without_failing() {
         .await
         .unwrap();
     assert!(report.failures.is_empty(), "{:?}", report.failures);
-    assert_eq!(
-        harness
-            .projections
-            .get_watermarks(&["acc-future".to_string()])
-            .unwrap()
-            .len(),
-        1
-    );
     assert!(harness.coordinator.stale_accounts().unwrap().is_empty());
 }
 
@@ -1104,42 +935,38 @@ async fn an_out_of_policy_observed_snapshot_fails_only_its_account() {
     assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
     assert_eq!(report.failures[0].account_id, holdings_account);
     assert_eq!(report.failures[0].code, "INVALID_SNAPSHOT_DATE");
-    assert!(harness
-        .projections
-        .get_watermarks(std::slice::from_ref(&holdings_account))
-        .unwrap()
-        .is_empty());
+    assert!(harness.rows(&holdings_account).is_empty());
+    assert!(
+        !harness.projections.pending_markers().unwrap().is_empty(),
+        "the markers stay until the account can be projected"
+    );
 }
 
 #[tokio::test]
-async fn deleting_a_transfer_leg_makes_the_partner_stale() {
+async fn a_changed_transfer_leg_refolds_its_partner() {
     let scenario = scenario("NOM-TXF-01");
     let facts = scenario.facts();
     let (out, into) = transfer_legs(&facts);
-    let harness = harness(facts).await;
+    let harness = harness(facts.clone()).await;
     harness
         .coordinator
         .run_job(request(), &SilentObserver)
         .await
         .unwrap();
-    harness
-        .activity_repo
-        .apply(Vec::new(), Vec::new(), std::slice::from_ref(&out.id));
-    let stale = harness.coordinator.stale_accounts().unwrap();
-    let partner = stale
-        .iter()
-        .find(|s| s.account_id == into.account_id)
-        .expect("the receiving account is stale too");
-    assert_eq!(partner.reason, StaleReason::FactsChanged);
-
-    // A job raised for an account that no longer exists repairs the partners.
+    // Only the sending account is marked; the pair brings the receiver in.
+    harness.store.mark(
+        MarkerScope::Account(out.account_id.clone()),
+        out.activity_date.date_naive(),
+    );
     let report = harness
         .coordinator
-        .run_job(scoped(vec!["deleted-account"]), &SilentObserver)
+        .run_job(request(), &SilentObserver)
         .await
         .unwrap();
-    assert!(report.account_ids.contains(&into.account_id));
-    assert!(harness.coordinator.stale_accounts().unwrap().is_empty());
+    assert!(matches!(
+        plan_of(&report, &into.account_id),
+        Some(RebuildPlan::Refold { .. })
+    ));
 }
 
 #[tokio::test]
@@ -1161,11 +988,6 @@ async fn unsupported_cost_basis_settings_fail_the_account() {
         .unwrap();
     assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
     assert_eq!(report.failures[0].code, "UNSUPPORTED_COST_BASIS");
-    assert!(harness
-        .projections
-        .get_watermarks(std::slice::from_ref(&account))
-        .unwrap()
-        .is_empty());
     assert!(harness
         .lot_repo
         .get_all_lots_for_account(&account)
@@ -1189,112 +1011,66 @@ async fn explicitly_requested_archived_accounts_are_rebuilt() {
     let harness = harness(facts).await;
     let report = harness
         .coordinator
-        .run_job(scoped(vec![archived.as_str()]), &SilentObserver)
+        .run_job(
+            PortfolioJobRequest {
+                account_ids: Some(vec![archived.clone()]),
+                force_full: true,
+                ..request()
+            },
+            &SilentObserver,
+        )
         .await
         .unwrap();
-    assert_eq!(report.account_ids, vec![archived.clone()]);
     assert!(report.failures.is_empty(), "{:?}", report.failures);
-    assert_eq!(
-        harness
-            .projections
-            .get_watermarks(std::slice::from_ref(&archived))
-            .unwrap()
-            .len(),
-        1
-    );
+    assert!(report.account_ids.contains(&archived));
 }
 
 #[tokio::test]
-async fn observed_snapshot_facts_are_ordered_so_the_fingerprint_is_stable() {
-    // Snapshot positions and cash live in hash maps, whose iteration order
-    // differs per load. Unsorted, an account with an observed snapshot never
-    // matched its own watermark: it was reported stale and rebuilt forever.
-    let scenario = scenario("NOM-OBS-01");
+async fn rejected_activities_are_stored_for_the_read_path() {
+    let scenario = scenario("EDGE-DRIP-01");
     let facts = scenario.facts();
-    let account = facts
-        .accounts
-        .iter()
-        .find(|a| a.tracking_mode == crate::accounts::TrackingMode::Holdings)
-        .expect("holdings account")
-        .id
-        .clone();
+    let account = facts.accounts[0].id.clone();
     let harness = harness(facts).await;
-
-    // Two positions and two cash buckets, inserted in reverse order.
-    let mut snapshot = manual_snapshot(
-        &account,
-        chrono::NaiveDate::from_ymd_opt(2025, 1, 6).unwrap(),
-    );
-    // Six assets inserted out of order: an unsorted load would have to hit
-    // the sorted permutation by chance (1 in 720) for this to pass.
-    for asset in ["zzz", "mmm", "aaa", "ttt", "ccc", "ppp"] {
-        snapshot.positions.insert(
-            asset.to_string(),
-            crate::portfolio::snapshot::Position {
-                id: format!("{account}-{asset}"),
-                account_id: account.clone(),
-                asset_id: asset.to_string(),
-                quantity: rust_decimal_macros::dec!(1),
-                average_cost: rust_decimal_macros::dec!(10),
-                total_cost_basis: rust_decimal_macros::dec!(10),
-                currency: "USD".to_string(),
-                ..Default::default()
-            },
-        );
-    }
-    snapshot
-        .cash_balances
-        .insert("USD".into(), rust_decimal_macros::dec!(5));
-    snapshot
-        .cash_balances
-        .insert("CAD".into(), rust_decimal_macros::dec!(7));
-    harness
-        .snapshot_repo
-        .save_snapshots(&[snapshot])
+    let report = harness
+        .coordinator
+        .run_job(request(), &SilentObserver)
         .await
         .unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let rejected = harness
+        .projections
+        .rejections(std::slice::from_ref(&account))
+        .unwrap();
+    assert_eq!(rejected.len(), 1, "{rejected:?}");
+    assert_eq!(rejected[0].activity_id, "drip-1");
+}
 
-    let loaded = facts::load(
-        &harness.sources,
-        std::slice::from_ref(&account),
-        "USD",
-        "UTC",
-        chrono::NaiveDate::from_ymd_opt(2025, 1, 12).unwrap(),
-    )
-    .unwrap();
-    let observed = loaded
-        .raw
-        .observed_snapshots
-        .iter()
-        .find(|s| s.positions.len() == 6)
-        .expect("the six-position snapshot");
-    let assets: Vec<&str> = observed
-        .positions
-        .iter()
-        .map(|p| p.asset_id.as_str())
-        .collect();
-    assert_eq!(
-        assets,
-        vec!["aaa", "ccc", "mmm", "ppp", "ttt", "zzz"],
-        "positions sorted by asset"
-    );
-    let currencies: Vec<&str> = observed.cash.iter().map(|(c, _)| c.as_str()).collect();
-    assert_eq!(currencies, vec!["CAD", "USD"], "cash sorted by currency");
+fn manual_snapshot(account_id: &str, date: chrono::NaiveDate) -> AccountStateSnapshot {
+    AccountStateSnapshot {
+        id: format!("{account_id}_{date}"),
+        account_id: account_id.to_string(),
+        snapshot_date: date,
+        source: SnapshotSource::ManualEntry,
+        ..AccountStateSnapshot::default()
+    }
+}
 
-    // The fingerprint a job stores must equal the one the next check computes.
-    let again = facts::load(
-        &harness.sources,
-        std::slice::from_ref(&account),
-        "USD",
-        "UTC",
-        chrono::NaiveDate::from_ymd_opt(2025, 1, 12).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        loaded.fingerprints.get(&account),
-        again.fingerprints.get(&account),
-        "the same facts must fingerprint the same on every load"
-    );
+fn transfer_legs(
+    facts: &ScenarioFacts,
+) -> (crate::activities::Activity, crate::activities::Activity) {
+    let out = facts
+        .activities
+        .iter()
+        .find(|a| a.activity_type == "TRANSFER_OUT")
+        .expect("transfer out")
+        .clone();
+    let into = facts
+        .activities
+        .iter()
+        .find(|a| a.activity_type == "TRANSFER_IN" && a.source_group_id == out.source_group_id)
+        .expect("paired transfer in")
+        .clone();
+    (out, into)
 }
 
 #[tokio::test]

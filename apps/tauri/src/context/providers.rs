@@ -10,8 +10,9 @@ use wealthfolio_connect::{
     BrokerSyncService, CoreImportRunRepositoryAdapter, ImportRunRepositoryTrait,
 };
 use wealthfolio_core::portfolio::coordinator::{
-    CheckpointCadence, CoordinatorDeps, FactSources, PortfolioCoordinator,
+    CoordinatorDeps, FactSources, PortfolioCoordinator, WindowCadence,
 };
+use wealthfolio_core::portfolio::projection::ProjectionStoreTrait;
 use wealthfolio_core::secrets::SecretStore;
 use wealthfolio_core::{
     accounts::AccountService,
@@ -489,6 +490,12 @@ async fn build_context(
         timezone.clone(),
     ));
 
+    let projection_store: Arc<dyn ProjectionStoreTrait> = Arc::new(
+        wealthfolio_storage_sqlite::portfolio::projection::ProjectionStore::new(
+            pool.clone(),
+            writer.clone(),
+        ),
+    );
     let fact_sources = FactSources {
         accounts: account_repository.clone(),
         activities: activity_repository.clone(),
@@ -496,6 +503,7 @@ async fn build_context(
         quotes: quote_service.clone(),
         fx_rates: fx_repository.clone(),
         snapshots: snapshot_repository.clone(),
+        projections: projection_store.clone(),
     };
     let valuation_service = Arc::new(ValuationService::new(
         valuation_repository.clone(),
@@ -504,12 +512,6 @@ async fn build_context(
         timezone.clone(),
     ));
 
-    let projection_store = Arc::new(
-        wealthfolio_storage_sqlite::portfolio::projection::ProjectionStore::new(
-            pool.clone(),
-            writer.clone(),
-        ),
-    );
     let portfolio_coordinator = Arc::new(PortfolioCoordinator::new(CoordinatorDeps {
         base_currency: base_currency.clone(),
         timezone: timezone.clone(),
@@ -518,7 +520,7 @@ async fn build_context(
         snapshot_service: snapshot_service.clone(),
         projections: projection_store,
         lots: lots_repository.clone(),
-        checkpoint_cadence: CheckpointCadence::YearEnd,
+        window_cadence: WindowCadence::Year,
     }));
 
     let final_cash_rebuild: Option<

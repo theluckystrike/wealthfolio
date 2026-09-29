@@ -375,7 +375,8 @@ impl PerformanceService {
         let series = rows::stored_series(&valuation_rows);
         let lots = rows::stored_lots(&lot_rows);
         let disposals = rows::stored_disposals(&disposal_rows);
-        let inputs = measured.measure_inputs(&series, &lots, &disposals);
+        let rejected = rows::stored_rejections(&self.sources, &measured)?;
+        let inputs = measured.measure_inputs(&series, &lots, &disposals, &rejected);
         let window = engine::Window { start, end };
         let kernel_profile = match profile {
             PerformanceSummaryProfile::Full => engine::MeasureProfile::Full,

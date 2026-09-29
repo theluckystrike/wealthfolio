@@ -569,7 +569,6 @@ pub async fn delete_snapshot_handler(
             account_ids: Some(vec![q.account_id.clone()]),
             market_sync_mode: MarketSyncMode::None,
             force_full: false,
-            earliest_change_at: None,
         },
     );
     state.health_service.clear_cache().await;

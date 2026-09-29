@@ -160,3 +160,25 @@ pub fn measure_engine(
     let raw = sources.load_for_measure(account_ids, base_currency, timezone, as_of)?;
     Ok(wealthfolio_portfolio_engine::Engine::new(raw)?)
 }
+
+/// Activities the last run rejected, across the engine's accounts (the scope's
+/// transfer closure): the read path leaves them out as the fold did.
+pub fn stored_rejections(
+    sources: &super::FactSources,
+    engine: &wealthfolio_portfolio_engine::Engine,
+) -> crate::errors::Result<
+    std::collections::BTreeSet<wealthfolio_portfolio_engine::model::ActivityId>,
+> {
+    let accounts: Vec<String> = engine
+        .facts()
+        .accounts()
+        .keys()
+        .map(|id| id.as_str().to_string())
+        .collect();
+    Ok(sources
+        .projections
+        .rejections(&accounts)?
+        .into_iter()
+        .map(|rejected| wealthfolio_portfolio_engine::model::ActivityId::new(rejected.activity_id))
+        .collect())
+}

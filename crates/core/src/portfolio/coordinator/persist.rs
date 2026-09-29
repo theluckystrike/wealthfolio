@@ -1,89 +1,88 @@
 //! Kernel stages over loaded facts, and kernel outputs in the row shapes the
 //! existing repositories and readers already understand.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use wealthfolio_portfolio_engine as engine;
 use wealthfolio_portfolio_engine::model::{
     AccountId, AccountState, AssetId, BasisStatus as KernelBasisStatus, CanonicalFacts, Currency,
-    DateRange, FlowSource, Keyframe, Lot, ProjectionBundle, ProjectionState, ValuationSeries,
-    ValueStatus,
+    DateRange, FlowSource, Keyframe, ValuationSeries, ValueStatus,
 };
 
 use super::LoadedFacts;
-use crate::errors::{Error, Result};
+use crate::errors::Result;
 use crate::lots::{LotDisposal, LotRecord};
 use crate::portfolio::economic_events::BasisStatus;
-use crate::portfolio::projection::{AccountProjection, ProjectionCheckpoint, ProjectionWatermark};
 use crate::portfolio::snapshot::{AccountStateSnapshot, Position, SnapshotSource};
 use crate::portfolio::valuation::{DailyAccountValuation, ExternalFlowSource, ValuationStatus};
-use crate::utils::time_utils::parse_user_timezone_or_default;
 
-pub const KERNEL_ENGINE: &str = "kernel";
-
-pub struct Computed {
-    pub facts: CanonicalFacts,
-    pub ledger: engine::CompiledLedger,
-    pub surfaces: engine::ResolvedSurfaces,
-    pub bundle: ProjectionBundle,
-    pub series: BTreeMap<AccountId, ValuationSeries>,
-    /// `Some(day)`: the run resumed from a checkpoint and only rows dated on
-    /// or after `day` are new; `None`: a run from the first activity.
-    pub since: Option<NaiveDate>,
-    /// Closure state at every chunk end, the last one at `as_of`.
-    pub checkpoints: Vec<ProjectionState>,
-}
-
-/// Where the projection takes checkpoints (architecture §3.3 chunk watermarks).
+/// How a run cuts its range into windows: each window is folded, valued and
+/// written before the next is read, so memory holds one window at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CheckpointCadence {
-    /// The last day of every calendar year.
+pub enum WindowCadence {
+    /// Calendar years.
     #[default]
-    YearEnd,
-    /// Every `n` days from the range start (tests).
-    EveryDays(u32),
+    Year,
+    /// `n` days (tests).
+    Days(u32),
 }
 
-impl CheckpointCadence {
-    /// Chunk end days strictly before `range.end` (the range end is always a
-    /// chunk end and is not listed).
-    fn boundaries(self, range: DateRange) -> Vec<NaiveDate> {
-        let mut days = Vec::new();
-        match self {
-            Self::YearEnd => {
-                let mut year = range.start.year();
-                while let Some(end) = NaiveDate::from_ymd_opt(year, 12, 31) {
-                    if end >= range.end {
-                        break;
-                    }
-                    if end >= range.start {
-                        days.push(end);
-                    }
-                    year += 1;
-                }
+impl WindowCadence {
+    /// The windows covering `range`, in order.
+    pub fn windows(self, range: DateRange) -> Vec<DateRange> {
+        let mut windows = Vec::new();
+        let mut start = range.start;
+        while start <= range.end {
+            let end = match self {
+                Self::Year => NaiveDate::from_ymd_opt(start.year(), 12, 31).unwrap_or(range.end),
+                Self::Days(n) => start + chrono::Duration::days(i64::from(n.max(1)) - 1),
             }
-            Self::EveryDays(n) => {
-                let step = i64::from(n.max(1));
-                let mut day = range.start + chrono::Duration::days(step - 1);
-                while day < range.end {
-                    days.push(day);
-                    day += chrono::Duration::days(step);
-                }
-            }
+            .min(range.end);
+            windows.push(DateRange { start, end });
+            let Some(next) = end.succ_opt() else {
+                break;
+            };
+            start = next;
         }
-        days
+        windows
     }
 }
 
-/// Facts normalised, compiled and surfaced once per job.
+/// Facts normalised and compiled once per job, with the FX surface and the
+/// provider-adjusted splits of the whole range. Quotes are surfaced per
+/// window.
 pub struct Resolved {
     pub facts: CanonicalFacts,
     pub ledger: engine::CompiledLedger,
     pub surfaces: engine::ResolvedSurfaces,
     /// First activity or observed snapshot day, clamped to `as_of`.
     pub genesis: NaiveDate,
+}
+
+impl Resolved {
+    pub fn range(&self) -> DateRange {
+        DateRange {
+            start: self.genesis,
+            end: self.facts.policy().as_of,
+        }
+    }
+
+    /// The surfaces of one window: its quotes (each asset's last observation
+    /// before the window included) over the whole-range FX and splits.
+    pub fn window_surfaces(
+        &self,
+        quotes: Vec<engine::model::RawQuote>,
+    ) -> engine::ResolvedSurfaces {
+        let mut diagnostics = Vec::new();
+        let observations = engine::normalize_quotes(quotes, self.facts.assets(), &mut diagnostics);
+        engine::ResolvedSurfaces {
+            quotes: engine::QuoteSurface::from_observations(&observations),
+            fx: self.surfaces.fx.clone(),
+            splits: self.surfaces.splits.clone(),
+        }
+    }
 }
 
 pub fn resolve(loaded: &LoadedFacts) -> Result<Resolved> {
@@ -101,6 +100,8 @@ pub fn resolve(loaded: &LoadedFacts) -> Result<Resolved> {
         .min()
         .unwrap_or(loaded.as_of)
         .min(loaded.as_of);
+    // The loaded quotes are only those around split dates: enough to tell
+    // which splits the provider already adjusted, over the whole range.
     let surfaces = engine::resolve_surfaces(
         &facts,
         DateRange {
@@ -116,232 +117,7 @@ pub fn resolve(loaded: &LoadedFacts) -> Result<Resolved> {
     })
 }
 
-/// Projects the loaded closure, from the first activity or from `resume`
-/// (the closure state at the day before the new range), in chunks whose
-/// end states become checkpoints, then values every day of the run.
-pub fn compute(
-    loaded: &LoadedFacts,
-    resume: Option<ProjectionState>,
-    cadence: CheckpointCadence,
-) -> Result<Computed> {
-    let Resolved {
-        facts,
-        ledger,
-        surfaces,
-        genesis,
-    } = resolve(loaded)?;
-    let fx = engine::FxResolver {
-        surface: &surfaces.fx,
-        policy: facts.policy(),
-    };
-    let since = resume
-        .as_ref()
-        .map(|state| state.date + chrono::Duration::days(1));
-    let range = DateRange {
-        start: since.unwrap_or(genesis),
-        end: loaded.as_of,
-    };
-
-    // Chunked fold: every chunk end state is a checkpoint (I2 makes the
-    // chunked run equal to one fold over the whole range).
-    let mut state = resume.clone();
-    let mut chunk_start = range.start;
-    let mut keyframes: BTreeMap<AccountId, Vec<Keyframe>> = BTreeMap::new();
-    let mut disposals = Vec::new();
-    let mut closures = Vec::new();
-    let mut diagnostics = Vec::new();
-    let mut checkpoints = Vec::new();
-    let mut ends = cadence.boundaries(range);
-    ends.push(range.end);
-    let mut final_state = None;
-    for end in ends {
-        if end < chunk_start {
-            continue;
-        }
-        let chunk = DateRange {
-            start: chunk_start,
-            end,
-        };
-        let bundle = engine::project(&ledger, &facts, &fx, state.take(), chunk)?;
-        for (account, frames) in bundle.keyframes {
-            keyframes.entry(account).or_default().extend(frames);
-        }
-        disposals.extend(bundle.disposals);
-        closures.extend(bundle.closures);
-        diagnostics.extend(bundle.diagnostics);
-        checkpoints.push(bundle.final_state.clone());
-        state = Some(bundle.final_state.clone());
-        final_state = Some(bundle.final_state);
-        chunk_start = end + chrono::Duration::days(1);
-    }
-    let bundle = ProjectionBundle {
-        keyframes,
-        final_state: final_state.expect("at least one chunk"),
-        disposals,
-        closures,
-        diagnostics,
-    };
-
-    // Valuation sees the resumed state as a keyframe on the day before the
-    // new range, so the first new days carry the right positions; that
-    // synthetic keyframe is never persisted.
-    let mut value_bundle = bundle.clone();
-    if let Some(resumed) = &resume {
-        for (account, state) in &resumed.accounts {
-            // An account that held nothing at the checkpoint has no history
-            // to carry: its first valuation row must come from its first
-            // event, exactly as in a fold from genesis. Seeding a keyframe
-            // here would emit zero-valued rows before the account existed.
-            if is_empty_state(state) {
-                continue;
-            }
-            value_bundle
-                .keyframes
-                .entry(account.clone())
-                .or_default()
-                .insert(
-                    0,
-                    Keyframe {
-                        date: resumed.date,
-                        state: state.clone(),
-                    },
-                );
-        }
-    }
-    let value_range = DateRange {
-        start: resume.as_ref().map(|s| s.date).unwrap_or(genesis),
-        end: loaded.as_of,
-    };
-    let series = engine::value(&engine::ValueInputs {
-        resolved: engine::Resolved {
-            facts: &facts,
-            ledger: &ledger,
-            surfaces: &surfaces,
-            range: value_range,
-        },
-        bundle: &value_bundle,
-    });
-    Ok(Computed {
-        facts,
-        ledger,
-        surfaces,
-        bundle,
-        series,
-        since,
-        checkpoints,
-    })
-}
-
-/// Nothing held, owed or contributed yet: the account did not exist as far
-/// as valuation is concerned.
-fn is_empty_state(state: &AccountState) -> bool {
-    state.positions.is_empty()
-        && state.cash.values().all(|amount| amount.is_zero())
-        && state.cost_basis.is_zero()
-        && state.net_contribution.is_zero()
-        && state.net_contribution_base.is_zero()
-}
-
-/// The closure state at `date` rebuilt from the stored checkpoints of the
-/// closure's accounts; `None` when an account that needs one has none.
-pub fn resume_state(
-    loaded: &LoadedFacts,
-    checkpoints: &[ProjectionCheckpoint],
-    date: NaiveDate,
-) -> Option<ProjectionState> {
-    let tz = parse_user_timezone_or_default(&loaded.timezone);
-    let mut accounts = BTreeMap::new();
-    let mut transfer_cache: BTreeMap<String, Vec<Lot>> = BTreeMap::new();
-    for account in &loaded.raw.accounts {
-        if account.is_archived || account.tracking_mode != "TRANSACTIONS" {
-            continue;
-        }
-        let has_history = loaded.raw.activities.iter().any(|a| {
-            a.account_id == account.id && a.timestamp.with_timezone(&tz).date_naive() <= date
-        });
-        let Some(row) = checkpoints
-            .iter()
-            .find(|c| c.account_id == account.id && c.date == date)
-        else {
-            if has_history {
-                return None;
-            }
-            continue;
-        };
-        let state: AccountState = serde_json::from_str(&row.state).ok()?;
-        let cache: BTreeMap<String, Vec<Lot>> = serde_json::from_str(&row.transfer_cache).ok()?;
-        for (group, lots) in cache {
-            transfer_cache.entry(group).or_insert(lots);
-        }
-        accounts.insert(AccountId::new(&account.id), state);
-    }
-    Some(ProjectionState {
-        date,
-        accounts,
-        transfer_cache,
-    })
-}
-
-/// Valuations of one account from its stored keyframes under the current
-/// surfaces: the revalue-only path for a market-data change or a new day,
-/// no projection and no lot rows. Holdings accounts value their observed
-/// snapshots, which the loaded facts already carry.
-pub fn revalue(
-    loaded: &LoadedFacts,
-    account_id: &str,
-    snapshots: &[AccountStateSnapshot],
-    disposals: &[LotDisposal],
-) -> Result<Vec<DailyAccountValuation>> {
-    let resolved = resolve(loaded)?;
-    let kernel_id = AccountId::new(account_id);
-    let account = resolved
-        .facts
-        .accounts()
-        .get(&kernel_id)
-        .ok_or_else(|| Error::Unexpected(format!("account {account_id} missing from facts")))?;
-    let mut keyframes: Vec<Keyframe> = snapshots
-        .iter()
-        .filter(|s| s.source == SnapshotSource::Calculated)
-        .map(|s| Keyframe {
-            date: s.snapshot_date,
-            state: account_state_from_snapshot(&kernel_id, &account.currency, s),
-        })
-        .collect();
-    keyframes.sort_by_key(|k| k.date);
-    let final_state = ProjectionState {
-        date: loaded.as_of,
-        accounts: keyframes
-            .last()
-            .map(|k| BTreeMap::from([(kernel_id.clone(), k.state.clone())]))
-            .unwrap_or_default(),
-        transfer_cache: BTreeMap::new(),
-    };
-    let bundle = ProjectionBundle {
-        keyframes: BTreeMap::from([(kernel_id.clone(), keyframes)]),
-        final_state,
-        disposals: super::rows::stored_disposals(disposals),
-        closures: Vec::new(),
-        diagnostics: Vec::new(),
-    };
-    let series = engine::value(&engine::ValueInputs {
-        resolved: engine::Resolved {
-            facts: &resolved.facts,
-            ledger: &resolved.ledger,
-            surfaces: &resolved.surfaces,
-            range: DateRange {
-                start: resolved.genesis,
-                end: loaded.as_of,
-            },
-        },
-        bundle: &bundle,
-    });
-    Ok(series
-        .get(&kernel_id)
-        .map(|series| valuation_rows(series, account_id, &loaded.base_currency))
-        .unwrap_or_default())
-}
-
-fn account_state_from_snapshot(
+pub fn account_state_from_snapshot(
     account: &AccountId,
     currency: &Currency,
     snapshot: &AccountStateSnapshot,
@@ -391,164 +167,78 @@ fn stamp() -> String {
         .to_string()
 }
 
-/// One account's rows plus its watermark.
-pub fn account_projection(
-    loaded: &LoadedFacts,
-    computed: &Computed,
-    account_id: &str,
-) -> Result<AccountProjection> {
-    let kernel_id = AccountId::new(account_id);
-    let account = computed
-        .facts
-        .accounts()
-        .get(&kernel_id)
-        .ok_or_else(|| Error::Unexpected(format!("account {account_id} missing from facts")))?;
-    let holdings = account.tracking == engine::model::TrackingMode::Holdings;
-    let fingerprint = loaded
-        .fingerprints
-        .get(account_id)
-        .map(|f| serde_json::to_string(f).unwrap_or_default())
-        .unwrap_or_default();
-
-    let (snapshots, lots, disposals) = if holdings {
-        (None, None, None)
-    } else {
-        (
-            Some(snapshot_rows(computed, account_id, &account.currency)),
-            Some(lot_rows(computed, account_id)),
-            Some(disposal_rows(computed, account_id)),
-        )
-    };
-    let valuations: Vec<DailyAccountValuation> = computed
-        .series
-        .get(&kernel_id)
-        .map(|series| valuation_rows(series, account_id, &loaded.base_currency))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|row| {
-            computed
-                .since
-                .is_none_or(|since| row.valuation_date >= since)
-        })
-        .collect();
-    let checkpoints = if holdings {
-        None
-    } else {
-        Some(
-            computed
-                .checkpoints
-                .iter()
-                .filter_map(|state| {
-                    let account_state = state.accounts.get(&kernel_id)?;
-                    Some(ProjectionCheckpoint {
-                        account_id: account_id.to_string(),
-                        date: state.date,
-                        state: serde_json::to_string(account_state).ok()?,
-                        transfer_cache: serde_json::to_string(&state.transfer_cache).ok()?,
-                    })
-                })
-                .collect(),
-        )
-    };
-
-    Ok(AccountProjection {
-        account_id: account_id.to_string(),
-        snapshots,
-        lots,
-        disposals,
-        valuations,
-        watermark: ProjectionWatermark {
-            account_id: account_id.to_string(),
-            engine: KERNEL_ENGINE.to_string(),
-            fingerprint,
-            as_of: loaded.as_of,
-            computed_at: crate::utils::clock::now(),
-        },
-        since: computed.since,
-        checkpoints,
-    })
-}
-
 pub fn snapshot_rows(
-    computed: &Computed,
+    frames: &[&Keyframe],
     account_id: &str,
     currency: &engine::model::Currency,
 ) -> Vec<AccountStateSnapshot> {
-    let kernel_id = AccountId::new(account_id);
     let now = crate::utils::clock::now();
-    computed
-        .bundle
-        .keyframes
-        .get(&kernel_id)
-        .map(|frames| {
-            frames
+    frames
+        .iter()
+        .map(|frame| {
+            let state = &frame.state;
+            let positions: HashMap<String, Position> = state
+                .positions
                 .iter()
-                .map(|frame| {
-                    let state = &frame.state;
-                    let positions: HashMap<String, Position> = state
-                        .positions
-                        .iter()
-                        .map(|(asset, p)| {
-                            (
-                                asset.as_str().to_string(),
-                                Position {
-                                    id: format!("{}-{}", account_id, asset),
-                                    account_id: account_id.to_string(),
-                                    asset_id: asset.as_str().to_string(),
-                                    quantity: p.quantity,
-                                    average_cost: p.average_cost,
-                                    total_cost_basis: p.total_cost_basis,
-                                    currency: p.currency.as_str().to_string(),
-                                    inception_date: p.inception,
-                                    lots: Default::default(),
-                                    created_at: p.inception,
-                                    last_updated: now,
-                                    is_alternative: p.alternative,
-                                    contract_multiplier: p.contract_multiplier,
-                                    cost_basis_account: p.cost_basis_account,
-                                    cost_basis_base: p.cost_basis_base,
-                                },
-                            )
-                        })
-                        .collect();
-                    AccountStateSnapshot {
-                        id: AccountStateSnapshot::stable_id(account_id, frame.date),
-                        account_id: account_id.to_string(),
-                        snapshot_date: frame.date,
-                        currency: currency.as_str().to_string(),
-                        positions,
-                        cash_balances: state
-                            .cash
-                            .iter()
-                            .map(|(c, a)| (c.as_str().to_string(), *a))
-                            .collect(),
-                        cost_basis: state.cost_basis,
-                        net_contribution: state.net_contribution,
-                        net_contribution_base: state.net_contribution_base,
-                        cash_total_account_currency: state.cash_total_account,
-                        cash_total_base_currency: state.cash_total_base,
-                        calculated_at: now.naive_utc(),
-                        source: SnapshotSource::Calculated,
-                    }
+                .map(|(asset, p)| {
+                    (
+                        asset.as_str().to_string(),
+                        Position {
+                            id: format!("{}-{}", account_id, asset),
+                            account_id: account_id.to_string(),
+                            asset_id: asset.as_str().to_string(),
+                            quantity: p.quantity,
+                            average_cost: p.average_cost,
+                            total_cost_basis: p.total_cost_basis,
+                            currency: p.currency.as_str().to_string(),
+                            inception_date: p.inception,
+                            lots: Default::default(),
+                            created_at: p.inception,
+                            last_updated: now,
+                            is_alternative: p.alternative,
+                            contract_multiplier: p.contract_multiplier,
+                            cost_basis_account: p.cost_basis_account,
+                            cost_basis_base: p.cost_basis_base,
+                        },
+                    )
                 })
-                .collect()
+                .collect();
+            AccountStateSnapshot {
+                id: AccountStateSnapshot::stable_id(account_id, frame.date),
+                account_id: account_id.to_string(),
+                snapshot_date: frame.date,
+                currency: currency.as_str().to_string(),
+                positions,
+                cash_balances: state
+                    .cash
+                    .iter()
+                    .map(|(c, a)| (c.as_str().to_string(), *a))
+                    .collect(),
+                cost_basis: state.cost_basis,
+                net_contribution: state.net_contribution,
+                net_contribution_base: state.net_contribution_base,
+                cash_total_account_currency: state.cash_total_account,
+                cash_total_base_currency: state.cash_total_base,
+                calculated_at: now.naive_utc(),
+                source: SnapshotSource::Calculated,
+            }
         })
-        .unwrap_or_default()
+        .collect()
 }
 
-pub fn lot_rows(computed: &Computed, account_id: &str) -> Vec<LotRecord> {
-    let fx = engine::FxResolver {
-        surface: &computed.surfaces.fx,
-        policy: computed.facts.policy(),
-    };
-    let base = computed.facts.policy().base_currency.as_str().to_string();
-    let account_currency = computed
+pub fn lot_rows(
+    resolved: &Resolved,
+    records: Vec<engine::model::LotRecord>,
+    account_id: &str,
+) -> Vec<LotRecord> {
+    let base = resolved.facts.policy().base_currency.as_str().to_string();
+    let account_currency = resolved
         .facts
         .accounts()
         .get(&AccountId::new(account_id))
         .map(|a| a.currency.as_str().to_string());
     let now = stamp();
-    engine::lot_records(&computed.bundle, &computed.facts, &fx)
+    records
         .into_iter()
         .filter(|lot| lot.account.as_str() == account_id)
         .map(|lot| LotRecord {
@@ -580,20 +270,23 @@ pub fn lot_rows(computed: &Computed, account_id: &str) -> Vec<LotRecord> {
             close_activity_id: lot
                 .close_event
                 .as_ref()
-                .and_then(|e| activity_of(computed, e)),
+                .and_then(|e| activity_of(resolved, e)),
             created_at: now.clone(),
             updated_at: now.clone(),
         })
         .collect()
 }
 
-pub fn disposal_rows(computed: &Computed, account_id: &str) -> Vec<LotDisposal> {
-    let base = computed.facts.policy().base_currency.as_str().to_string();
+pub fn disposal_rows(
+    resolved: &Resolved,
+    disposals: &[&engine::model::LotDisposal],
+    account_id: &str,
+) -> Vec<LotDisposal> {
+    let base = resolved.facts.policy().base_currency.as_str().to_string();
     let now = stamp();
-    let mut rows: Vec<&engine::model::LotDisposal> = computed
-        .bundle
-        .disposals
+    let mut rows: Vec<&engine::model::LotDisposal> = disposals
         .iter()
+        .copied()
         .filter(|d| d.account.as_str() == account_id)
         .collect();
     rows.sort_by(|a, b| {
@@ -610,7 +303,7 @@ pub fn disposal_rows(computed: &Computed, account_id: &str) -> Vec<LotDisposal> 
             asset_id: d.asset.as_str().to_string(),
             // Composite legs (`{activity}:buy`) reference their activity:
             // `lot_disposals.disposal_activity_id` is a NOT NULL foreign key.
-            disposal_activity_id: activity_of(computed, &d.event).unwrap_or_default(),
+            disposal_activity_id: activity_of(resolved, &d.event).unwrap_or_default(),
             disposal_date: d.date.to_string(),
             quantity: d.quantity.to_string(),
             proceeds: d.proceeds.to_string(),
@@ -630,8 +323,8 @@ pub fn disposal_rows(computed: &Computed, account_id: &str) -> Vec<LotDisposal> 
 
 /// The stored activity an event derives from (composite legs map to their
 /// parent activity).
-fn activity_of(computed: &Computed, event: &engine::model::EventId) -> Option<String> {
-    computed
+fn activity_of(resolved: &Resolved, event: &engine::model::EventId) -> Option<String> {
+    resolved
         .ledger
         .source_of(event)
         .map(|a| a.as_str().to_string())

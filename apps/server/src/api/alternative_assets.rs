@@ -186,7 +186,6 @@ async fn create_alternative_asset(
             account_ids: None,
             market_sync_mode: MarketSyncMode::None,
             force_full: false,
-            earliest_change_at: None,
         },
     );
 
@@ -231,7 +230,6 @@ async fn update_alternative_asset_valuation(
             account_ids: None,
             market_sync_mode: MarketSyncMode::None,
             force_full: false,
-            earliest_change_at: None,
         },
     );
 
@@ -296,7 +294,6 @@ async fn delete_alternative_asset(
             account_ids: None,
             market_sync_mode: MarketSyncMode::None,
             force_full: false,
-            earliest_change_at: None,
         },
     );
 

@@ -293,21 +293,11 @@ diesel::table! {
 }
 
 diesel::table! {
-    projection_watermarks (account_id) {
-        account_id -> Text,
-        engine -> Text,
-        fingerprint -> Text,
-        as_of -> Text,
-        computed_at -> Text,
-    }
-}
-
-diesel::table! {
-    projection_checkpoints (account_id, checkpoint_date) {
-        account_id -> Text,
-        checkpoint_date -> Text,
-        state -> Text,
-        transfer_cache -> Text,
+    projection_state (scope) {
+        scope -> Text,
+        dirty_from -> Nullable<Text>,
+        version -> BigInt,
+        rejections -> Text,
     }
 }
 

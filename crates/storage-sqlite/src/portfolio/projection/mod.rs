@@ -1,16 +1,19 @@
-//! Kernel projection persistence: one transaction per account across
-//! snapshots, positions, lots, disposals, valuations and the watermark.
+//! Kernel projection persistence: the markers triggers record (see the
+//! `projection_state` migration), windowed row writes, and the end-of-run
+//! commit of lot books, rejections and consumed markers.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use diesel::prelude::*;
+use diesel::sql_types::{BigInt, Nullable, Text};
 use diesel::sqlite::SqliteConnection;
 use wealthfolio_core::errors::Result;
 use wealthfolio_core::portfolio::projection::{
-    AccountProjection, ProjectionCheckpoint, ProjectionStoreTrait, ProjectionWatermark,
+    MarkerScope, ProjectionMarker, ProjectionStoreTrait, RejectedActivity, RunCompletion,
+    WindowRows, GENESIS,
 };
 use wealthfolio_core::portfolio::snapshot::Position;
 
@@ -19,83 +22,6 @@ use crate::errors::StorageError;
 use crate::lots::{filter_and_normalize_lots, LotDisposalDB, LotRecordDB};
 use crate::portfolio::snapshot::{AccountStateSnapshotDB, SnapshotRepository};
 use crate::portfolio::valuation::DailyAccountValuationDB;
-use crate::schema::{projection_checkpoints, projection_watermarks};
-
-#[derive(Debug, Clone, Queryable, Insertable, AsChangeset)]
-#[diesel(table_name = projection_watermarks)]
-struct ProjectionWatermarkDB {
-    account_id: String,
-    engine: String,
-    fingerprint: String,
-    as_of: String,
-    computed_at: String,
-}
-
-#[derive(Debug, Clone, Queryable, Insertable)]
-#[diesel(table_name = projection_checkpoints)]
-struct ProjectionCheckpointDB {
-    account_id: String,
-    checkpoint_date: String,
-    state: String,
-    transfer_cache: String,
-}
-
-impl From<&ProjectionCheckpoint> for ProjectionCheckpointDB {
-    fn from(checkpoint: &ProjectionCheckpoint) -> Self {
-        Self {
-            account_id: checkpoint.account_id.clone(),
-            checkpoint_date: checkpoint.date.to_string(),
-            state: checkpoint.state.clone(),
-            transfer_cache: checkpoint.transfer_cache.clone(),
-        }
-    }
-}
-
-impl TryFrom<ProjectionCheckpointDB> for ProjectionCheckpoint {
-    type Error = StorageError;
-
-    fn try_from(row: ProjectionCheckpointDB) -> std::result::Result<Self, StorageError> {
-        let date = NaiveDate::parse_from_str(&row.checkpoint_date, "%Y-%m-%d")
-            .map_err(|e| StorageError::SerializationError(format!("checkpoint_date: {e}")))?;
-        Ok(Self {
-            account_id: row.account_id,
-            date,
-            state: row.state,
-            transfer_cache: row.transfer_cache,
-        })
-    }
-}
-
-impl From<&ProjectionWatermark> for ProjectionWatermarkDB {
-    fn from(watermark: &ProjectionWatermark) -> Self {
-        Self {
-            account_id: watermark.account_id.clone(),
-            engine: watermark.engine.clone(),
-            fingerprint: watermark.fingerprint.clone(),
-            as_of: watermark.as_of.to_string(),
-            computed_at: watermark.computed_at.to_rfc3339(),
-        }
-    }
-}
-
-impl TryFrom<ProjectionWatermarkDB> for ProjectionWatermark {
-    type Error = StorageError;
-
-    fn try_from(row: ProjectionWatermarkDB) -> std::result::Result<Self, StorageError> {
-        let as_of = NaiveDate::parse_from_str(&row.as_of, "%Y-%m-%d")
-            .map_err(|e| StorageError::SerializationError(format!("as_of: {e}")))?;
-        let computed_at = DateTime::parse_from_rfc3339(&row.computed_at)
-            .map(|d| d.with_timezone(&Utc))
-            .map_err(|e| StorageError::SerializationError(format!("computed_at: {e}")))?;
-        Ok(Self {
-            account_id: row.account_id,
-            engine: row.engine,
-            fingerprint: row.fingerprint,
-            as_of,
-            computed_at,
-        })
-    }
-}
 
 pub struct ProjectionStore {
     pool: Arc<DbPool>,
@@ -109,6 +35,34 @@ impl ProjectionStore {
 }
 
 const SOURCE_CALCULATED: &str = "CALCULATED";
+
+/// Lowers a marker's dirty day and bumps its version, as the triggers do.
+const INVALIDATE: &str = "INSERT INTO projection_state (scope, dirty_from, version) VALUES (?, ?, 1) \
+     ON CONFLICT (scope) DO UPDATE SET \
+     dirty_from = min(coalesce(projection_state.dirty_from, excluded.dirty_from), excluded.dirty_from), \
+     version = projection_state.version + 1";
+
+#[derive(QueryableByName)]
+struct MarkerRow {
+    #[diesel(sql_type = Text)]
+    scope: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    dirty_from: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    version: i64,
+}
+
+#[derive(QueryableByName)]
+struct LastValuedRow {
+    #[diesel(sql_type = Text)]
+    account_id: String,
+    #[diesel(sql_type = Text)]
+    day: String,
+}
+
+fn parse_day(raw: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok()
+}
 
 /// Disposal rows must reference a stored lot and a stored activity
 /// (`lot_disposals` foreign keys). A row that cannot is dropped with a
@@ -157,128 +111,220 @@ fn referentially_valid_disposals(
         .collect())
 }
 
+struct PreparedWindow {
+    account: String,
+    start: String,
+    end: Option<String>,
+    snapshots: Option<Vec<AccountStateSnapshotDB>>,
+    positions: Vec<(String, HashMap<String, Position>)>,
+    valuations: Vec<DailyAccountValuationDB>,
+}
+
+fn write_window_rows(conn: &mut SqliteConnection, window: PreparedWindow) -> Result<()> {
+    let PreparedWindow {
+        account,
+        start,
+        end,
+        snapshots,
+        positions,
+        valuations,
+    } = window;
+    if let Some(snapshots) = snapshots {
+        use crate::schema::holdings_snapshots::dsl as hs;
+        // Only calculated rows are the projection's; manual and imported
+        // snapshots are the user's (REG-0913).
+        let target = hs::holdings_snapshots
+            .filter(hs::account_id.eq(&account))
+            .filter(hs::source.eq(SOURCE_CALCULATED))
+            .filter(hs::snapshot_date.ge(&start));
+        match &end {
+            Some(end) => diesel::delete(target.filter(hs::snapshot_date.le(end)))
+                .execute(conn)
+                .map_err(StorageError::from)?,
+            None => diesel::delete(target)
+                .execute(conn)
+                .map_err(StorageError::from)?,
+        };
+        for chunk in snapshots.chunks(1000) {
+            diesel::replace_into(hs::holdings_snapshots)
+                .values(chunk)
+                .execute(conn)
+                .map_err(StorageError::from)?;
+        }
+        for (snapshot_id, positions) in &positions {
+            SnapshotRepository::write_snapshot_positions(conn, snapshot_id, positions)?;
+        }
+    }
+    use crate::schema::daily_account_valuation::dsl as v;
+    let target = v::daily_account_valuation
+        .filter(v::account_id.eq(&account))
+        .filter(v::valuation_date.ge(&start));
+    match &end {
+        Some(end) => diesel::delete(target.filter(v::valuation_date.le(end)))
+            .execute(conn)
+            .map_err(StorageError::from)?,
+        None => diesel::delete(target)
+            .execute(conn)
+            .map_err(StorageError::from)?,
+    };
+    for chunk in valuations.chunks(1000) {
+        diesel::replace_into(v::daily_account_valuation)
+            .values(chunk)
+            .execute(conn)
+            .map_err(StorageError::from)?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl ProjectionStoreTrait for ProjectionStore {
-    fn get_watermarks(&self, account_ids: &[String]) -> Result<Vec<ProjectionWatermark>> {
-        use crate::schema::projection_watermarks::dsl;
+    fn pending_markers(&self) -> Result<Vec<ProjectionMarker>> {
+        let mut conn = get_connection(&self.pool)?;
+        let rows: Vec<MarkerRow> = diesel::sql_query(
+            "SELECT scope, dirty_from, version FROM projection_state WHERE dirty_from IS NOT NULL",
+        )
+        .load(&mut conn)
+        .map_err(StorageError::from)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ProjectionMarker {
+                scope: MarkerScope::parse(&row.scope),
+                // A day the triggers could not date means "everything".
+                dirty_from: row
+                    .dirty_from
+                    .as_deref()
+                    .and_then(parse_day)
+                    .unwrap_or(GENESIS),
+                version: row.version,
+            })
+            .collect())
+    }
+
+    fn last_valued_days(&self) -> Result<HashMap<String, NaiveDate>> {
+        let mut conn = get_connection(&self.pool)?;
+        let rows: Vec<LastValuedRow> = diesel::sql_query(
+            "SELECT account_id, MAX(valuation_date) AS day FROM daily_account_valuation \
+             GROUP BY account_id",
+        )
+        .load(&mut conn)
+        .map_err(StorageError::from)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| Some((row.account_id, parse_day(&row.day)?)))
+            .collect())
+    }
+
+    fn rejections(&self, account_ids: &[String]) -> Result<Vec<RejectedActivity>> {
+        use crate::schema::projection_state::dsl as ps;
         if account_ids.is_empty() {
             return Ok(Vec::new());
         }
         let mut conn = get_connection(&self.pool)?;
-        let rows: Vec<ProjectionWatermarkDB> = dsl::projection_watermarks
-            .filter(dsl::account_id.eq_any(account_ids))
+        let rows: Vec<String> = ps::projection_state
+            .filter(ps::scope.eq_any(account_ids))
+            .select(ps::rejections)
             .load(&mut conn)
             .map_err(StorageError::from)?;
-        rows.into_iter()
-            .map(|row| ProjectionWatermark::try_from(row).map_err(Into::into))
-            .collect()
+        Ok(rows
+            .iter()
+            .flat_map(|row| serde_json::from_str::<Vec<RejectedActivity>>(row).unwrap_or_default())
+            .collect())
     }
 
-    fn get_checkpoints(&self, account_ids: &[String]) -> Result<Vec<ProjectionCheckpoint>> {
-        use crate::schema::projection_checkpoints::dsl;
-        let mut conn = get_connection(&self.pool)?;
-        dsl::projection_checkpoints
-            .filter(dsl::account_id.eq_any(account_ids))
-            .load::<ProjectionCheckpointDB>(&mut conn)
-            .map_err(StorageError::from)?
+    async fn write_window(&self, rows: Vec<WindowRows>) -> Result<()> {
+        let prepared: Vec<PreparedWindow> = rows
             .into_iter()
-            .map(|row| ProjectionCheckpoint::try_from(row).map_err(Into::into))
-            .collect()
-    }
-
-    async fn persist_account_projection(&self, projection: AccountProjection) -> Result<()> {
-        let account = projection.account_id.clone();
-        let since = projection.since.map(|d| d.to_string());
-        let snapshot_positions: Option<Vec<(String, HashMap<String, Position>)>> =
-            projection.snapshots.as_ref().map(|rows| {
-                rows.iter()
-                    .map(|s| (s.id.clone(), s.positions.clone()))
-                    .collect()
-            });
-        let snapshots: Option<Vec<AccountStateSnapshotDB>> = projection
-            .snapshots
-            .map(|rows| rows.into_iter().map(AccountStateSnapshotDB::from).collect());
-        let lots: Option<Vec<LotRecordDB>> = projection
-            .lots
-            .as_ref()
-            .map(|rows| rows.iter().map(LotRecordDB::from).collect());
-        let disposals: Option<Vec<LotDisposalDB>> = projection
-            .disposals
-            .as_ref()
-            .map(|rows| rows.iter().map(LotDisposalDB::from).collect());
-        let valuations: Vec<DailyAccountValuationDB> = projection
-            .valuations
-            .into_iter()
-            .map(DailyAccountValuationDB::from)
+            .map(|rows| PreparedWindow {
+                account: rows.account_id,
+                start: rows.start.to_string(),
+                end: rows.end.map(|d| d.to_string()),
+                positions: rows
+                    .snapshots
+                    .as_ref()
+                    .map(|snapshots| {
+                        snapshots
+                            .iter()
+                            .map(|s| (s.id.clone(), s.positions.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                snapshots: rows.snapshots.map(|snapshots| {
+                    snapshots
+                        .into_iter()
+                        .map(AccountStateSnapshotDB::from)
+                        .collect()
+                }),
+                valuations: rows
+                    .valuations
+                    .into_iter()
+                    .map(DailyAccountValuationDB::from)
+                    .collect(),
+            })
             .collect();
-        let checkpoints: Option<Vec<ProjectionCheckpointDB>> = projection
-            .checkpoints
-            .as_ref()
-            .map(|rows| rows.iter().map(ProjectionCheckpointDB::from).collect());
-        let watermark = ProjectionWatermarkDB::from(&projection.watermark);
-
         self.writer
             .exec(move |conn: &mut SqliteConnection| {
-                if let Some(snapshots) = snapshots {
-                    use crate::schema::holdings_snapshots::dsl as hs;
-                    // Only calculated rows are the projection's; manual and
-                    // imported snapshots are the user's (REG-0913). A resumed
-                    // run keeps the rows before its start.
-                    let target = hs::holdings_snapshots
-                        .filter(hs::account_id.eq(&account))
-                        .filter(hs::source.eq(SOURCE_CALCULATED));
-                    match &since {
-                        Some(since) => diesel::delete(target.filter(hs::snapshot_date.ge(since)))
-                            .execute(conn)
-                            .map_err(StorageError::from)?,
-                        None => diesel::delete(target)
-                            .execute(conn)
-                            .map_err(StorageError::from)?,
-                    };
-                    if !snapshots.is_empty() {
-                        diesel::replace_into(hs::holdings_snapshots)
-                            .values(&snapshots)
-                            .execute(conn)
-                            .map_err(StorageError::from)?;
-                    }
-                    for (snapshot_id, positions) in snapshot_positions.iter().flatten() {
-                        SnapshotRepository::write_snapshot_positions(conn, snapshot_id, positions)?;
-                    }
+                for window in prepared {
+                    write_window_rows(conn, window)?;
                 }
-                if let Some(lots) = lots {
-                    use crate::schema::lots::dsl as l;
-                    // A resumed run re-emits every lot still open at its start
-                    // and every closure inside it; lots closed before it stay.
-                    let target = l::lots.filter(l::account_id.eq(&account));
-                    match &since {
-                        Some(since) => diesel::delete(
-                            target.filter(l::is_closed.eq(0).or(l::close_date.ge(since.clone()))),
+                Ok(())
+            })
+            .await
+    }
+
+    async fn complete_run(&self, completion: RunCompletion) -> Result<()> {
+        let books: Vec<(String, String, Vec<LotRecordDB>, Vec<LotDisposalDB>)> = completion
+            .lot_books
+            .iter()
+            .map(|book| {
+                (
+                    book.account_id.clone(),
+                    book.since.to_string(),
+                    book.lots.iter().map(LotRecordDB::from).collect(),
+                    book.disposals.iter().map(LotDisposalDB::from).collect(),
+                )
+            })
+            .collect();
+        let rejections: Vec<(String, String)> = completion
+            .rejections
+            .iter()
+            .map(|(account, rejected)| {
+                (
+                    account.clone(),
+                    serde_json::to_string(rejected).unwrap_or_else(|_| "[]".to_string()),
+                )
+            })
+            .collect();
+        let consumed = completion.consumed;
+        self.writer
+            .exec(move |conn: &mut SqliteConnection| {
+                for (account, since, lots, disposals) in books {
+                    {
+                        use crate::schema::lots::dsl as l;
+                        // Lots closed before `since` are history the run did
+                        // not touch; open lots are re-emitted whole.
+                        diesel::delete(
+                            l::lots
+                                .filter(l::account_id.eq(&account))
+                                .filter(l::is_closed.eq(0).or(l::close_date.ge(since.clone()))),
                         )
                         .execute(conn)
-                        .map_err(StorageError::from)?,
-                        None => diesel::delete(target)
-                            .execute(conn)
-                            .map_err(StorageError::from)?,
-                    };
-                    let normalized = filter_and_normalize_lots(conn, lots, &account)?;
-                    if !normalized.is_empty() {
-                        diesel::insert_into(l::lots)
-                            .values(&normalized)
-                            .execute(conn)
-                            .map_err(StorageError::from)?;
+                        .map_err(StorageError::from)?;
+                        let normalized = filter_and_normalize_lots(conn, lots, &account)?;
+                        if !normalized.is_empty() {
+                            diesel::insert_into(l::lots)
+                                .values(&normalized)
+                                .execute(conn)
+                                .map_err(StorageError::from)?;
+                        }
                     }
-                }
-                if let Some(disposals) = disposals {
                     use crate::schema::lot_disposals::dsl as d;
-                    let target = d::lot_disposals.filter(d::account_id.eq(&account));
-                    match &since {
-                        Some(since) => diesel::delete(target.filter(d::disposal_date.ge(since)))
-                            .execute(conn)
-                            .map_err(StorageError::from)?,
-                        None => diesel::delete(target)
-                            .execute(conn)
-                            .map_err(StorageError::from)?,
-                    };
+                    diesel::delete(
+                        d::lot_disposals
+                            .filter(d::account_id.eq(&account))
+                            .filter(d::disposal_date.ge(&since)),
+                    )
+                    .execute(conn)
+                    .map_err(StorageError::from)?;
                     let disposals = referentially_valid_disposals(conn, disposals, &account)?;
                     if !disposals.is_empty() {
                         diesel::insert_into(d::lot_disposals)
@@ -287,44 +333,46 @@ impl ProjectionStoreTrait for ProjectionStore {
                             .map_err(StorageError::from)?;
                     }
                 }
-                {
-                    use crate::schema::daily_account_valuation::dsl as v;
-                    let target = v::daily_account_valuation.filter(v::account_id.eq(&account));
-                    match &since {
-                        Some(since) => diesel::delete(target.filter(v::valuation_date.ge(since)))
-                            .execute(conn)
-                            .map_err(StorageError::from)?,
-                        None => diesel::delete(target)
-                            .execute(conn)
-                            .map_err(StorageError::from)?,
-                    };
-                    for chunk in valuations.chunks(1000) {
-                        diesel::replace_into(v::daily_account_valuation)
-                            .values(chunk)
-                            .execute(conn)
-                            .map_err(StorageError::from)?;
-                    }
+                for (account, rejected) in rejections {
+                    diesel::sql_query(
+                        "INSERT INTO projection_state (scope, dirty_from, version, rejections) \
+                         VALUES (?, NULL, 0, ?) \
+                         ON CONFLICT (scope) DO UPDATE SET rejections = excluded.rejections",
+                    )
+                    .bind::<Text, _>(&account)
+                    .bind::<Text, _>(&rejected)
+                    .execute(conn)
+                    .map_err(StorageError::from)?;
                 }
-                if let Some(checkpoints) = checkpoints {
-                    use crate::schema::projection_checkpoints::dsl as c;
-                    let target = c::projection_checkpoints.filter(c::account_id.eq(&account));
-                    match &since {
-                        Some(since) => diesel::delete(target.filter(c::checkpoint_date.ge(since)))
-                            .execute(conn)
-                            .map_err(StorageError::from)?,
-                        None => diesel::delete(target)
-                            .execute(conn)
-                            .map_err(StorageError::from)?,
+                for marker in consumed {
+                    // A write since the run read the marker bumped its version:
+                    // that change is not in the run, so the marker stays.
+                    let statement = match marker.scope {
+                        MarkerScope::Account(_) => {
+                            "UPDATE projection_state SET dirty_from = NULL \
+                             WHERE scope = ? AND version = ?"
+                        }
+                        _ => "DELETE FROM projection_state WHERE scope = ? AND version = ?",
                     };
-                    if !checkpoints.is_empty() {
-                        diesel::replace_into(c::projection_checkpoints)
-                            .values(&checkpoints)
-                            .execute(conn)
-                            .map_err(StorageError::from)?;
-                    }
+                    diesel::sql_query(statement)
+                        .bind::<Text, _>(marker.scope.key())
+                        .bind::<BigInt, _>(marker.version)
+                        .execute(conn)
+                        .map_err(StorageError::from)?;
                 }
-                diesel::replace_into(projection_watermarks::table)
-                    .values(&watermark)
+                Ok(())
+            })
+            .await
+    }
+
+    async fn invalidate(&self, scope: MarkerScope, from: NaiveDate) -> Result<()> {
+        let key = scope.key();
+        let day = from.to_string();
+        self.writer
+            .exec(move |conn: &mut SqliteConnection| {
+                diesel::sql_query(INVALIDATE)
+                    .bind::<Text, _>(&key)
+                    .bind::<Text, _>(&day)
                     .execute(conn)
                     .map_err(StorageError::from)?;
                 Ok(())
@@ -343,6 +391,7 @@ mod tests {
     use tempfile::tempdir;
     use wealthfolio_core::lots::{LotDisposal, LotRecord, LotRepositoryTrait};
     use wealthfolio_core::portfolio::economic_events::BasisStatus;
+    use wealthfolio_core::portfolio::projection::LotBook;
     use wealthfolio_core::portfolio::snapshot::{AccountStateSnapshot, Position, SnapshotSource};
     use wealthfolio_core::portfolio::valuation::{
         DailyAccountValuation, ExternalFlowSource, ValuationRepositoryTrait, ValuationStatus,
@@ -352,8 +401,6 @@ mod tests {
     use crate::db::{create_pool, get_connection, run_migrations, write_actor::spawn_writer};
     use crate::lots::LotsRepository;
     use crate::portfolio::valuation::ValuationRepository;
-    use wealthfolio_core::portfolio::projection::ProjectionCheckpoint;
-
     struct Db {
         pool: Arc<DbPool>,
         writer: WriteHandle,
@@ -519,277 +566,364 @@ mod tests {
         }
     }
 
-    fn watermark(fingerprint: &str) -> ProjectionWatermark {
-        ProjectionWatermark {
-            account_id: "acc1".to_string(),
-            engine: "kernel".to_string(),
-            fingerprint: fingerprint.to_string(),
-            as_of: date(10),
-            computed_at: Utc::now(),
-        }
+    fn sql(db: &Db, statement: &str) {
+        let mut conn = get_connection(&db.pool).unwrap();
+        diesel::sql_query(statement).execute(&mut conn).unwrap();
     }
 
-    fn projection(days: &[u32], lots: Vec<LotRecord>, fingerprint: &str) -> AccountProjection {
-        AccountProjection {
+    /// (dirty day, version) of a scope, `None` when no row.
+    fn marker(db: &Db, scope: &str) -> Option<(Option<String>, i64)> {
+        let mut conn = get_connection(&db.pool).unwrap();
+        let rows: Vec<MarkerRow> = diesel::sql_query(
+            "SELECT scope, dirty_from, version FROM projection_state WHERE scope = ?",
+        )
+        .bind::<Text, _>(scope)
+        .load(&mut conn)
+        .unwrap();
+        rows.into_iter()
+            .next()
+            .map(|row| (row.dirty_from, row.version))
+    }
+
+    fn dirty(db: &Db, scope: &str) -> Option<String> {
+        marker(db, scope).and_then(|(day, _)| day)
+    }
+
+    fn window(start: u32, end: Option<u32>, days: &[u32]) -> WindowRows {
+        WindowRows {
             account_id: "acc1".to_string(),
+            start: date(start),
+            end: end.map(date),
             snapshots: Some(days.iter().map(|d| snapshot(*d, "10")).collect()),
-            lots: Some(lots),
-            disposals: Some(vec![disposal("d-1")]),
             valuations: days
                 .iter()
                 .map(|d| valuation(*d, 1500 + *d as i64))
                 .collect(),
-            watermark: watermark(fingerprint),
-            since: None,
-            checkpoints: None,
         }
     }
 
     #[tokio::test]
-    async fn projection_round_trips_and_replaces_atomically() {
+    async fn the_first_run_rebuilds_everything() {
         let db = setup();
         let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());
-        let snapshots =
-            crate::portfolio::snapshot::SnapshotRepository::new(db.pool.clone(), db.writer.clone());
-        let lots = LotsRepository::new(db.pool.clone(), db.writer.clone());
-        let valuations = ValuationRepository::new(db.pool.clone(), db.writer.clone());
-
-        store
-            .persist_account_projection(projection(
-                &[2, 3, 4],
-                vec![lot("lot-1"), lot("lot-2")],
-                "fp-1",
-            ))
-            .await
-            .unwrap();
-
-        let stored_snapshots = snapshots
-            .get_snapshots_by_account("acc1", None, None)
-            .unwrap();
-        assert_eq!(stored_snapshots.len(), 3);
-        assert_eq!(
-            stored_snapshots[0].positions["AAPL"].quantity,
-            Decimal::from(10)
-        );
-        assert_eq!(stored_snapshots[0].cash_balances["USD"], Decimal::from(500));
-        let stored_lots = lots.get_all_lots_for_account("acc1").await.unwrap();
-        assert_eq!(stored_lots.len(), 2);
-        let stored_disposals = lots.get_lot_disposals_for_account("acc1").await.unwrap();
-        assert_eq!(stored_disposals.len(), 1);
-        assert_eq!(stored_disposals[0].realized_pnl_base, "80");
-        let stored_valuations = valuations
-            .get_historical_valuations("acc1", None, None)
-            .unwrap();
-        assert_eq!(stored_valuations.len(), 3);
-        assert_eq!(stored_valuations[2].total_value_base, Decimal::from(1504));
-        let marks = store.get_watermarks(&["acc1".to_string()]).unwrap();
-        assert_eq!(marks.len(), 1);
-        assert_eq!(marks[0].fingerprint, "fp-1");
-        assert_eq!(marks[0].as_of, date(10));
-
-        // A second projection replaces every section and upserts the watermark.
-        store
-            .persist_account_projection(projection(&[2, 3], vec![lot("lot-1")], "fp-2"))
-            .await
-            .unwrap();
-        assert_eq!(
-            snapshots
-                .get_snapshots_by_account("acc1", None, None)
-                .unwrap()
-                .len(),
-            2
-        );
-        let stored_lots = lots.get_all_lots_for_account("acc1").await.unwrap();
-        assert_eq!(stored_lots.len(), 1);
-        assert_eq!(stored_lots[0].id, "lot-1");
-        assert_eq!(
-            valuations
-                .get_historical_valuations("acc1", None, None)
-                .unwrap()
-                .len(),
-            2
-        );
-        let marks = store.get_watermarks(&["acc1".to_string()]).unwrap();
-        assert_eq!(marks.len(), 1);
-        assert_eq!(marks[0].fingerprint, "fp-2");
-
-        // Holdings-mode shape: snapshots and lots untouched, valuations replaced.
-        store
-            .persist_account_projection(AccountProjection {
-                account_id: "acc1".to_string(),
-                snapshots: None,
-                lots: None,
-                disposals: None,
-                valuations: vec![valuation(7, 1700)],
-                watermark: watermark("fp-3"),
-                since: None,
-                checkpoints: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            snapshots
-                .get_snapshots_by_account("acc1", None, None)
-                .unwrap()
-                .len(),
-            2
-        );
-        assert_eq!(
-            lots.get_all_lots_for_account("acc1").await.unwrap().len(),
-            1
-        );
-        let stored_valuations = valuations
-            .get_historical_valuations("acc1", None, None)
-            .unwrap();
-        assert_eq!(stored_valuations.len(), 1);
-        assert_eq!(stored_valuations[0].valuation_date, date(7));
+        let markers = store.pending_markers().unwrap();
+        assert!(markers
+            .iter()
+            .any(|m| m.scope == MarkerScope::All && m.dirty_from == GENESIS));
+        // The fixture's sell-1 (2025-01-05) marked its account a day early.
+        assert!(markers.iter().any(
+            |m| m.scope == MarkerScope::Account("acc1".to_string()) && m.dirty_from == date(4)
+        ));
     }
 
     #[tokio::test]
-    async fn manual_snapshots_survive_a_projection_rewrite() {
+    async fn activity_writes_mark_their_account_and_transfer_partners() {
+        let db = setup();
+        sql(
+            &db,
+            "INSERT INTO accounts (id, name, account_type, currency, is_default, is_active, \
+             created_at, updated_at, tracking_mode, is_archived) \
+             VALUES ('acc2', 'Other', 'SECURITIES', 'USD', 0, 1, datetime('now'), datetime('now'), 'TRANSACTIONS', 0)",
+        );
+        let insert = |id: &str, account: &str, day: &str, group: &str| {
+            format!(
+                "INSERT INTO activities (id, account_id, activity_type, status, activity_date, currency, \
+                 source_group_id, is_user_modified, needs_review, created_at, updated_at) \
+                 VALUES ('{id}', '{account}', 'TRANSFER_OUT', 'POSTED', '{day}', 'USD', '{group}', 0, 0, \
+                 datetime('now'), datetime('now'))"
+            )
+        };
+        sql(&db, &insert("out-1", "acc1", "2025-01-20T15:00:00Z", "g1"));
+        assert_eq!(dirty(&db, "acc2"), None);
+        // The partner leg marks both accounts, each from its own leg's day.
+        sql(&db, &insert("in-1", "acc2", "2025-01-21T15:00:00Z", "g1"));
+        assert_eq!(dirty(&db, "acc2").as_deref(), Some("2025-01-20"));
+        assert_eq!(dirty(&db, "acc1").as_deref(), Some("2025-01-04"));
+
+        let (_, before) = marker(&db, "acc1").unwrap();
+        sql(&db, "UPDATE activities SET notes = 'x' WHERE id = 'in-1'");
+        let (_, after) = marker(&db, "acc1").unwrap();
+        assert!(after > before, "every write bumps the partner's version");
+
+        // Backdating lowers the day; deleting marks the partner again.
+        sql(
+            &db,
+            "UPDATE activities SET activity_date = '2024-12-01T10:00:00Z' WHERE id = 'in-1'",
+        );
+        assert_eq!(dirty(&db, "acc2").as_deref(), Some("2024-11-30"));
+        sql(&db, "DELETE FROM activities WHERE id = 'out-1'");
+        assert_eq!(dirty(&db, "acc1").as_deref(), Some("2025-01-04"));
+    }
+
+    #[tokio::test]
+    async fn prices_revalue_their_holders_and_fx_refolds_everything() {
+        let db = setup();
+        let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());
+        store
+            .complete_run(RunCompletion {
+                consumed: store.pending_markers().unwrap(),
+                ..RunCompletion::default()
+            })
+            .await
+            .unwrap();
+        assert!(store.pending_markers().unwrap().is_empty());
+
+        sql(
+            &db,
+            "INSERT INTO quotes (id, asset_id, day, source, close, currency, created_at, timestamp) \
+             VALUES ('q1', 'AAPL', '2025-01-03', 'YAHOO', '100', 'USD', datetime('now'), '2025-01-03T00:00:00Z')",
+        );
+        assert_eq!(dirty(&db, "q:AAPL").as_deref(), Some("2025-01-03"));
+        assert_eq!(dirty(&db, "@all"), None);
+
+        sql(
+            &db,
+            "INSERT INTO assets (id, kind, is_active, quote_mode, quote_ccy, created_at, updated_at) \
+             VALUES ('FX:EURUSD', 'FX', 1, 'MARKET', 'USD', datetime('now'), datetime('now'))",
+        );
+        sql(
+            &db,
+            "INSERT INTO quotes (id, asset_id, day, source, close, currency, created_at, timestamp) \
+             VALUES ('q2', 'FX:EURUSD', '2025-01-02', 'YAHOO', '1.1', 'USD', datetime('now'), '2025-01-02T00:00:00Z')",
+        );
+        assert_eq!(dirty(&db, "@all").as_deref(), Some("2025-01-02"));
+        assert_eq!(dirty(&db, "q:FX:EURUSD"), None);
+    }
+
+    #[tokio::test]
+    async fn only_engine_facts_of_assets_accounts_and_settings_mark() {
+        let db = setup();
+        sql(&db, "UPDATE assets SET name = 'Apple' WHERE id = 'AAPL'");
+        assert_eq!(
+            marker(&db, "a:AAPL"),
+            None,
+            "a profile edit changes nothing"
+        );
+        sql(
+            &db,
+            "UPDATE assets SET metadata = '{\"contractMultiplier\": 10}' WHERE id = 'AAPL'",
+        );
+        assert_eq!(dirty(&db, "a:AAPL").as_deref(), Some("0001-01-01"));
+
+        sql(
+            &db,
+            "UPDATE accounts SET name = 'Renamed' WHERE id = 'acc1'",
+        );
+        sql(
+            &db,
+            "UPDATE accounts SET meta = '{\"broker\": {\"lastSync\": \"x\"}}' WHERE id = 'acc1'",
+        );
+        assert_eq!(dirty(&db, "acc1").as_deref(), Some("2025-01-04"));
+        sql(
+            &db,
+            "UPDATE accounts SET meta = '{\"accounting\": {\"costBasisMethod\": \"LIFO\"}}' \
+             WHERE id = 'acc1'",
+        );
+        assert_eq!(dirty(&db, "acc1").as_deref(), Some("0001-01-01"));
+        sql(
+            &db,
+            "UPDATE projection_state SET dirty_from = '2025-01-04' WHERE scope = 'acc1'",
+        );
+        sql(
+            &db,
+            "UPDATE accounts SET currency = 'CAD' WHERE id = 'acc1'",
+        );
+        assert_eq!(dirty(&db, "acc1").as_deref(), Some("0001-01-01"));
+
+        let (_, before) = marker(&db, "@all").unwrap();
+        sql(
+            &db,
+            "INSERT INTO app_settings (setting_key, setting_value) VALUES ('theme', 'dark')",
+        );
+        assert_eq!(marker(&db, "@all").unwrap().1, before);
+        sql(
+            &db,
+            "INSERT INTO app_settings (setting_key, setting_value) VALUES ('base_currency', 'EUR') \
+             ON CONFLICT (setting_key) DO UPDATE SET setting_value = excluded.setting_value",
+        );
+        assert!(marker(&db, "@all").unwrap().1 > before);
+    }
+
+    #[tokio::test]
+    async fn projection_writes_do_not_mark_but_manual_snapshots_do() {
         let db = setup();
         let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());
         let snapshots = SnapshotRepository::new(db.pool.clone(), db.writer.clone());
+        let before = marker(&db, "acc1").unwrap();
+        store
+            .write_window(vec![window(2, None, &[2, 3])])
+            .await
+            .unwrap();
+        assert_eq!(marker(&db, "acc1").unwrap(), before);
+
+        let mut manual = snapshot(1, "5");
+        manual.id = "acc1_manual".to_string();
+        manual.source = SnapshotSource::ManualEntry;
+        snapshots.save_snapshots(&[manual]).await.unwrap();
+        assert_eq!(dirty(&db, "acc1").as_deref(), Some("2025-01-01"));
+    }
+
+    #[tokio::test]
+    async fn a_window_replaces_only_its_own_rows() {
+        let db = setup();
+        let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());
+        let snapshots = SnapshotRepository::new(db.pool.clone(), db.writer.clone());
+        let valuations = ValuationRepository::new(db.pool.clone(), db.writer.clone());
         let mut manual = snapshot(3, "10");
-        manual.id = "acc1_2025-01-03".to_string();
+        manual.id = "acc1_manual".to_string();
         manual.source = SnapshotSource::ManualEntry;
         snapshots.save_snapshots(&[manual]).await.unwrap();
 
         store
-            .persist_account_projection(projection(&[2, 4], vec![lot("lot-1")], "fp-1"))
+            .write_window(vec![window(2, None, &[2, 3, 4, 5, 6])])
+            .await
+            .unwrap();
+        // A later bounded window, then the open-ended tail from day 7.
+        store
+            .write_window(vec![window(4, Some(5), &[4])])
             .await
             .unwrap();
         store
-            .persist_account_projection(projection(&[2, 5], vec![lot("lot-1")], "fp-2"))
+            .write_window(vec![window(7, None, &[])])
             .await
             .unwrap();
 
-        let stored = snapshots
+        let calculated: Vec<NaiveDate> = snapshots
             .get_snapshots_by_account("acc1", None, None)
-            .unwrap();
-        let manual_rows: Vec<_> = stored
-            .iter()
-            .filter(|s| s.source == SnapshotSource::ManualEntry)
-            .collect();
-        assert_eq!(
-            manual_rows.len(),
-            1,
-            "manual snapshot survives every rewrite"
-        );
-        assert_eq!(manual_rows[0].snapshot_date, date(3));
-        let calculated: Vec<NaiveDate> = stored
+            .unwrap()
             .iter()
             .filter(|s| s.source == SnapshotSource::Calculated)
             .map(|s| s.snapshot_date)
             .collect();
-        assert_eq!(calculated, vec![date(2), date(5)]);
-    }
-
-    #[tokio::test]
-    async fn disposals_without_a_stored_activity_are_dropped_not_fatal() {
-        let db = setup();
-        let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());
-        let lots_repo = LotsRepository::new(db.pool.clone(), db.writer.clone());
-        let mut orphan = disposal("disp-orphan");
-        orphan.disposal_activity_id = "drip-1:buy".to_string();
-        let mut projection = projection(&[2, 5], vec![lot("lot-1")], "fp-1");
-        projection.disposals = Some(vec![disposal("disp-1"), orphan]);
-        store.persist_account_projection(projection).await.unwrap();
-
-        let stored = lots_repo
-            .get_lot_disposals_for_account("acc1")
-            .await
-            .unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].id, "disp-1");
+        assert_eq!(calculated, vec![date(2), date(3), date(4), date(6)]);
+        let manual_rows = snapshots
+            .get_snapshots_by_account("acc1", None, None)
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.source == SnapshotSource::ManualEntry)
+            .count();
+        assert_eq!(manual_rows, 1, "manual snapshots survive every rewrite");
+        let valued: Vec<NaiveDate> = valuations
+            .get_historical_valuations("acc1", None, None)
+            .unwrap()
+            .iter()
+            .map(|v| v.valuation_date)
+            .collect();
+        assert_eq!(valued, vec![date(2), date(3), date(4), date(6)]);
         assert_eq!(
-            store.get_watermarks(&["acc1".to_string()]).unwrap().len(),
-            1
+            store.last_valued_days().unwrap().get("acc1"),
+            Some(&date(6))
         );
     }
 
     #[tokio::test]
-    async fn a_resumed_projection_keeps_the_rows_before_its_start() {
+    async fn completing_a_run_commits_the_lot_book_and_clears_what_it_saw() {
         let db = setup();
         let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());
-        let snapshots = SnapshotRepository::new(db.pool.clone(), db.writer.clone());
         let lots = LotsRepository::new(db.pool.clone(), db.writer.clone());
-        let valuations = ValuationRepository::new(db.pool.clone(), db.writer.clone());
-        let checkpoint = |day: u32| ProjectionCheckpoint {
-            account_id: "acc1".to_string(),
-            date: date(day),
-            state: format!("{{\"day\":{day}}}"),
-            transfer_cache: "{}".to_string(),
-        };
 
-        // Full run: days 2..5, one lot closed on day 3 and one still open.
         let mut closed = lot("lot-closed");
         closed.is_closed = true;
         closed.close_date = Some("2025-01-03".to_string());
         closed.remaining_quantity = "0".to_string();
-        let mut full = projection(&[2, 3, 4, 5], vec![closed.clone(), lot("lot-open")], "fp-1");
         let mut early = disposal("d-early");
         early.lot_id = "lot-closed".to_string();
         early.disposal_date = "2025-01-03".to_string();
-        full.disposals = Some(vec![early]);
-        full.checkpoints = Some(vec![checkpoint(3), checkpoint(5)]);
-        store.persist_account_projection(full).await.unwrap();
+        let seen = store.pending_markers().unwrap();
+        store
+            .complete_run(RunCompletion {
+                lot_books: vec![LotBook {
+                    account_id: "acc1".to_string(),
+                    since: GENESIS,
+                    lots: vec![closed, lot("lot-open")],
+                    disposals: vec![early],
+                }],
+                rejections: vec![(
+                    "acc1".to_string(),
+                    vec![RejectedActivity {
+                        activity_id: "sell-1".to_string(),
+                        message: "rejected".to_string(),
+                    }],
+                )],
+                consumed: seen.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(store.pending_markers().unwrap().is_empty());
+        assert_eq!(
+            store.rejections(&["acc1".to_string()]).unwrap(),
+            vec![RejectedActivity {
+                activity_id: "sell-1".to_string(),
+                message: "rejected".to_string(),
+            }]
+        );
 
-        // Resume from day 4: rows dated 4+ are replaced, earlier rows stay.
-        let mut resumed = projection(&[4, 5, 6], vec![lot("lot-open")], "fp-2");
+        // From day 4: the lot closed before stays, open lots and later
+        // disposals are replaced, an orphan disposal is dropped.
         let mut late = disposal("d-late");
         late.lot_id = "lot-open".to_string();
         late.disposal_date = "2025-01-05".to_string();
-        resumed.disposals = Some(vec![late]);
-        resumed.since = Some(date(4));
-        resumed.checkpoints = Some(vec![checkpoint(6)]);
-        store.persist_account_projection(resumed).await.unwrap();
-
-        let stored_snapshots = snapshots
-            .get_snapshots_by_account("acc1", None, None)
+        let mut orphan = disposal("d-orphan");
+        orphan.disposal_activity_id = "drip-1:buy".to_string();
+        sql(&db, "UPDATE activities SET notes = 'x' WHERE id = 'sell-1'");
+        let stale = store.pending_markers().unwrap();
+        sql(&db, "UPDATE activities SET notes = 'y' WHERE id = 'sell-1'");
+        store
+            .complete_run(RunCompletion {
+                lot_books: vec![LotBook {
+                    account_id: "acc1".to_string(),
+                    since: date(4),
+                    lots: vec![lot("lot-open")],
+                    disposals: vec![late, orphan],
+                }],
+                rejections: vec![("acc1".to_string(), Vec::new())],
+                consumed: stale,
+            })
+            .await
             .unwrap();
-        let snapshot_days: Vec<NaiveDate> =
-            stored_snapshots.iter().map(|s| s.snapshot_date).collect();
-        assert_eq!(
-            snapshot_days,
-            vec![date(2), date(3), date(4), date(5), date(6)]
-        );
-        let stored_lots = lots.get_all_lots_for_account("acc1").await.unwrap();
-        let mut lot_ids: Vec<&str> = stored_lots.iter().map(|l| l.id.as_str()).collect();
-        lot_ids.sort();
-        assert_eq!(
-            lot_ids,
-            vec!["lot-closed", "lot-open"],
-            "closed-before-start lot kept"
-        );
-        let stored_disposals = lots.get_lot_disposals_for_account("acc1").await.unwrap();
-        let mut disposal_ids: Vec<&str> = stored_disposals.iter().map(|d| d.id.as_str()).collect();
-        disposal_ids.sort();
-        assert_eq!(
-            disposal_ids,
-            vec!["d-early", "d-late"],
-            "the disposal before the start stays, the later one is replaced"
-        );
-        let stored_valuations = valuations
-            .get_historical_valuations("acc1", None, None)
-            .unwrap();
-        let valuation_days: Vec<NaiveDate> =
-            stored_valuations.iter().map(|v| v.valuation_date).collect();
-        assert_eq!(
-            valuation_days,
-            vec![date(2), date(3), date(4), date(5), date(6)]
-        );
-        let mut checkpoint_days: Vec<NaiveDate> = store
-            .get_checkpoints(&["acc1".to_string()])
+        let mut lot_ids: Vec<String> = lots
+            .get_all_lots_for_account("acc1")
+            .await
             .unwrap()
-            .iter()
-            .map(|c| c.date)
+            .into_iter()
+            .map(|l| l.id)
             .collect();
-        checkpoint_days.sort();
-        assert_eq!(checkpoint_days, vec![date(3), date(6)]);
+        lot_ids.sort();
+        assert_eq!(lot_ids, vec!["lot-closed", "lot-open"]);
+        let mut disposal_ids: Vec<String> = lots
+            .get_lot_disposals_for_account("acc1")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        disposal_ids.sort();
+        assert_eq!(disposal_ids, vec!["d-early", "d-late"]);
+        assert!(store.rejections(&["acc1".to_string()]).unwrap().is_empty());
         assert_eq!(
-            store.get_watermarks(&["acc1".to_string()]).unwrap()[0].fingerprint,
-            "fp-2"
+            dirty(&db, "acc1").as_deref(),
+            Some("2025-01-04"),
+            "a write after the run read the marker keeps it"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_lowers_and_bumps() {
+        let db = setup();
+        let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());
+        store
+            .invalidate(MarkerScope::Account("acc1".to_string()), date(2))
+            .await
+            .unwrap();
+        assert_eq!(dirty(&db, "acc1").as_deref(), Some("2025-01-02"));
+        let (_, version) = marker(&db, "acc1").unwrap();
+        store
+            .invalidate(MarkerScope::Account("acc1".to_string()), date(9))
+            .await
+            .unwrap();
+        assert_eq!(
+            marker(&db, "acc1").unwrap(),
+            (Some("2025-01-02".to_string()), version + 1)
         );
     }
 }

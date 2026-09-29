@@ -106,7 +106,6 @@ pub async fn run_portfolio_request(
         account_ids: payload.account_ids,
         market_sync: payload.market_sync_mode,
         force_full: payload.force_full,
-        earliest_change_at: payload.earliest_change_at,
     };
     let observer = TauriJobObserver::new(app_handle.clone(), Arc::clone(context));
     match context

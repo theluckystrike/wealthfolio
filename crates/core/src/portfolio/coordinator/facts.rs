@@ -1,7 +1,8 @@
-//! Loads the kernel's `RawFacts` for a scope from the repositories and
-//! fingerprints each requested account from the same rows.
+//! Loads the kernel's `RawFacts` for a scope from the repositories. Activities,
+//! FX rates and observed snapshots are loaded whole; quotes are loaded per
+//! window (`window_quotes`), plus the few around split dates up front.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
@@ -12,12 +13,12 @@ use wealthfolio_portfolio_engine::model::{
 
 use std::sync::Arc;
 
-use super::fingerprint::{content_hash, AccountFingerprint};
 use crate::accounts::{AccountRepositoryTrait, TrackingMode};
 use crate::activities::{Activity, ActivityRepositoryTrait};
 use crate::assets::AssetRepositoryTrait;
 use crate::errors::{Error, Result};
 use crate::fx::FxRepositoryTrait;
+use crate::portfolio::projection::ProjectionStoreTrait;
 use crate::portfolio::snapshot::{
     snapshot_date_requires_remediation, SnapshotRepositoryTrait, SnapshotSource,
 };
@@ -32,6 +33,8 @@ pub struct FactSources {
     pub quotes: Arc<dyn QuoteServiceTrait>,
     pub fx_rates: Arc<dyn FxRepositoryTrait>,
     pub snapshots: Arc<dyn SnapshotRepositoryTrait>,
+    /// Rejections of the last run, which the read path leaves out.
+    pub projections: Arc<dyn ProjectionStoreTrait>,
 }
 
 impl FactSources {
@@ -267,12 +270,48 @@ fn raw_fx_rate(r: &crate::fx::ExchangeRate) -> RawFxRate {
     }
 }
 
+/// Days of closes loaded before and after a split date to tell whether the
+/// provider already adjusted the series.
+const SPLIT_QUOTES_BEFORE_DAYS: i64 = 10;
+const SPLIT_QUOTES_AFTER_DAYS: i64 = 31;
+
+/// Quotes of one window: every observation from `start` through `end`, plus
+/// each asset's last observation before `start`, so a price carries into the
+/// window exactly as it would through the whole range.
+pub fn window_quotes(
+    deps: &FactSources,
+    asset_ids: &[String],
+    start: NaiveDate,
+    end: NaiveDate,
+) -> Result<Vec<RawQuote>> {
+    if asset_ids.is_empty() || start > end {
+        return Ok(Vec::new());
+    }
+    let mut rows: Vec<crate::quotes::Quote> = match start.pred_opt() {
+        Some(before) => deps
+            .quotes
+            .get_latest_quotes_as_of(asset_ids, before)?
+            .into_values()
+            .collect(),
+        None => Vec::new(),
+    };
+    let symbols: HashSet<String> = asset_ids.iter().cloned().collect();
+    rows.extend(
+        deps.quotes
+            .get_sparse_quotes_in_range(&symbols, start, end)?,
+    );
+    Ok(rows.iter().map(raw_quote).collect())
+}
+
 pub struct LoadedFacts {
     /// Accounts the job persists (requested, non-archived, sorted).
     pub scope: Vec<String>,
-    /// Facts for the transfer closure of the scope.
+    /// Facts for the transfer closure of the scope; `raw.quotes` holds only
+    /// the closes around split dates.
     pub raw: RawFacts,
-    pub fingerprints: BTreeMap<String, AccountFingerprint>,
+    /// Every asset the closure's activities or observed snapshots reference:
+    /// whose quotes each window loads.
+    pub asset_ids: Vec<String>,
     /// Holdings accounts with an observed snapshot outside the supported
     /// date range (account id, date): they fail instead of projecting.
     pub invalid_snapshot_dates: Vec<(String, NaiveDate)>,
@@ -423,29 +462,21 @@ pub fn load(
         })
         .collect();
 
-    let earliest = activities
-        .iter()
-        .map(|a| a.activity_date.date_naive())
-        .chain(observed_snapshots.iter().map(|s| s.date))
-        .min()
-        .unwrap_or(as_of);
-    let quote_rows = if asset_ids.is_empty() {
-        Vec::new()
-    } else {
-        let symbols: HashSet<String> = asset_ids.iter().cloned().collect();
-        deps.quotes
-            .get_sparse_quotes_in_range(&symbols, earliest, as_of)?
-    };
-    let quotes: Vec<RawQuote> = quote_rows
-        .iter()
-        .map(|q| RawQuote {
-            asset_id: q.asset_id.clone(),
-            day: q.timestamp.date_naive(),
-            close: q.close,
-            currency: q.currency.clone(),
-            source: q.data_source.clone(),
-        })
-        .collect();
+    // Split detection looks at the closes around each split, over the whole
+    // range; every other quote is read per window.
+    let mut quotes = Vec::new();
+    for activity in activities.iter().filter(|a| a.effective_type() == "SPLIT") {
+        let Some(asset) = &activity.asset_id else {
+            continue;
+        };
+        let day = activity.activity_date.date_naive();
+        quotes.extend(window_quotes(
+            deps,
+            std::slice::from_ref(asset),
+            day - chrono::Duration::days(SPLIT_QUOTES_BEFORE_DAYS),
+            (day + chrono::Duration::days(SPLIT_QUOTES_AFTER_DAYS)).min(as_of),
+        )?);
+    }
 
     let fx_rows = deps.fx_rates.get_historical_exchange_rates()?;
     let fx_rates: Vec<RawFxRate> = fx_rows
@@ -468,116 +499,9 @@ pub fn load(
 
     let raw_activities: Vec<RawActivity> = activities.iter().map(|a| raw_activity(a)).collect();
 
-    // Fingerprints for the requested accounts.
-    let policy_key = format!("{base_currency}|{timezone}");
-    let fx_count = fx_rows.len();
-    let fx_keys: Vec<String> = fx_rows
-        .iter()
-        .map(|r| {
-            format!(
-                "{}|{}|{}|{}",
-                r.from_currency,
-                r.to_currency,
-                r.timestamp.date_naive(),
-                r.rate
-            )
-        })
-        .collect();
-    let fx_hash = content_hash(fx_keys.iter().map(String::as_str));
-    let mut fingerprints = BTreeMap::new();
-    for account in all_accounts.iter().filter(|a| scope.contains(&a.id)) {
-        let own: Vec<&Activity> = activities
-            .iter()
-            .copied()
-            .filter(|a| a.account_id == account.id)
-            .collect();
-        let own_groups: HashSet<&str> = own
-            .iter()
-            .filter_map(|a| a.source_group_id.as_deref())
-            .collect();
-        let partners: Vec<&Activity> = activities
-            .iter()
-            .copied()
-            .filter(|a| {
-                a.account_id != account.id
-                    && a.source_group_id
-                        .as_deref()
-                        .is_some_and(|g| own_groups.contains(g))
-            })
-            .collect();
-        let settings = accounting.get(&account.id);
-        let mut own_assets: BTreeSet<&str> =
-            own.iter().filter_map(|a| a.asset_id.as_deref()).collect();
-        let observed: Vec<&RawObservedSnapshot> = observed_snapshots
-            .iter()
-            .filter(|s| s.account_id == account.id)
-            .collect();
-        own_assets.extend(
-            observed
-                .iter()
-                .flat_map(|s| s.positions.iter().map(|p| p.asset_id.as_str())),
-        );
-        let asset_keys: Vec<String> = asset_rows
-            .iter()
-            .filter(|a| own_assets.contains(a.id.as_str()))
-            .map(|a| {
-                format!(
-                    "{}|{}|{}|{}|{}",
-                    a.id,
-                    a.kind.as_db_str(),
-                    a.instrument_type
-                        .as_ref()
-                        .map(|t| t.as_db_str())
-                        .unwrap_or(""),
-                    a.quote_ccy,
-                    a.contract_multiplier()
-                )
-            })
-            .collect();
-        let quote_keys: Vec<String> = quote_rows
-            .iter()
-            .filter(|q| own_assets.contains(q.asset_id.as_str()))
-            .map(|q| format!("{}|{}|{}", q.asset_id, q.timestamp.date_naive(), q.close))
-            .collect();
-        let observed_keys: Vec<String> = observed
-            .iter()
-            .map(|s| serde_json::to_string(s).unwrap_or_default())
-            .collect();
-        fingerprints.insert(
-            account.id.clone(),
-            AccountFingerprint {
-                activity_count: own.len(),
-                activities_updated_at: own.iter().map(|a| a.updated_at).max(),
-                partner_activity_count: partners.len(),
-                partner_activities_updated_at: partners.iter().map(|a| a.updated_at).max(),
-                account: format!(
-                    "{}|{}|{}|{}|{}|{}|{:?}",
-                    account.currency,
-                    account.account_type,
-                    tracking_label(account.tracking_mode),
-                    account.is_archived,
-                    settings
-                        .map(|s| s.cost_basis_method.as_str())
-                        .unwrap_or("FIFO"),
-                    settings
-                        .map(|s| s.cost_basis_profile.as_str())
-                        .unwrap_or("GENERIC"),
-                    settings.map(|s| s.pooling_scope),
-                ),
-                assets: asset_keys,
-                observed_snapshot_count: observed.len(),
-                observed_snapshots_hash: content_hash(observed_keys.iter().map(String::as_str)),
-                policy: policy_key.clone(),
-                quote_count: quote_keys.len(),
-                quotes_hash: content_hash(quote_keys.iter().map(String::as_str)),
-                fx_count,
-                fx_hash,
-            },
-        );
-    }
-
     Ok(LoadedFacts {
         scope,
+        asset_ids: asset_id_vec,
         raw: RawFacts {
             policy,
             accounts,
@@ -587,7 +511,6 @@ pub fn load(
             fx_rates,
             observed_snapshots,
         },
-        fingerprints,
         invalid_snapshot_dates,
         unsupported_accounts,
         base_currency: base_currency.to_string(),

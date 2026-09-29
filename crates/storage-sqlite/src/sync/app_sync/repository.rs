@@ -769,18 +769,19 @@ fn reset_restore_dependent_read_models(
         || table_set.contains("assets")
         || table_set.contains("activities")
     {
-        // Derived rows go, so the projection watermarks that vouch for them
-        // must go too: the next consistency check then rebuilds everything.
-        for table in [
-            "lot_disposals",
-            "lots",
-            "daily_account_valuation",
-            "projection_watermarks",
-        ] {
+        // Derived rows go, so everything is stale: the next run rebuilds it.
+        for table in ["lot_disposals", "lots", "daily_account_valuation"] {
             diesel::sql_query(format!("DELETE FROM {}", quote_identifier(table)))
                 .execute(conn)
                 .map_err(StorageError::from)?;
         }
+        diesel::sql_query(
+            "INSERT INTO projection_state (scope, dirty_from, version) VALUES ('@all', '0001-01-01', 1) \
+             ON CONFLICT (scope) DO UPDATE SET dirty_from = '0001-01-01', \
+             version = projection_state.version + 1",
+        )
+        .execute(conn)
+        .map_err(StorageError::from)?;
     }
 
     Ok(())

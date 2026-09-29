@@ -95,7 +95,6 @@ fn is_broad_market_update(payload: &PortfolioRequestPayload) -> bool {
     payload.account_ids.is_none()
         && payload.market_sync_mode.requires_sync()
         && payload.market_sync_mode.asset_ids().is_none()
-        && payload.earliest_change_at.is_none()
         && !payload.force_full
 }
 

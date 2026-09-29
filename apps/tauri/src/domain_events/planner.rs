@@ -78,11 +78,6 @@ pub fn plan_portfolio_job(events: &[DomainEvent]) -> Option<PortfolioRequestPayl
     let mut asset_ids: HashSet<String> = HashSet::new();
     let mut has_recalc_events = false;
     let mut recalculate_all_accounts = false;
-    // The earliest changed instant lets the coordinator resume from the
-    // checkpoint before it instead of folding from the first activity; an
-    // undated change means the coordinator decides from its fingerprints.
-    let mut earliest_change_at: Option<chrono::DateTime<chrono::Utc>> = None;
-    let mut undated_change = false;
     // Price-only batches use saved quotes. Other events retain their normal sync.
     let needs_market_sync = events.iter().any(|event| {
         !matches!(
@@ -98,33 +93,16 @@ pub fn plan_portfolio_job(events: &[DomainEvent]) -> Option<PortfolioRequestPayl
             DomainEvent::ActivitiesChanged {
                 account_ids: acc_ids,
                 asset_ids: a_ids,
-                earliest_activity_at_utc,
                 ..
             } => {
                 has_recalc_events = true;
                 account_ids.extend(acc_ids.iter().cloned());
                 asset_ids.extend(a_ids.iter().cloned());
-                match earliest_activity_at_utc {
-                    Some(at) => {
-                        earliest_change_at = Some(earliest_change_at.map_or(*at, |e| e.min(*at)))
-                    }
-                    None => undated_change = true,
-                }
             }
-            DomainEvent::AssetSplitActivitiesChanged {
-                asset_ids: ids,
-                earliest_activity_at_utc,
-                ..
-            } => {
+            DomainEvent::AssetSplitActivitiesChanged { asset_ids: ids, .. } => {
                 has_recalc_events = true;
                 recalculate_all_accounts = true;
                 asset_ids.extend(ids.iter().filter(|id| !id.is_empty()).cloned());
-                match earliest_activity_at_utc {
-                    Some(at) => {
-                        earliest_change_at = Some(earliest_change_at.map_or(*at, |e| e.min(*at)))
-                    }
-                    None => undated_change = true,
-                }
             }
             DomainEvent::HoldingsChanged {
                 account_ids: acc_ids,
@@ -154,9 +132,8 @@ pub fn plan_portfolio_job(events: &[DomainEvent]) -> Option<PortfolioRequestPayl
             DomainEvent::AssetsCreated { asset_ids: ids } => {
                 asset_ids.extend(ids.iter().filter(|id| !id.is_empty()).cloned());
             }
-            // Saved prices changed: every account revalues. The coordinator
-            // sees the new quotes in its market-data fingerprint, so no
-            // forced rebuild and no dated change are needed.
+            // Saved prices changed: the quote triggers marked their holders
+            // for a revalue; the job only has to run.
             DomainEvent::PriceHistoryChanged => {
                 has_recalc_events = true;
                 recalculate_all_accounts = true;
@@ -182,9 +159,6 @@ pub fn plan_portfolio_job(events: &[DomainEvent]) -> Option<PortfolioRequestPayl
     }
 
     let mut builder = PortfolioRequestPayload::builder();
-    if !undated_change {
-        builder = builder.earliest_change_at(earliest_change_at);
-    }
     if !recalculate_all_accounts && !account_ids.is_empty() {
         builder = builder.account_ids(Some(account_ids.into_iter().collect()));
     }
@@ -673,27 +647,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_portfolio_job_carries_the_earliest_change_only_when_every_event_is_dated() {
-        let early: chrono::DateTime<chrono::Utc> = "2025-01-03T10:00:00Z".parse().unwrap();
-        let late: chrono::DateTime<chrono::Utc> = "2025-01-09T10:00:00Z".parse().unwrap();
-        let dated = |at: Option<chrono::DateTime<chrono::Utc>>| DomainEvent::ActivitiesChanged {
-            account_ids: vec!["acc1".to_string()],
-            asset_ids: vec!["AAPL".to_string()],
-            currencies: vec!["USD".to_string()],
-            earliest_activity_at_utc: at,
-        };
-        let payload = plan_portfolio_job(&[dated(Some(late)), dated(Some(early))]).unwrap();
-        assert_eq!(payload.earliest_change_at, Some(early));
-        assert!(!payload.force_full);
-
-        let payload = plan_portfolio_job(&[dated(Some(late)), dated(None)]).unwrap();
-        assert_eq!(
-            payload.earliest_change_at, None,
-            "an undated change is not dated by its neighbours"
-        );
-    }
-
-    #[test]
     fn price_history_notifications_do_not_schedule_market_fetches() {
         let events = vec![
             DomainEvent::PriceHistoryChanged,
@@ -702,7 +655,6 @@ mod tests {
         let job = plan_portfolio_job(&events).unwrap();
         assert!(!job.market_sync_mode.requires_sync());
         assert!(job.account_ids.is_none());
-        assert!(job.earliest_change_at.is_none());
     }
 
     #[test]
@@ -719,6 +671,5 @@ mod tests {
         let job = plan_portfolio_job(&events).unwrap();
         assert!(job.account_ids.is_none());
         assert!(job.market_sync_mode.requires_sync());
-        assert!(job.earliest_change_at.is_none());
     }
 }

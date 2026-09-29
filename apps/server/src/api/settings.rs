@@ -73,7 +73,6 @@ async fn update_settings(
                 account_ids: None,
                 market_sync_mode: MarketSyncMode::None,
                 force_full: false,
-                earliest_change_at: None,
             };
 
             if let Err(err) = process_portfolio_job(state_for_job, job_config).await {

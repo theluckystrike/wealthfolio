@@ -1,9 +1,12 @@
-//! Storage contract for kernel projections: one atomic write per account
-//! (keyframes, lots, disposals, valuations and the watermark row) and the
-//! watermark reads the consistency check needs (architecture §3.3).
+//! Storage contract for kernel projections (architecture §3.3). Triggers record
+//! what the stored rows no longer reflect in the same transaction as the fact
+//! that changed; a run reads those markers, rewrites rows one window at a
+//! time, then commits the lot book and clears the markers it consumed.
+
+use std::collections::HashMap;
 
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use crate::errors::Result;
@@ -11,58 +14,120 @@ use crate::lots::{LotDisposal, LotRecord};
 use crate::portfolio::snapshot::AccountStateSnapshot;
 use crate::portfolio::valuation::DailyAccountValuation;
 
-/// What was last projected for an account and from which facts.
+/// "Recompute everything": the day the triggers write for a change that has
+/// no date (account or asset facts, policy, the first run).
+pub const GENESIS: NaiveDate = match NaiveDate::from_ymd_opt(1, 1, 1) {
+    Some(day) => day,
+    None => panic!("valid date"),
+};
+
+/// What a marker says is stale.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MarkerScope {
+    /// The account's facts changed: refold it.
+    Account(String),
+    /// An asset's facts changed: refold its holders.
+    Asset(String),
+    /// An asset's prices changed: revalue its holders.
+    Prices(String),
+    /// FX or policy changed: refold every account.
+    All,
+}
+
+impl MarkerScope {
+    pub fn parse(key: &str) -> Self {
+        if key == "@all" {
+            Self::All
+        } else if let Some(asset) = key.strip_prefix("a:") {
+            Self::Asset(asset.to_string())
+        } else if let Some(asset) = key.strip_prefix("q:") {
+            Self::Prices(asset.to_string())
+        } else {
+            Self::Account(key.to_string())
+        }
+    }
+
+    /// The stored `scope` key.
+    pub fn key(&self) -> String {
+        match self {
+            Self::Account(id) => id.clone(),
+            Self::Asset(id) => format!("a:{id}"),
+            Self::Prices(id) => format!("q:{id}"),
+            Self::All => "@all".to_string(),
+        }
+    }
+}
+
+/// A pending invalidation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionMarker {
+    pub scope: MarkerScope,
+    /// First local day whose stored rows are stale.
+    pub dirty_from: NaiveDate,
+    /// Bumped by every write to the marker: a run clears it only when the
+    /// version it read is still current.
+    pub version: i64,
+}
+
+/// An activity the last run rejected: it contributed nothing to the stored
+/// rows, and performance leaves it out too.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectionWatermark {
-    pub account_id: String,
-    /// Engine that wrote the rows (`kernel`).
-    pub engine: String,
-    /// Serialized [`crate::portfolio::coordinator::AccountFingerprint`].
-    pub fingerprint: String,
-    /// Policy day the projection ran for.
-    pub as_of: NaiveDate,
-    pub computed_at: DateTime<Utc>,
+#[serde(rename_all = "camelCase")]
+pub struct RejectedActivity {
+    pub activity_id: String,
+    pub message: String,
 }
 
-/// The kernel's projection state of one account at the end of a chunk: the
-/// starting point of a resumed run (architecture §3.3 chunk watermark). `state` is
-/// the account's `AccountState` as JSON; `transfer_cache` the closure's
-/// in-flight transfer lots at that date, also JSON.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProjectionCheckpoint {
-    pub account_id: String,
-    pub date: NaiveDate,
-    pub state: String,
-    pub transfer_cache: String,
-}
-
-/// Everything one account's projection writes, committed together.
+/// One account's rows for one window of a run: stored rows dated from `start`
+/// through `end` (or onwards when `end` is `None`) are replaced.
 #[derive(Debug, Clone)]
-pub struct AccountProjection {
+pub struct WindowRows {
     pub account_id: String,
-    /// `None` leaves the account's snapshots alone (holdings-mode accounts
-    /// own their observed snapshots).
+    pub start: NaiveDate,
+    pub end: Option<NaiveDate>,
+    /// `None` leaves the account's snapshots alone (holdings-mode accounts own
+    /// their observed snapshots; a revalue keeps the calculated ones).
     pub snapshots: Option<Vec<AccountStateSnapshot>>,
-    /// `None` leaves lot rows alone.
-    pub lots: Option<Vec<LotRecord>>,
-    pub disposals: Option<Vec<LotDisposal>>,
     pub valuations: Vec<DailyAccountValuation>,
-    pub watermark: ProjectionWatermark,
-    /// `Some(date)`: a resumed run; rows dated on or after it are replaced
-    /// and earlier rows are kept. `None`: every row of the account is replaced.
-    pub since: Option<NaiveDate>,
-    /// `None` leaves the stored checkpoints alone (a revalue-only run).
-    pub checkpoints: Option<Vec<ProjectionCheckpoint>>,
+}
+
+/// A refolded account's lot book from `since`: every lot still open plus the
+/// lots closed on or after it, and the disposals dated on or after it.
+#[derive(Debug, Clone)]
+pub struct LotBook {
+    pub account_id: String,
+    pub since: NaiveDate,
+    pub lots: Vec<LotRecord>,
+    pub disposals: Vec<LotDisposal>,
+}
+
+/// What a run commits last, in one transaction.
+#[derive(Debug, Clone, Default)]
+pub struct RunCompletion {
+    pub lot_books: Vec<LotBook>,
+    /// Refolded accounts' rejections, replacing the stored list.
+    pub rejections: Vec<(String, Vec<RejectedActivity>)>,
+    /// Markers the run consumed; each clears only if its version is unchanged.
+    pub consumed: Vec<ProjectionMarker>,
 }
 
 #[async_trait]
 pub trait ProjectionStoreTrait: Send + Sync {
-    fn get_watermarks(&self, account_ids: &[String]) -> Result<Vec<ProjectionWatermark>>;
+    /// Every marker with a dirty day.
+    fn pending_markers(&self) -> Result<Vec<ProjectionMarker>>;
 
-    /// Every stored checkpoint of the accounts, any date order.
-    fn get_checkpoints(&self, account_ids: &[String]) -> Result<Vec<ProjectionCheckpoint>>;
+    /// The latest stored valuation day of every account that has one.
+    fn last_valued_days(&self) -> Result<HashMap<String, NaiveDate>>;
 
-    /// Replaces the account's projected rows and its watermark in ONE
-    /// transaction, so an interrupted job never leaves a partial account.
-    async fn persist_account_projection(&self, projection: AccountProjection) -> Result<()>;
+    /// Stored rejections of the accounts.
+    fn rejections(&self, account_ids: &[String]) -> Result<Vec<RejectedActivity>>;
+
+    /// Replaces the rows of one window, every account in one transaction.
+    async fn write_window(&self, rows: Vec<WindowRows>) -> Result<()>;
+
+    /// Writes the lot books and rejections and clears the consumed markers.
+    async fn complete_run(&self, completion: RunCompletion) -> Result<()>;
+
+    /// Marks `scope` stale from `from` (a forced rebuild, synced facts).
+    async fn invalidate(&self, scope: MarkerScope, from: NaiveDate) -> Result<()>;
 }

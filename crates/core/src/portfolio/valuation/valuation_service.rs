@@ -240,8 +240,9 @@ impl ValuationServiceTrait for ValuationService {
         let series = rows::stored_series(&rows);
         let disposals = rows::stored_disposals(&disposal_rows);
         let scope: Vec<AccountId> = account_ids.iter().map(AccountId::new).collect();
+        let rejected = rows::stored_rejections(&self.sources, &measured)?;
         let aggregated = engine::aggregate_scope(
-            &measured.effects(&disposals),
+            &measured.effects(&disposals, &rejected),
             &series,
             &scope,
             engine::Window {

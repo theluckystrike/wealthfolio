@@ -797,6 +797,24 @@ impl SnapshotRepositoryTrait for SnapshotRepository {
         self.get_snapshots_by_account(account_id_param, start_date, end_date)
     }
 
+    fn get_latest_calculated_snapshot_on_or_before(
+        &self,
+        account_id_param: &str,
+        date: NaiveDate,
+    ) -> Result<Option<AccountStateSnapshot>> {
+        use crate::schema::holdings_snapshots::dsl::*;
+        let mut conn = get_connection(&self.pool)?;
+        let rows = holdings_snapshots
+            .filter(account_id.eq(account_id_param))
+            .filter(source.eq("CALCULATED"))
+            .filter(snapshot_date.le(date.format("%Y-%m-%d").to_string()))
+            .order(snapshot_date.desc())
+            .limit(1)
+            .load::<AccountStateSnapshotDB>(&mut conn)
+            .map_err(StorageError::from)?;
+        Ok(Self::decode_snapshots(rows)?.into_iter().next())
+    }
+
     fn get_snapshot_metadata_by_account(
         &self,
         account_id_param: &str,

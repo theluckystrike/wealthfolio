@@ -16,8 +16,9 @@ use wealthfolio_connect::{
 };
 use wealthfolio_core::addons::{AddonService, AddonServiceTrait};
 use wealthfolio_core::portfolio::coordinator::{
-    CheckpointCadence, CoordinatorDeps, FactSources, PortfolioCoordinator,
+    CoordinatorDeps, FactSources, PortfolioCoordinator, WindowCadence,
 };
+use wealthfolio_core::portfolio::projection::ProjectionStoreTrait;
 use wealthfolio_core::{
     accounts::AccountService,
     activities::{
@@ -631,6 +632,12 @@ async fn initialize_profile_state(
     );
 
     let valuation_repository = Arc::new(ValuationRepository::new(pool.clone(), writer.clone()));
+    let projection_store: Arc<dyn ProjectionStoreTrait> = Arc::new(
+        wealthfolio_storage_sqlite::portfolio::projection::ProjectionStore::new(
+            pool.clone(),
+            writer.clone(),
+        ),
+    );
     let fact_sources = FactSources {
         accounts: account_repo.clone(),
         activities: activity_repository.clone(),
@@ -638,6 +645,7 @@ async fn initialize_profile_state(
         quotes: quote_service.clone(),
         fx_rates: fx_repo.clone(),
         snapshots: snapshot_repository.clone(),
+        projections: projection_store.clone(),
     };
     let valuation_service = Arc::new(ValuationService::new(
         valuation_repository.clone(),
@@ -780,12 +788,6 @@ async fn initialize_profile_state(
         asset_service.as_ref(),
     )
     .await?;
-    let projection_store = Arc::new(
-        wealthfolio_storage_sqlite::portfolio::projection::ProjectionStore::new(
-            pool.clone(),
-            writer.clone(),
-        ),
-    );
     let portfolio_coordinator = Arc::new(PortfolioCoordinator::new(CoordinatorDeps {
         base_currency: base_currency.clone(),
         timezone: timezone.clone(),
@@ -794,7 +796,7 @@ async fn initialize_profile_state(
         snapshot_service: snapshot_service.clone(),
         projections: projection_store,
         lots: lots_repository.clone(),
-        checkpoint_cadence: CheckpointCadence::YearEnd,
+        window_cadence: WindowCadence::Year,
     }));
 
     // Spending: events + event_types

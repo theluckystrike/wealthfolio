@@ -208,7 +208,6 @@ async fn execute_health_fix(
             // Prices/valuations were already fixed by the user; just rebuild.
             market_sync_mode: MarketSyncMode::Incremental { asset_ids: None },
             force_full: true,
-            earliest_change_at: None,
         };
 
         process_portfolio_job(state.clone(), job_config)
