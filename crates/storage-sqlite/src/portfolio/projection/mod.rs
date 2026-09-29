@@ -151,9 +151,11 @@ fn write_window_rows(conn: &mut SqliteConnection, window: PreparedWindow) -> Res
                 .execute(conn)
                 .map_err(StorageError::from)?;
         }
-        for (snapshot_id, positions) in &positions {
-            SnapshotRepository::write_snapshot_positions(conn, snapshot_id, positions)?;
-        }
+        let positions: Vec<(&str, &HashMap<String, Position>)> = positions
+            .iter()
+            .map(|(snapshot_id, positions)| (snapshot_id.as_str(), positions))
+            .collect();
+        SnapshotRepository::write_snapshots_positions(conn, &positions)?;
     }
     use crate::schema::daily_account_valuation::dsl as v;
     let target = v::daily_account_valuation
@@ -822,6 +824,51 @@ mod tests {
             store.last_valued_days().unwrap().get("acc1"),
             Some(&date(6))
         );
+    }
+
+    #[tokio::test]
+    async fn a_window_writes_the_positions_of_every_snapshot_it_keeps() {
+        #[derive(QueryableByName)]
+        struct PositionRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            snapshot_id: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            quantity: String,
+        }
+        let db = setup();
+        let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());
+        let positions = || -> Vec<(String, String)> {
+            let mut conn = get_connection(&db.pool).unwrap();
+            diesel::sql_query(
+                "SELECT snapshot_id, quantity FROM snapshot_positions ORDER BY snapshot_id",
+            )
+            .load::<PositionRow>(&mut conn)
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.snapshot_id, row.quantity))
+            .collect()
+        };
+        let id = |day: u32| AccountStateSnapshot::stable_id("acc1", date(day));
+
+        store
+            .write_window(vec![window(2, None, &[2, 3, 4])])
+            .await
+            .unwrap();
+        let mut expected = vec![
+            (id(2), "10".to_string()),
+            (id(3), "10".to_string()),
+            (id(4), "10".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(positions(), expected);
+
+        // Rewriting from day 3: day 3 gets new positions, day 4's go with it.
+        let mut rewrite = window(3, None, &[]);
+        rewrite.snapshots = Some(vec![snapshot(3, "7")]);
+        store.write_window(vec![rewrite]).await.unwrap();
+        let mut expected = vec![(id(2), "10".to_string()), (id(3), "7".to_string())];
+        expected.sort();
+        assert_eq!(positions(), expected);
     }
 
     #[tokio::test]

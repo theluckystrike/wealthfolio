@@ -13,10 +13,15 @@ use std::sync::Arc;
 use super::model::{AccountStateSnapshotDB, NewSnapshotPositionRecord, SnapshotPositionRecord};
 use crate::db::{get_connection, WriteHandle};
 use crate::errors::StorageError;
+use crate::utils::chunk_for_sqlite;
 use wealthfolio_core::errors::{Error, Result};
 use wealthfolio_core::portfolio::snapshot::{
     AccountStateSnapshot, Position, SnapshotMetadata, SnapshotRepositoryTrait,
 };
+
+/// Position rows per multi-row insert: 14 columns each, well under SQLite's
+/// bound-parameter limit.
+const POSITION_INSERT_CHUNK: usize = 1000;
 
 pub struct SnapshotRepository {
     pool: Arc<Pool<ConnectionManager<SqliteConnection>>>,
@@ -688,39 +693,51 @@ impl SnapshotRepository {
         snap_id: &str,
         positions: &HashMap<String, Position>,
     ) -> std::result::Result<(), StorageError> {
+        Self::write_snapshots_positions(conn, &[(snap_id, positions)])
+    }
+
+    /// [`Self::write_snapshot_positions`] for many snapshots at once: one
+    /// delete and one asset check per chunk instead of per snapshot.
+    pub(crate) fn write_snapshots_positions(
+        conn: &mut SqliteConnection,
+        snapshots: &[(&str, &HashMap<String, Position>)],
+    ) -> std::result::Result<(), StorageError> {
         use crate::schema::snapshot_positions::dsl::*;
 
-        diesel::delete(snapshot_positions.filter(snapshot_id.eq(snap_id)))
-            .execute(conn)
-            .map_err(StorageError::from)?;
-
-        if positions.is_empty() {
-            return Ok(());
+        let ids: Vec<&str> = snapshots.iter().map(|(snap_id, _)| *snap_id).collect();
+        for chunk in chunk_for_sqlite(&ids) {
+            diesel::delete(snapshot_positions.filter(snapshot_id.eq_any(chunk)))
+                .execute(conn)
+                .map_err(StorageError::from)?;
         }
 
-        let existing_asset_ids =
-            Self::existing_asset_ids(conn, positions.values().map(|p| p.asset_id.as_str()))?;
+        let existing_asset_ids = Self::existing_asset_ids(
+            conn,
+            snapshots
+                .iter()
+                .flat_map(|(_, positions)| positions.values().map(|p| p.asset_id.as_str())),
+        )?;
 
-        let mut records: Vec<NewSnapshotPositionRecord> = Vec::with_capacity(positions.len());
-        for pos in positions.values() {
-            if !existing_asset_ids.contains(pos.asset_id.as_str()) {
-                warn!(
-                    "Dropping snapshot position for missing asset {} (snapshot {})",
-                    pos.asset_id, snap_id
-                );
-                continue;
+        let mut records: Vec<NewSnapshotPositionRecord> = Vec::new();
+        for (snap_id, positions) in snapshots {
+            for pos in positions.values() {
+                if !existing_asset_ids.contains(pos.asset_id.as_str()) {
+                    warn!(
+                        "Dropping snapshot position for missing asset {} (snapshot {})",
+                        pos.asset_id, snap_id
+                    );
+                    continue;
+                }
+                records.push(NewSnapshotPositionRecord::from_position(snap_id, pos));
             }
-            records.push(NewSnapshotPositionRecord::from_position(snap_id, pos));
         }
 
-        if records.is_empty() {
-            return Ok(());
+        for chunk in records.chunks(POSITION_INSERT_CHUNK) {
+            diesel::insert_into(snapshot_positions)
+                .values(chunk)
+                .execute(conn)
+                .map_err(StorageError::from)?;
         }
-
-        diesel::insert_into(snapshot_positions)
-            .values(&records)
-            .execute(conn)
-            .map_err(StorageError::from)?;
 
         Ok(())
     }
