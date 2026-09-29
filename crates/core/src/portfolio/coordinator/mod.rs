@@ -338,6 +338,7 @@ impl PortfolioCoordinator {
         observer.update_started();
         match self.load_facts(&account_ids) {
             Ok(loaded) => {
+                let loaded = Arc::new(loaded);
                 let (plans, failures) = self.execute(&loaded, &account_ids, request).await;
                 report.plans = plans;
                 report.failures = failures;
@@ -413,7 +414,7 @@ impl PortfolioCoordinator {
     /// each account in one transaction. Every failure names its account.
     async fn execute(
         &self,
-        loaded: &LoadedFacts,
+        loaded: &Arc<LoadedFacts>,
         account_ids: &[String],
         request: &PortfolioJobRequest,
     ) -> (Vec<AccountPlan>, Vec<AccountFailure>) {
@@ -455,7 +456,20 @@ impl PortfolioCoordinator {
             .iter()
             .any(|p| matches!(p.plan, RebuildPlan::Full | RebuildPlan::Resume { .. }));
         let computed = if needs_projection {
-            match persist::compute(loaded, resume, self.deps.checkpoint_cadence) {
+            // The fold is CPU-bound (seconds on a long history): run it on the
+            // blocking pool so it never holds an async worker.
+            let job_facts = Arc::clone(loaded);
+            let cadence = self.deps.checkpoint_cadence;
+            let computed =
+                tokio::task::spawn_blocking(move || persist::compute(&job_facts, resume, cadence))
+                    .await
+                    // A panic's payload is not surfaced (it may carry figures).
+                    .unwrap_or_else(|_| {
+                        Err(Error::Unexpected(
+                            "Portfolio projection stopped unexpectedly".to_string(),
+                        ))
+                    });
+            match computed {
                 Ok(computed) => Some(computed),
                 Err(error) => {
                     let message = error.to_string();
