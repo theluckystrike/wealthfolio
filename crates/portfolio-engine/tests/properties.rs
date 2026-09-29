@@ -246,6 +246,7 @@ fn value_windowed(
                 bundle: &bundle,
             },
             &seed,
+            None,
         );
         for (account, series) in series {
             days.entry(account).or_default().extend(series.days);

@@ -238,6 +238,14 @@ fn writers(
         .collect()
 }
 
+/// The accounts a window values: only those it writes.
+fn valued(active: &[Writer]) -> BTreeSet<AccountId> {
+    active
+        .iter()
+        .map(|writer| AccountId::new(writer.account.as_str()))
+        .collect()
+}
+
 /// Rows `[start, end]` or, for the window that ends today, `[start, ∞)`.
 fn row_end(resolved: &Resolved, window: DateRange) -> Option<NaiveDate> {
     (window.end < resolved.facts.policy().as_of).then_some(window.end)
@@ -416,6 +424,7 @@ fn fold_window(
                 bundle: &bundle,
             },
             seed,
+            Some(&valued(active)),
         );
         let base = resolved.facts.policy().base_currency.as_str();
         for writer in active {
@@ -599,6 +608,7 @@ fn revalue_window(
             bundle: &bundle,
         },
         &seed,
+        Some(&valued(active)),
     );
     let base = resolved.facts.policy().base_currency.as_str();
     Ok(active

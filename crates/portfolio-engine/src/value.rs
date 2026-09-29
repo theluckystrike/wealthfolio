@@ -90,7 +90,7 @@ impl PricedPosition {
 /// Dense daily valuations per account (transactions-mode from the projection,
 /// holdings-mode from observed snapshots), each with finalized flows.
 pub fn value(inputs: &ValueInputs<'_>) -> BTreeMap<AccountId, ValuationSeries> {
-    value_series(inputs, None)
+    value_series(inputs, None, None)
 }
 
 /// [`value`] for one window of a chunked run: `inputs.bundle` is the window's
@@ -98,24 +98,41 @@ pub fn value(inputs: &ValueInputs<'_>) -> BTreeMap<AccountId, ValuationSeries> {
 /// account with history before the window, its state on the day before (the
 /// previous window's end state, or a stored keyframe). Rows start at the
 /// window start; concatenated over windows they equal one [`value`] over the
-/// whole range (P-WIN).
+/// whole range (P-WIN). `accounts` restricts the work to the accounts a run
+/// rewrites (`None`: every account); the others are not valued.
 pub fn value_window(
     inputs: &ValueInputs<'_>,
     seed: &BTreeMap<AccountId, AccountState>,
+    accounts: Option<&BTreeSet<AccountId>>,
 ) -> BTreeMap<AccountId, ValuationSeries> {
-    value_series(inputs, Some(seed))
+    value_series(inputs, Some(seed), accounts)
 }
 
 fn value_series(
     inputs: &ValueInputs<'_>,
     seed: Option<&BTreeMap<AccountId, AccountState>>,
+    only: Option<&BTreeSet<AccountId>>,
 ) -> BTreeMap<AccountId, ValuationSeries> {
     let resolved = &inputs.resolved;
     let rejected = inputs.bundle.rejected_activities();
-    let (effects, mut pricing_diagnostics) =
-        priced_events(resolved, &inputs.bundle.disposals, &rejected);
+    // Valuation reads only the flows of the accounts it values, inside the
+    // range: pricing anything else would be thrown away.
+    let (effects, mut pricing_diagnostics) = priced_events(
+        resolved,
+        &inputs.bundle.disposals,
+        &rejected,
+        Some(EventSelection {
+            range: resolved.range,
+            accounts: only,
+        }),
+    );
     let mut series = BTreeMap::new();
-    for (account_id, account) in &resolved.facts.accounts {
+    for (account_id, account) in resolved
+        .facts
+        .accounts
+        .iter()
+        .filter(|(id, _)| only.is_none_or(|only| only.contains(*id)))
+    {
         if account.archived {
             continue;
         }
@@ -1089,7 +1106,14 @@ pub fn effects(
     disposals: &[LotDisposal],
     rejected: &BTreeSet<ActivityId>,
 ) -> Effects {
-    priced_events(resolved, disposals, rejected).0
+    priced_events(resolved, disposals, rejected, None).0
+}
+
+/// The events a valuation prices: those inside `range`, of `accounts` when
+/// given.
+struct EventSelection<'a> {
+    range: DateRange,
+    accounts: Option<&'a BTreeSet<AccountId>>,
 }
 
 /// [`effects`] plus the pricing diagnostics, by the account of the event.
@@ -1097,6 +1121,7 @@ fn priced_events(
     resolved: &Resolved<'_>,
     disposals: &[LotDisposal],
     rejected: &BTreeSet<ActivityId>,
+    selection: Option<EventSelection<'_>>,
 ) -> (Effects, BTreeMap<AccountId, Vec<Diagnostic>>) {
     let facts = resolved.facts;
     let base = facts.policy.base_currency.clone();
@@ -1117,12 +1142,16 @@ fn priced_events(
     let mut valuer = Valuer::new(resolved, disposals, &AccountId::new("effects"), &base);
     let mut diagnostics: BTreeMap<AccountId, Vec<Diagnostic>> = BTreeMap::new();
     let mut events = Vec::with_capacity(resolved.ledger.events.len());
-    for event in resolved
-        .ledger
-        .events
-        .iter()
-        .filter(|event| !rejected.contains(&event.source))
-    {
+    for event in resolved.ledger.events.iter().filter(|event| {
+        !rejected.contains(&event.source)
+            && selection.as_ref().is_none_or(|selected| {
+                event.date >= selected.range.start
+                    && event.date <= selected.range.end
+                    && selected
+                        .accounts
+                        .is_none_or(|accounts| accounts.contains(&event.account))
+            })
+    }) {
         let in_range = event.date >= range.start && event.date <= range.end;
         let flow = match &event.flow.boundary {
             Boundary::None => None,
