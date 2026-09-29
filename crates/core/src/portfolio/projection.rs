@@ -30,7 +30,10 @@ pub enum MarkerScope {
     Asset(String),
     /// An asset's prices changed: revalue its holders.
     Prices(String),
-    /// FX or policy changed: refold every account.
+    /// An FX asset's rates changed: revalue every account, and refold those
+    /// with activity, from the day after the pair's previous observation.
+    Fx(String),
+    /// Policy (base currency, timezone) changed: refold every account.
     All,
 }
 
@@ -42,6 +45,8 @@ impl MarkerScope {
             Self::Asset(asset.to_string())
         } else if let Some(asset) = key.strip_prefix("q:") {
             Self::Prices(asset.to_string())
+        } else if let Some(asset) = key.strip_prefix("fx:") {
+            Self::Fx(asset.to_string())
         } else {
             Self::Account(key.to_string())
         }
@@ -53,6 +58,7 @@ impl MarkerScope {
             Self::Account(id) => id.clone(),
             Self::Asset(id) => format!("a:{id}"),
             Self::Prices(id) => format!("q:{id}"),
+            Self::Fx(id) => format!("fx:{id}"),
             Self::All => "@all".to_string(),
         }
     }

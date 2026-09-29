@@ -2,7 +2,7 @@
 //! FX rates and observed snapshots are loaded whole; quotes are loaded per
 //! window (`window_quotes`), plus the few around split dates up front.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
@@ -302,9 +302,9 @@ pub struct LoadedFacts {
     /// Facts for the transfer closure of the scope; `raw.quotes` holds only
     /// the closes around split dates.
     pub raw: RawFacts,
-    /// Every asset the closure's activities or observed snapshots reference:
-    /// whose quotes each window loads.
-    pub asset_ids: Vec<String>,
+    /// Observation days of each FX asset: how far back a changed rate
+    /// reaches (lookups take the nearest observation either way).
+    pub fx_days: BTreeMap<String, BTreeSet<NaiveDate>>,
     /// Holdings accounts with an observed snapshot outside the supported
     /// date range (account id, date): they fail instead of projecting.
     pub invalid_snapshot_dates: Vec<(String, NaiveDate)>,
@@ -472,6 +472,13 @@ pub fn load(
     }
 
     let fx_rows = deps.fx_rates.get_historical_exchange_rates()?;
+    let mut fx_days: BTreeMap<String, BTreeSet<NaiveDate>> = BTreeMap::new();
+    for rate in &fx_rows {
+        fx_days
+            .entry(rate.id.clone())
+            .or_default()
+            .insert(rate.timestamp.date_naive());
+    }
     let fx_rates: Vec<RawFxRate> = fx_rows
         .iter()
         .map(|r| RawFxRate {
@@ -494,7 +501,7 @@ pub fn load(
 
     Ok(LoadedFacts {
         scope,
-        asset_ids: asset_id_vec,
+        fx_days,
         raw: RawFacts {
             policy,
             accounts,

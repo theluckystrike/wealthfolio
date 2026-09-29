@@ -137,20 +137,26 @@ the same transaction.
 activities, accounting settings or observed snapshots changed: refold it),
 `a:<asset>` (the asset's kind, quote currency, instrument type or contract
 multiplier changed: refold its holders), `q:<asset>` (its prices changed:
-revalue its holders) and `@all` (an FX rate, the base currency or the timezone
-changed: refold everything). Each carries the first stale day and a version
-every write bumps. An activity marks its account from the day before its UTC
-date (its local day is within a day of it) and its transfer partners from
-theirs. The projection's own calculated rows mark nothing. The migration starts
-with `@all` from the beginning, so the first run rebuilds everything.
+revalue its holders), `fx:<asset>` (an FX asset's rates changed) and `@all` (the
+base currency or the timezone changed: refold everything). Each carries the
+first stale day and a version every write bumps. An activity marks its account
+from the day before its UTC date (its local day is within a day of it) and its
+transfer partners from theirs. The projection's own calculated rows mark
+nothing. The migration starts with `@all` from the beginning, so the first run
+rebuilds everything.
 
 **Plans.** A job maps the markers onto accounts and picks one path per account:
 
-| Verdict                                                      | Plan        | Work                                                                   |
-| ------------------------------------------------------------ | ----------- | ---------------------------------------------------------------------- |
-| Nothing marked, valuations reach today                       | —           | nothing is loaded                                                      |
-| Prices changed, or the day moved                             | **Revalue** | value stored keyframes (or observed snapshots) from the day; rows only |
-| Facts changed (the account, a partner, an asset, FX, policy) | **Refold**  | fold from the first activity; rewrite rows from the day                |
+| Verdict                                                  | Plan        | Work                                                                   |
+| -------------------------------------------------------- | ----------- | ---------------------------------------------------------------------- |
+| Nothing marked, valuations reach today                   | —           | nothing is loaded                                                      |
+| Prices or FX changed, or the day moved                   | **Revalue** | value stored keyframes (or observed snapshots) from the day; rows only |
+| Facts changed (the account, a partner, an asset, policy) | **Refold**  | fold from the first activity; rewrite rows from the day                |
+
+Conversions take the nearest FX observation in either direction, so a changed
+rate reaches back to the day after its pair's previous observation: every
+account revalues from there, and only accounts with activity since then also
+refold (the fold converts on activity days alone).
 
 Holdings-mode accounts only revalue: their facts are observed snapshots. A
 refold is not resumed from a stored state: folding the refolded accounts (and

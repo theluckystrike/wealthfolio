@@ -63,11 +63,13 @@ fn lower(map: &mut BTreeMap<String, NaiveDate>, account: &str, day: NaiveDate) -
 }
 
 /// Maps the markers onto `targets`: asset markers reach the accounts holding
-/// the asset, a refold reaches the account's transfer partners (their lots
-/// and flows come from its legs), and an account whose valuations end before
-/// today is revalued from the next day.
+/// the asset, an FX rate reaches back to its pair's previous observation, a
+/// refold reaches the account's transfer partners (their lots and flows come
+/// from its legs), and an account whose valuations end before today is
+/// revalued from the next day.
 pub(super) fn plan(
     resolved: &Resolved,
+    fx_days: &BTreeMap<String, BTreeSet<NaiveDate>>,
     markers: &[ProjectionMarker],
     last_valued: &HashMap<String, NaiveDate>,
     today: NaiveDate,
@@ -76,6 +78,13 @@ pub(super) fn plan(
     let facts = &resolved.facts;
     let targets: BTreeSet<&str> = targets.iter().map(String::as_str).collect();
     let holdings = &resolved.assets_by_account;
+    let mut last_activity: BTreeMap<&str, NaiveDate> = BTreeMap::new();
+    for activity in facts.activities() {
+        let last = last_activity
+            .entry(activity.account.as_str())
+            .or_insert(activity.date);
+        *last = (*last).max(activity.date);
+    }
     let holders = |asset: &str| -> Vec<&str> {
         targets
             .iter()
@@ -109,6 +118,26 @@ pub(super) fn plan(
             MarkerScope::Prices(asset) => {
                 for target in holders(asset) {
                     lower(&mut plan.revalue, target, day);
+                }
+            }
+            MarkerScope::Fx(asset) => {
+                // Conversions take the nearest observation either way, so a
+                // changed rate reaches back to the day after the pair's
+                // previous one (the quote's day and the rate's UTC day may
+                // differ by one). Valuations convert every day; the fold only
+                // on activity days.
+                let before = day.pred_opt().unwrap_or(day);
+                let from = fx_days
+                    .get(asset)
+                    .and_then(|days| days.range(..before).next_back())
+                    .and_then(|previous| previous.succ_opt())
+                    .unwrap_or(GENESIS)
+                    .min(day);
+                for target in &targets {
+                    lower(&mut plan.revalue, target, from);
+                    if last_activity.get(target).is_some_and(|last| *last >= from) {
+                        lower(&mut plan.refold, target, from);
+                    }
                 }
             }
         }

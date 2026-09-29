@@ -539,7 +539,8 @@ async fn lifecycle_steps_match_a_fresh_rebuild() {
                     .collect(),
             );
             for spec in &step.add_fx_rates {
-                live.store.mark(MarkerScope::All, spec.day);
+                let rate = crate::test_support::scenario::fx_rate_from_spec(spec);
+                live.store.mark(MarkerScope::Fx(rate.id), spec.day);
             }
             live.fx_repo.add_rates(
                 step.add_fx_rates
@@ -1211,4 +1212,98 @@ async fn one_run_refolds_and_revalues_different_accounts_like_a_fresh_rebuild() 
             );
         }
     }
+}
+
+#[tokio::test]
+async fn an_fx_rate_revalues_from_its_previous_observation_and_refolds_only_later_activity() {
+    // USD/CAD is observed daily to 01-08, then on 01-13. A rate for 01-11 is
+    // the nearest one for 01-10 too (and 01-12), so every account revalues
+    // from 01-09; acc-1 sells (converting USD) on 01-10 and refolds, acc-2's
+    // only activity is its 01-02 deposit, so it just revalues.
+    let day = |d: u32| NaiveDate::from_ymd_opt(2025, 1, d).unwrap();
+    let mut before = scenario("NOM-FX-01").facts();
+    before
+        .fx_rates
+        .retain(|r| !(day(9)..=day(12)).contains(&r.timestamp.date_naive()));
+    let mut second = before.accounts[0].clone();
+    second.id = "acc-2".to_string();
+    second.name = "CAD savings".to_string();
+    before.accounts.push(second);
+    let mut deposit = before
+        .activities
+        .iter()
+        .find(|a| a.id == "dep-1")
+        .expect("dep-1")
+        .clone();
+    deposit.id = "dep-2".to_string();
+    deposit.account_id = "acc-2".to_string();
+    before.activities.push(deposit);
+
+    let mut rate = before
+        .fx_rates
+        .iter()
+        .find(|r| r.timestamp.date_naive() == day(8))
+        .expect("01-08 rate")
+        .clone();
+    rate.timestamp += chrono::Duration::days(3);
+    rate.rate = rust_decimal_macros::dec!(1.50);
+    let mut after = before.clone();
+    after.fx_rates.push(rate.clone());
+
+    let live = harness(before.clone()).await;
+    live.coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    live.fx_repo.add_rates(vec![rate.clone()]);
+    live.store.mark(MarkerScope::Fx(rate.id.clone()), day(11));
+    let report = live
+        .coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(
+        plan_of(&report, "acc-1"),
+        Some(RebuildPlan::Refold { from: day(9) })
+    );
+    assert_eq!(
+        plan_of(&report, "acc-2"),
+        Some(RebuildPlan::Revalue { from: day(9) })
+    );
+
+    let fresh = harness(after).await;
+    fresh
+        .coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    for account in ["acc-1", "acc-2"] {
+        assert_eq!(
+            normalized_valuations(live.rows(account)),
+            normalized_valuations(fresh.rows(account)),
+            "valuations of {account}"
+        );
+    }
+    let realized = |disposals: Vec<crate::lots::LotDisposal>| -> Vec<(String, String)> {
+        disposals
+            .into_iter()
+            .map(|d| (d.disposal_activity_id, d.realized_pnl_base))
+            .collect()
+    };
+    assert_eq!(
+        realized(
+            live.lot_repo
+                .get_lot_disposals_for_account("acc-1")
+                .await
+                .unwrap()
+        ),
+        realized(
+            fresh
+                .lot_repo
+                .get_lot_disposals_for_account("acc-1")
+                .await
+                .unwrap()
+        )
+    );
 }

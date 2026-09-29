@@ -5,7 +5,9 @@
 -- scope       an account id: refold the account from dirty_from
 --             'a:<asset>': the asset's facts changed, refold its holders
 --             'q:<asset>': its prices changed, revalue its holders
---             '@all': FX or policy changed, refold every account
+--             'fx:<asset>': an FX rate changed, revalue every account (and refold
+--             those with activity) from the pair's previous observation
+--             '@all': policy changed, refold every account
 -- dirty_from  first local day to recompute; NULL once the projection is clean
 -- version     bumped by every write, so a job only clears what it has seen
 -- rejections  account rows: activities the last run rejected (JSON)
@@ -132,12 +134,13 @@ BEGIN
 END;
 
 -- Prices revalue the asset's holders from the quote's day. FX rates are quotes
--- of FX assets; the fold converts with them, so they refold every account.
+-- of FX assets: the job reaches back from the rate's day to its pair's
+-- previous observation, since conversions take the nearest one either way.
 CREATE TRIGGER projection_quote_insert AFTER INSERT ON quotes
 BEGIN
     INSERT INTO projection_state (scope, dirty_from, version)
     VALUES (
-        CASE WHEN (SELECT kind FROM assets WHERE id = NEW.asset_id) = 'FX' THEN '@all' ELSE 'q:' || NEW.asset_id END,
+        CASE WHEN (SELECT kind FROM assets WHERE id = NEW.asset_id) = 'FX' THEN 'fx:' || NEW.asset_id ELSE 'q:' || NEW.asset_id END,
         coalesce(date(NEW.day), '0001-01-01'),
         1
     )
@@ -150,7 +153,7 @@ CREATE TRIGGER projection_quote_update AFTER UPDATE ON quotes
 BEGIN
     INSERT INTO projection_state (scope, dirty_from, version)
     VALUES (
-        CASE WHEN (SELECT kind FROM assets WHERE id = NEW.asset_id) = 'FX' THEN '@all' ELSE 'q:' || NEW.asset_id END,
+        CASE WHEN (SELECT kind FROM assets WHERE id = NEW.asset_id) = 'FX' THEN 'fx:' || NEW.asset_id ELSE 'q:' || NEW.asset_id END,
         coalesce(min(date(OLD.day), date(NEW.day)), '0001-01-01'),
         1
     )
@@ -163,7 +166,7 @@ CREATE TRIGGER projection_quote_delete AFTER DELETE ON quotes
 BEGIN
     INSERT INTO projection_state (scope, dirty_from, version)
     VALUES (
-        CASE WHEN (SELECT kind FROM assets WHERE id = OLD.asset_id) = 'FX' THEN '@all' ELSE 'q:' || OLD.asset_id END,
+        CASE WHEN (SELECT kind FROM assets WHERE id = OLD.asset_id) = 'FX' THEN 'fx:' || OLD.asset_id ELSE 'q:' || OLD.asset_id END,
         coalesce(date(OLD.day), '0001-01-01'),
         1
     )

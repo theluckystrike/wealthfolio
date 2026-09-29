@@ -666,7 +666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prices_revalue_their_holders_and_fx_refolds_everything() {
+    async fn prices_and_fx_rates_mark_their_asset() {
         let db = setup();
         let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());
         store
@@ -696,8 +696,14 @@ mod tests {
             "INSERT INTO quotes (id, asset_id, day, source, close, currency, created_at, timestamp) \
              VALUES ('q2', 'FX:EURUSD', '2025-01-02', 'YAHOO', '1.1', 'USD', datetime('now'), '2025-01-02T00:00:00Z')",
         );
-        assert_eq!(dirty(&db, "@all").as_deref(), Some("2025-01-02"));
+        assert_eq!(dirty(&db, "fx:FX:EURUSD").as_deref(), Some("2025-01-02"));
         assert_eq!(dirty(&db, "q:FX:EURUSD"), None);
+        assert_eq!(dirty(&db, "@all"), None);
+        assert!(store
+            .pending_markers()
+            .unwrap()
+            .iter()
+            .any(|m| m.scope == MarkerScope::Fx("FX:EURUSD".to_string())));
     }
 
     #[tokio::test]

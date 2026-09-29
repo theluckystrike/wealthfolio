@@ -420,7 +420,14 @@ impl PortfolioCoordinator {
         let loaded = Arc::new(loaded);
         let job_facts = Arc::clone(&loaded);
         let resolved = Arc::new(blocking(move || persist::resolve(&job_facts)).await?);
-        let plan = run::plan(&resolved, &markers, &last_valued, today, &targets);
+        let plan = run::plan(
+            &resolved,
+            &loaded.fx_days,
+            &markers,
+            &last_valued,
+            today,
+            &targets,
+        );
         let plans = plan.account_plans();
         let accounts: Vec<String> = plans.iter().map(|p| p.account_id.clone()).collect();
 
