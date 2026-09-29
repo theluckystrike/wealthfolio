@@ -301,18 +301,26 @@ impl ProjectionStoreTrait for ProjectionStore {
                     {
                         use crate::schema::lots::dsl as l;
                         // Lots closed before `since` are history the run did
-                        // not touch; open lots are re-emitted whole.
+                        // not touch; open lots are re-emitted whole. The book's
+                        // lots are updated in place: deleting one would
+                        // cascade away its disposals, including the ones dated
+                        // before `since` that the run does not re-emit.
+                        let normalized = filter_and_normalize_lots(conn, lots, &account)?;
+                        let kept: Vec<&str> = normalized.iter().map(|lot| lot.id()).collect();
                         diesel::delete(
                             l::lots
                                 .filter(l::account_id.eq(&account))
-                                .filter(l::is_closed.eq(0).or(l::close_date.ge(since.clone()))),
+                                .filter(l::is_closed.eq(0).or(l::close_date.ge(since.clone())))
+                                .filter(l::id.ne_all(&kept)),
                         )
                         .execute(conn)
                         .map_err(StorageError::from)?;
-                        let normalized = filter_and_normalize_lots(conn, lots, &account)?;
-                        if !normalized.is_empty() {
+                        for lot in &normalized {
                             diesel::insert_into(l::lots)
-                                .values(&normalized)
+                                .values(lot)
+                                .on_conflict(l::id)
+                                .do_update()
+                                .set(lot)
                                 .execute(conn)
                                 .map_err(StorageError::from)?;
                         }
@@ -905,6 +913,65 @@ mod tests {
             Some("2025-01-04"),
             "a write after the run read the marker keeps it"
         );
+    }
+
+    #[tokio::test]
+    async fn a_later_lot_book_keeps_earlier_disposals_of_open_lots() {
+        // lot-open was partly sold on day 3; a run from day 4 re-emits the lot
+        // and must not take the day-3 disposal with it (lot_disposals cascade
+        // on lot deletion).
+        let db = setup();
+        let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());
+        let lots = LotsRepository::new(db.pool.clone(), db.writer.clone());
+        let mut partly_sold = disposal("d-partial");
+        partly_sold.lot_id = "lot-open".to_string();
+        partly_sold.disposal_date = "2025-01-03".to_string();
+        let book = |since, disposals| RunCompletion {
+            lot_books: vec![LotBook {
+                account_id: "acc1".to_string(),
+                since,
+                lots: vec![lot("lot-open")],
+                disposals,
+            }],
+            ..RunCompletion::default()
+        };
+        store
+            .complete_run(book(GENESIS, vec![partly_sold]))
+            .await
+            .unwrap();
+        store.complete_run(book(date(4), Vec::new())).await.unwrap();
+        let kept: Vec<String> = lots
+            .get_lot_disposals_for_account("acc1")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(kept, vec!["d-partial"]);
+
+        // A lot the new book no longer has goes, with its disposals.
+        store
+            .complete_run(RunCompletion {
+                lot_books: vec![LotBook {
+                    account_id: "acc1".to_string(),
+                    since: date(2),
+                    lots: Vec::new(),
+                    disposals: Vec::new(),
+                }],
+                ..RunCompletion::default()
+            })
+            .await
+            .unwrap();
+        assert!(lots
+            .get_all_lots_for_account("acc1")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(lots
+            .get_lot_disposals_for_account("acc1")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

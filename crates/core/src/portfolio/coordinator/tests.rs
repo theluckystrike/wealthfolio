@@ -430,6 +430,33 @@ async fn assert_parity(cadence: WindowCadence) {
                 expected_keyframes,
                 "{label}: keyframe count"
             );
+            let disposals = harness
+                .lot_repo
+                .get_lot_disposals_for_account(account_id)
+                .await
+                .unwrap();
+            let expected_disposals = expected["disposals"]
+                .as_sequence()
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                disposals.len(),
+                expected_disposals.len(),
+                "{label}: disposal count"
+            );
+            for want in &expected_disposals {
+                let activity = golden_str(want, "activity_id");
+                let realized = golden_decimal(want, "realized_pnl_base").normalize();
+                assert!(
+                    disposals.iter().any(|d| {
+                        activity.starts_with(&d.disposal_activity_id)
+                            && d.realized_pnl_base
+                                .parse::<rust_decimal::Decimal>()
+                                .is_ok_and(|v| v.round_dp(8).normalize() == realized)
+                    }),
+                    "{label}: disposal of {activity} (realized {realized}) not persisted"
+                );
+            }
         }
         compared += 1;
     }

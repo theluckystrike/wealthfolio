@@ -26,9 +26,10 @@ use wealthfolio_core::portfolio::snapshot::Position;
 
 // ── Diesel model ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Queryable, Selectable, Insertable)]
+#[derive(Debug, Queryable, Selectable, Insertable, AsChangeset)]
 #[diesel(table_name = crate::schema::lots)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+#[diesel(treat_none_as_null = true)]
 pub(crate) struct LotRecordDB {
     id: String,
     account_id: String,
@@ -58,6 +59,12 @@ pub(crate) struct LotRecordDB {
     close_activity_id: Option<String>,
     created_at: String,
     updated_at: String,
+}
+
+impl LotRecordDB {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
 }
 
 #[derive(Debug, Queryable, Selectable, Insertable)]
