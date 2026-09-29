@@ -615,10 +615,12 @@ Testable contract; the property suite (§5) encodes each one.
 
 `RawFacts` is a per-invocation scope, not the database.
 
-- **Magnitudes are modest.** A heavy portfolio — 100k activities, 200 assets, 10
-  years — is tens of megabytes of activities and around a hundred of sparse
-  quote observations. That is the load-everything worst case, which the shell
-  never needs.
+- **Windows bound memory.** Holding a whole range at once does not scale: a full
+  rebuild of 20 accounts, 300 assets, 20 years and 50k activities peaked at 3.9
+  GB, mostly keyframes and quotes. Walked in yearly windows (§3.3) the same
+  rebuild peaks at 515 MB, and a typical portfolio (5 accounts, 50 assets, 10
+  years, 3k activities) at 34 MB (release build, measured). Activities, FX rates
+  and observed snapshots still load whole.
 - **`facts_needed` is the scoping mechanism.** A per-account run loads that
   account's activities and its assets' observations plus the transfer-pair
   closure. A chunked run loads observations covering the chunk plus the nearest
