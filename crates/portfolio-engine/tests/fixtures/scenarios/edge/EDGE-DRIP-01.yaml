@@ -1,13 +1,12 @@
 id: EDGE-DRIP-01
-title: DRIP whose reinvestment leg is rejected keeps the dividend as cash
+title: DRIP whose reinvestment leg is rejected is rejected whole
 intent: >
-  Rejection is atomic per event, not per stored activity. A DRIP paid in USD
-  on a GBP-quoted asset, with no USD/GBP rate and no rate on the row, compiles
-  into `drip-1:dividend` (books 20 USD) and `drip-1:buy` (needs the price in
-  GBP). The buy leg cannot convert, so it is rejected and leaves no trace; the
-  income leg stands. Valuation and attribution price every ledger event, so
-  keeping the income as cash is what keeps them consistent: skipping both legs
-  would leave attribution counting income the account never received.
+  An activity applies whole or not at all. A DRIP paid in USD on a GBP-quoted
+  asset, with no USD/GBP rate and no rate on the row, compiles into
+  `drip-1:dividend` (books 20 USD) and `drip-1:buy` (needs the price in GBP).
+  The buy leg cannot convert, so the activity is rejected: the income leg is
+  rolled back with it, and valuation and attribution leave the activity out
+  as the fold did.
 policy:
   base_currency: USD
   timezone: UTC
@@ -38,8 +37,7 @@ quotes:
   - { asset: vod, day: 2025-01-08, close: 8 }
   - { asset: vod, day: 2025-01-10, close: 8 }
 expected_notes: >
-  Cash USD 1000 from 01-02, 1020 from 01-08 (income leg). No vod position and
-  no lot: the rejected buy leg leaves the account exactly as the income leg
-  left it. An ActivityRejected error names `drip-1:buy` (USD to GBP
-  conversion). net_contribution 1000 throughout, no flows. Attribution income
-  20. Total value 1000 -> 1020 on 01-08.
+  Cash USD 1000 throughout: the rejected DRIP books nothing. No vod position
+  and no lot. An ActivityRejected error names `drip-1` (USD to GBP
+  conversion of the buy leg). net_contribution 1000, no flows, attribution
+  income 0, total value 1000.

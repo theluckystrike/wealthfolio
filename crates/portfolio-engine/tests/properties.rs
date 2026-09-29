@@ -10,7 +10,10 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use support::*;
 use wealthfolio_portfolio_engine::model::*;
-use wealthfolio_portfolio_engine::{aggregate_scope, project, DiagnosticCode, ValueInputs, Window};
+use wealthfolio_portfolio_engine::{
+    aggregate_scope, project, value_window, DiagnosticCode, QuoteSurface, Resolved,
+    ResolvedSurfaces, ValueInputs, Window,
+};
 
 const DUST: Decimal = Decimal::from_parts(1, 0, 0, false, 8);
 
@@ -128,6 +131,136 @@ fn p_chunk_partitions_are_equivalent() {
             assert_same(&scenario.id, "P-RESOLVE (chunked value)", &left, &right);
         }
     }
+}
+
+/// P-WIN: a windowed run (fold a window from the previous window's state,
+/// value it from that seed with quotes observed in the window plus each
+/// asset's last observation before it) yields the one-shot valuations, day for
+/// day, however the range is cut.
+#[test]
+fn p_win_windowed_valuation_is_equivalent() {
+    for scenario in corpus() {
+        let one_shot = Pipeline::from_scenario(&scenario);
+        let range = one_shot.range();
+        if range.start == range.end {
+            continue;
+        }
+        let event_days: Vec<NaiveDate> = one_shot
+            .ledger()
+            .events
+            .iter()
+            .map(|e| e.date)
+            .filter(|d| *d >= range.start && *d < range.end)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let every_third: Vec<NaiveDate> = range
+            .start
+            .iter_days()
+            .take_while(|d| *d < range.end)
+            .step_by(3)
+            .collect();
+        let midpoint = vec![range.start + (range.end - range.start) / 2];
+        for cuts in [midpoint, event_days, every_third] {
+            let windowed = value_windowed(&one_shot, &cuts);
+            for (account, series) in &one_shot.series {
+                let left = serde_json::to_value(windowed.get(account).cloned().unwrap_or_default())
+                    .unwrap();
+                let right = serde_json::to_value(&series.days).unwrap();
+                assert_same(
+                    &scenario.id,
+                    &format!("P-WIN {account} at {cuts:?}"),
+                    &left,
+                    &right,
+                );
+            }
+            assert!(
+                windowed.keys().all(|a| one_shot.series.contains_key(a)),
+                "{}: P-WIN valued an account the one-shot run did not",
+                scenario.id
+            );
+        }
+    }
+}
+
+fn value_windowed(
+    pipeline: &Pipeline,
+    cuts: &[NaiveDate],
+) -> BTreeMap<AccountId, Vec<DailyValuation>> {
+    let fx = pipeline.fx();
+    let quotes = pipeline.facts().quotes();
+    let mut state: Option<ProjectionState> = None;
+    let mut started: BTreeSet<AccountId> = BTreeSet::new();
+    let mut days: BTreeMap<AccountId, Vec<DailyValuation>> = BTreeMap::new();
+    let mut start = pipeline.range().start;
+    let mut ends: Vec<NaiveDate> = cuts.to_vec();
+    ends.push(pipeline.range().end);
+    for end in ends {
+        if end < start {
+            continue;
+        }
+        let window = DateRange { start, end };
+        let seed: BTreeMap<AccountId, AccountState> = state
+            .as_ref()
+            .map(|s| {
+                s.accounts
+                    .iter()
+                    .filter(|(id, _)| started.contains(*id))
+                    .map(|(id, a)| (id.clone(), a.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let bundle = project(
+            pipeline.ledger(),
+            pipeline.facts(),
+            &fx,
+            state.take(),
+            window,
+        )
+        .expect("window projects");
+        let mut last_before: BTreeMap<&AssetId, &QuoteObservation> = BTreeMap::new();
+        for quote in quotes.iter().filter(|q| q.day < start) {
+            let latest = last_before.entry(&quote.asset).or_insert(quote);
+            if quote.day > latest.day {
+                *latest = quote;
+            }
+        }
+        let observations: Vec<QuoteObservation> = last_before
+            .into_values()
+            .chain(quotes.iter().filter(|q| q.day >= start && q.day <= end))
+            .cloned()
+            .collect();
+        let surfaces = ResolvedSurfaces {
+            quotes: QuoteSurface::from_observations(&observations),
+            fx: pipeline.surfaces().fx.clone(),
+            splits: pipeline.surfaces().splits.clone(),
+        };
+        let series = value_window(
+            &ValueInputs {
+                resolved: Resolved {
+                    facts: pipeline.facts(),
+                    ledger: pipeline.ledger(),
+                    surfaces: &surfaces,
+                    range: window,
+                },
+                bundle: &bundle,
+            },
+            &seed,
+        );
+        for (account, series) in series {
+            days.entry(account).or_default().extend(series.days);
+        }
+        started.extend(
+            bundle
+                .keyframes
+                .iter()
+                .filter(|(_, frames)| !frames.is_empty())
+                .map(|(id, _)| id.clone()),
+        );
+        state = Some(bundle.final_state);
+        start = end.succ_opt().unwrap();
+    }
+    days
 }
 
 fn project_chunked(pipeline: &Pipeline, cuts: &[NaiveDate]) -> ProjectionBundle {
@@ -380,7 +513,10 @@ fn p_txf_internal_pairs_cancel_at_portfolio_scope() {
         let pipeline = Pipeline::from_scenario(&scenario);
         let scope = pipeline.portfolio_scope();
         let Ok(portfolio) = aggregate_scope(
-            &pipeline.effects(&pipeline.bundle.disposals),
+            &pipeline.effects(
+                &pipeline.bundle.disposals,
+                &pipeline.bundle.rejected_activities(),
+            ),
             &pipeline.series,
             &scope,
             Window::default(),
@@ -521,7 +657,10 @@ fn p_agg_scope_aggregation_is_exact() {
     let mut pair_days = 0usize;
     for scenario in corpus() {
         let pipeline = Pipeline::from_scenario(&scenario);
-        let effects = pipeline.effects(&pipeline.bundle.disposals);
+        let effects = pipeline.effects(
+            &pipeline.bundle.disposals,
+            &pipeline.bundle.rejected_activities(),
+        );
         let scope = pipeline.portfolio_scope();
         for account in &scope {
             let Some(own) = pipeline.series.get(account) else {

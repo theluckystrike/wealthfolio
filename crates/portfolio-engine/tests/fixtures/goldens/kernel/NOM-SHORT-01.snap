@@ -120,7 +120,7 @@ baseline:
           attribution:
             contributions: "2000"
             distributions: "0"
-            fees: "9"
+            fees: "7"
             fx_effect: "0"
             income: "0"
             realized_pnl: "20"
@@ -172,7 +172,7 @@ baseline:
             - date: 2025-01-12
               value: "0.0185"
           summary:
-            amount: "35"
+            amount: "37"
             amount_status: complete
             basis: marketValue
             basis_status: notApplicable
@@ -409,7 +409,7 @@ baseline:
       attribution:
         contributions: "2000"
         distributions: "0"
-        fees: "9"
+        fees: "7"
         fx_effect: "0"
         income: "0"
         realized_pnl: "20"
@@ -461,7 +461,7 @@ baseline:
         - date: 2025-01-12
           value: "0.0185"
       summary:
-        amount: "35"
+        amount: "37"
         amount_status: complete
         basis: marketValue
         basis_status: notApplicable

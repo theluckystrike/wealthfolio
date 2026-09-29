@@ -6,7 +6,7 @@
 //! for the runs an engine does not cover alone: chunked folds and resumes from
 //! a checkpoint, revaluing stored keyframes, and measuring stored rows.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::compile::{compile, CompiledLedger};
 use crate::diagnostics::Diagnostic;
@@ -118,9 +118,10 @@ impl Engine {
 
     /// Every event priced once for scope aggregation and `measure`;
     /// `disposals` supply the removed-lot basis of unquoted outbound
-    /// transfers (computed or stored).
-    pub fn effects(&self, disposals: &[LotDisposal]) -> Effects {
-        effects(&self.resolved(), disposals)
+    /// transfers and `rejected` the activities the fold left out (computed
+    /// or stored).
+    pub fn effects(&self, disposals: &[LotDisposal], rejected: &BTreeSet<ActivityId>) -> Effects {
+        effects(&self.resolved(), disposals, rejected)
     }
 
     /// The inputs `measure_account` and `measure_scope` read: the priced
@@ -130,9 +131,10 @@ impl Engine {
         series: &'a BTreeMap<AccountId, ValuationSeries>,
         lots: &'a [LotRecord],
         disposals: &'a [LotDisposal],
+        rejected: &BTreeSet<ActivityId>,
     ) -> MeasureInputs<'a> {
         MeasureInputs {
-            effects: self.effects(disposals),
+            effects: self.effects(disposals, rejected),
             series,
             lots,
             disposals,

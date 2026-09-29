@@ -90,14 +90,36 @@ impl PricedPosition {
 /// Dense daily valuations per account (transactions-mode from the projection,
 /// holdings-mode from observed snapshots), each with finalized flows.
 pub fn value(inputs: &ValueInputs<'_>) -> BTreeMap<AccountId, ValuationSeries> {
+    value_series(inputs, None)
+}
+
+/// [`value`] for one window of a chunked run: `inputs.bundle` is the window's
+/// projection and `resolved.range` the window. `seed` holds, for every
+/// account with history before the window, its state on the day before (the
+/// previous window's end state, or a stored keyframe). Rows start at the
+/// window start; concatenated over windows they equal one [`value`] over the
+/// whole range (P-WIN).
+pub fn value_window(
+    inputs: &ValueInputs<'_>,
+    seed: &BTreeMap<AccountId, AccountState>,
+) -> BTreeMap<AccountId, ValuationSeries> {
+    value_series(inputs, Some(seed))
+}
+
+fn value_series(
+    inputs: &ValueInputs<'_>,
+    seed: Option<&BTreeMap<AccountId, AccountState>>,
+) -> BTreeMap<AccountId, ValuationSeries> {
     let resolved = &inputs.resolved;
-    let (effects, mut pricing_diagnostics) = priced_events(resolved, &inputs.bundle.disposals);
+    let rejected = inputs.bundle.rejected_activities();
+    let (effects, mut pricing_diagnostics) =
+        priced_events(resolved, &inputs.bundle.disposals, &rejected);
     let mut series = BTreeMap::new();
     for (account_id, account) in &resolved.facts.accounts {
         if account.archived {
             continue;
         }
-        let keyframes = keyframes_for(account_id, account, inputs);
+        let keyframes = keyframes_for(account_id, account, inputs, seed);
         let Some(first) = keyframes.first().map(|k| k.date) else {
             continue;
         };
@@ -126,6 +148,13 @@ pub fn value(inputs: &ValueInputs<'_>) -> BTreeMap<AccountId, ValuationSeries> {
         );
         stamp_flows(&mut days, &flows, false);
         valuer.infer_holdings_flows(&mut days, &keyframes);
+        if seed.is_some() {
+            // The seed day only carries the state into the window.
+            days.retain(|day| day.date >= resolved.range.start);
+            if days.is_empty() {
+                continue;
+            }
+        }
         valuer.report_carries();
         let mut diagnostics = valuer.diagnostics;
         diagnostics.extend(pricing_diagnostics.remove(account_id).unwrap_or_default());
@@ -322,16 +351,27 @@ fn keyframes_for(
     account_id: &AccountId,
     account: &AccountFacts,
     inputs: &ValueInputs<'_>,
+    seed: Option<&BTreeMap<AccountId, AccountState>>,
 ) -> Vec<ValuationKeyframe> {
     let resolved = &inputs.resolved;
     let mut by_date: BTreeMap<NaiveDate, ValuationKeyframe> = BTreeMap::new();
     if account.tracking == TrackingMode::Holdings {
-        for observed in resolved
-            .facts
-            .observed_snapshots
-            .iter()
-            .filter(|s| s.account == *account_id && s.date <= resolved.range.end)
-        {
+        // A window needs only the last observation before it, then its own.
+        let floor = seed.and_then(|_| {
+            resolved
+                .facts
+                .observed_snapshots
+                .iter()
+                .filter(|s| s.account == *account_id && s.date < resolved.range.start)
+                .map(|s| s.date)
+                .max()
+        });
+        for observed in resolved.facts.observed_snapshots.iter().filter(|s| {
+            s.account == *account_id
+                && s.date <= resolved.range.end
+                && floor.is_none_or(|floor| s.date >= floor)
+                && (seed.is_none() || floor.is_some() || s.date >= resolved.range.start)
+        }) {
             let positions = observed
                 .positions
                 .iter()
@@ -370,23 +410,34 @@ fn keyframes_for(
             );
         }
     } else {
+        // A window starts from the account's state on the day before it.
+        let seeded = seed
+            .and_then(|seed| seed.get(account_id))
+            .and_then(|state| {
+                Some(Keyframe {
+                    date: resolved.range.start.pred_opt()?,
+                    state: state.without_lots(),
+                })
+            });
+        let own = inputs
+            .bundle
+            .keyframes
+            .get(account_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         // An account with no events has no keyframes: present its (empty)
-        // final state on the range end, as one row.
-        let synthetic;
-        let frames: &[Keyframe] = match inputs.bundle.keyframes.get(account_id) {
-            Some(frames) if !frames.is_empty() => frames,
-            _ => match inputs.bundle.final_state.accounts.get(account_id) {
-                Some(state) => {
-                    synthetic = [Keyframe {
-                        date: resolved.range.end,
-                        state: state.without_lots(),
-                    }];
-                    &synthetic
-                }
-                None => &[],
-            },
-        };
-        for frame in frames.iter().filter(|f| f.date <= resolved.range.end) {
+        // final state on the range end, as one row (in a chunked run, only
+        // the last window's end is the range end).
+        let last_window = seed.is_none() || resolved.range.end == resolved.facts.policy.as_of;
+        let synthetic = (own.is_empty() && seeded.is_none() && last_window)
+            .then(|| inputs.bundle.final_state.accounts.get(account_id))
+            .flatten()
+            .map(|state| Keyframe {
+                date: resolved.range.end,
+                state: state.without_lots(),
+            });
+        let frames = seeded.iter().chain(own).chain(synthetic.iter());
+        for frame in frames.filter(|f| f.date <= resolved.range.end) {
             let positions = frame
                 .state
                 .positions
@@ -1030,15 +1081,22 @@ impl<'a> Valuer<'a> {
 /// Every event priced once for scope aggregation and `measure`: its flow in
 /// base (as an external flow, or as one of unknown boundary), its attribution
 /// and trade charges in base, the resolved pairs and each account's profile.
-/// `disposals` supply the removed-lot basis of unquoted outbound transfers.
-pub fn effects(resolved: &Resolved<'_>, disposals: &[LotDisposal]) -> Effects {
-    priced_events(resolved, disposals).0
+/// `disposals` supply the removed-lot basis of unquoted outbound transfers;
+/// `rejected` activities contributed nothing to the projection and are left
+/// out.
+pub fn effects(
+    resolved: &Resolved<'_>,
+    disposals: &[LotDisposal],
+    rejected: &BTreeSet<ActivityId>,
+) -> Effects {
+    priced_events(resolved, disposals, rejected).0
 }
 
 /// [`effects`] plus the pricing diagnostics, by the account of the event.
 fn priced_events(
     resolved: &Resolved<'_>,
     disposals: &[LotDisposal],
+    rejected: &BTreeSet<ActivityId>,
 ) -> (Effects, BTreeMap<AccountId, Vec<Diagnostic>>) {
     let facts = resolved.facts;
     let base = facts.policy.base_currency.clone();
@@ -1059,7 +1117,12 @@ fn priced_events(
     let mut valuer = Valuer::new(resolved, disposals, &AccountId::new("effects"), &base);
     let mut diagnostics: BTreeMap<AccountId, Vec<Diagnostic>> = BTreeMap::new();
     let mut events = Vec::with_capacity(resolved.ledger.events.len());
-    for event in &resolved.ledger.events {
+    for event in resolved
+        .ledger
+        .events
+        .iter()
+        .filter(|event| !rejected.contains(&event.source))
+    {
         let in_range = event.date >= range.start && event.date <= range.end;
         let flow = match &event.flow.boundary {
             Boundary::None => None,
@@ -1158,6 +1221,9 @@ fn priced_events(
         pairs: facts
             .transfer_pairs
             .iter()
+            .filter(|pair| {
+                !rejected.contains(&pair.transfer_in) && !rejected.contains(&pair.transfer_out)
+            })
             .map(|pair| PairEffect {
                 group: pair.group_id.clone(),
                 transfer_in: pair.transfer_in.clone(),

@@ -68,8 +68,8 @@ expected_notes: >
   excess-1 is rejected, no disposal, no lot change, cash still 2313 (the
   rejection is only logged; the harness diagnostics do not surface it).
   Market value 01-12 = -6 x 46 = -276; total value 2037; TWR 1.85%.
-  net_contribution 2000 throughout. LEGACY BEHAVIOR (attribution): fees 9 =
-  5 + 2 + 2, i.e. the rejected excess-1 fee is still attributed although it
-  never booked; realized 20 (16 grossed up by the disposed short fee 2 and
-  the cover fee 2), unrealized 24 (21 + remaining fee 3); summary 35 vs the
-  true value change of 37.
+  net_contribution 2000 throughout. Attribution skips the rejected
+  activity as the fold does: fees 7 = 5 + 2 (legacy also attributed the
+  never-booked excess-1 fee, 9); realized 20 (16 grossed up by the disposed
+  short fee 2 and the cover fee 2), unrealized 24 (21 + remaining fee 3);
+  summary 37, the true value change.

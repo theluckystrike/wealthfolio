@@ -32,11 +32,11 @@ pub use error::EngineError;
 pub use measure::{
     measure_account, measure_price_series, measure_scope, MeasureInputs, MeasureProfile,
 };
-pub use normalize::{normalize, Normalized};
+pub use normalize::{normalize, normalize_quotes, Normalized};
 pub use project::lot_records;
 pub use project::project;
 pub use resolve::{
     resolve_surfaces, FxResolver, FxSurface, QuoteSurface, ResolvedSurfaces, SplitEvent,
 };
 pub use scope::{facts_needed, FactsRequest};
-pub use value::{aggregate_scope, effects, value, Resolved, ValueInputs, Window};
+pub use value::{aggregate_scope, effects, value, value_window, Resolved, ValueInputs, Window};

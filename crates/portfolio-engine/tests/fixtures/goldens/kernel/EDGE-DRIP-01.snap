@@ -21,9 +21,9 @@ baseline:
           positions: {}
           source: CALCULATED
         - cash:
-            USD: "1020"
-          cash_total_account_currency: "1020"
-          cash_total_base_currency: "1020"
+            USD: "1000"
+          cash_total_account_currency: "1000"
+          cash_total_base_currency: "1000"
           cost_basis: "0"
           date: 2025-01-08
           net_contribution: "1000"
@@ -38,7 +38,7 @@ baseline:
             distributions: "0"
             fees: "0"
             fx_effect: "0"
-            income: "20"
+            income: "0"
             realized_pnl: "0"
             residual: "0"
             taxes: "0"
@@ -51,19 +51,19 @@ baseline:
           period_start: 2025-01-02
           quality: ok
           returns:
-            annualized_irr: "1.46974202"
+            annualized_irr: "0"
             annualized_twr: ~
             annualized_value_return: ~
-            irr: "0.02"
-            twr: "0.02"
-            value_return: "0.02"
+            irr: "0"
+            twr: "0"
+            value_return: "0"
           risk:
             drawdown_duration_days: 1
             max_drawdown: "0"
             peak_date: 2025-01-02
             recovery_date: ~
             trough_date: 2025-01-03
-            volatility: "0.13380518"
+            volatility: "0"
           series:
             - date: 2025-01-02
               value: "0"
@@ -78,18 +78,18 @@ baseline:
             - date: 2025-01-07
               value: "0"
             - date: 2025-01-08
-              value: "0.02"
+              value: "0"
             - date: 2025-01-09
-              value: "0.02"
+              value: "0"
             - date: 2025-01-10
-              value: "0.02"
+              value: "0"
           summary:
-            amount: "20"
+            amount: "0"
             amount_status: complete
             basis: marketValue
             basis_status: notApplicable
             method: timeWeighted
-            percent: "0.02"
+            percent: "0"
             percent_status: complete
             quality: ok
       tracking_mode: TRANSACTIONS
@@ -215,10 +215,10 @@ baseline:
           total_value_base: "1000"
           value_status: complete
         - basis_status: notApplicable
-          book_basis: "1020"
-          book_basis_base: "1020"
-          cash_balance: "1020"
-          cash_balance_base: "1020"
+          book_basis: "1000"
+          book_basis_base: "1000"
+          cash_balance: "1000"
+          cash_balance_base: "1000"
           cost_basis: "0"
           cost_basis_base: "0"
           date: 2025-01-08
@@ -230,15 +230,15 @@ baseline:
           investment_market_value_base: "0"
           net_contribution: "1000"
           net_contribution_base: "1000"
-          performance_eligible_value_base: "1020"
-          total_value: "1020"
-          total_value_base: "1020"
+          performance_eligible_value_base: "1000"
+          total_value: "1000"
+          total_value_base: "1000"
           value_status: complete
         - basis_status: notApplicable
-          book_basis: "1020"
-          book_basis_base: "1020"
-          cash_balance: "1020"
-          cash_balance_base: "1020"
+          book_basis: "1000"
+          book_basis_base: "1000"
+          cash_balance: "1000"
+          cash_balance_base: "1000"
           cost_basis: "0"
           cost_basis_base: "0"
           date: 2025-01-09
@@ -250,15 +250,15 @@ baseline:
           investment_market_value_base: "0"
           net_contribution: "1000"
           net_contribution_base: "1000"
-          performance_eligible_value_base: "1020"
-          total_value: "1020"
-          total_value_base: "1020"
+          performance_eligible_value_base: "1000"
+          total_value: "1000"
+          total_value_base: "1000"
           value_status: complete
         - basis_status: notApplicable
-          book_basis: "1020"
-          book_basis_base: "1020"
-          cash_balance: "1020"
-          cash_balance_base: "1020"
+          book_basis: "1000"
+          book_basis_base: "1000"
+          cash_balance: "1000"
+          cash_balance_base: "1000"
           cost_basis: "0"
           cost_basis_base: "0"
           date: 2025-01-10
@@ -270,12 +270,12 @@ baseline:
           investment_market_value_base: "0"
           net_contribution: "1000"
           net_contribution_base: "1000"
-          performance_eligible_value_base: "1020"
-          total_value: "1020"
-          total_value_base: "1020"
+          performance_eligible_value_base: "1000"
+          total_value: "1000"
+          total_value_base: "1000"
           value_status: complete
   diagnostics:
-    - "project/drip-1:buy: Error ActivityRejected: failed to convert unit_price from USD to GBP on 2025-01-08"
+    - "project/drip-1: Error ActivityRejected: failed to convert unit_price from USD to GBP on 2025-01-08"
   portfolio:
     all_time:
       attribution:
@@ -283,7 +283,7 @@ baseline:
         distributions: "0"
         fees: "0"
         fx_effect: "0"
-        income: "20"
+        income: "0"
         realized_pnl: "0"
         residual: "0"
         taxes: "0"
@@ -296,19 +296,19 @@ baseline:
       period_start: 2025-01-02
       quality: ok
       returns:
-        annualized_irr: "1.46974202"
+        annualized_irr: "0"
         annualized_twr: ~
         annualized_value_return: ~
-        irr: "0.02"
-        twr: "0.02"
-        value_return: "0.02"
+        irr: "0"
+        twr: "0"
+        value_return: "0"
       risk:
         drawdown_duration_days: 1
         max_drawdown: "0"
         peak_date: 2025-01-02
         recovery_date: ~
         trough_date: 2025-01-03
-        volatility: "0.13380518"
+        volatility: "0"
       series:
         - date: 2025-01-02
           value: "0"
@@ -323,18 +323,18 @@ baseline:
         - date: 2025-01-07
           value: "0"
         - date: 2025-01-08
-          value: "0.02"
+          value: "0"
         - date: 2025-01-09
-          value: "0.02"
+          value: "0"
         - date: 2025-01-10
-          value: "0.02"
+          value: "0"
       summary:
-        amount: "20"
+        amount: "0"
         amount_status: complete
         basis: marketValue
         basis_status: notApplicable
         method: timeWeighted
-        percent: "0.02"
+        percent: "0"
         percent_status: complete
         quality: ok
   portfolio_flows: []

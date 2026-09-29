@@ -519,7 +519,11 @@ pub fn capture_valuation(
     let flows = if series.contains_key(account) {
         flow_values(
             &aggregate_scope(
-                &effects(&inputs.resolved, &inputs.bundle.disposals),
+                &effects(
+                    &inputs.resolved,
+                    &inputs.bundle.disposals,
+                    &inputs.bundle.rejected_activities(),
+                ),
                 series,
                 std::slice::from_ref(account),
                 Window::default(),
@@ -568,7 +572,11 @@ pub fn capture_portfolio_flows(
         return Ok(Vec::new());
     }
     aggregate_scope(
-        &effects(&inputs.resolved, &inputs.bundle.disposals),
+        &effects(
+            &inputs.resolved,
+            &inputs.bundle.disposals,
+            &inputs.bundle.rejected_activities(),
+        ),
         series,
         &scope,
         Window::default(),
@@ -973,8 +981,12 @@ impl Pipeline {
 
     /// The read-path inputs over this pipeline's own outputs.
     pub fn measure_inputs<'a>(&'a self, lots: &'a [LotRecord]) -> MeasureInputs<'a> {
-        self.engine
-            .measure_inputs(&self.series, lots, &self.bundle.disposals)
+        self.engine.measure_inputs(
+            &self.series,
+            lots,
+            &self.bundle.disposals,
+            &self.bundle.rejected_activities(),
+        )
     }
 
     /// Every non-archived account, the legacy portfolio scope.

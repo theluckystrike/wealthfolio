@@ -259,17 +259,17 @@ struct Reduction {
     fully_consumed: Vec<Lot>,
 }
 
-/// Everything one event may change: the cash balances, the account totals and
-/// the position of the event's own asset (every handler writes only that
-/// position). Debug builds check the footprint on every event.
+/// Everything one activity may change: the cash balances, the account totals
+/// and the positions of its legs' assets (every handler writes only its
+/// event's own position). Debug builds check the footprint on every activity.
 struct Savepoint {
     cash: BTreeMap<Currency, Decimal>,
     totals: [Decimal; 5],
-    position: Option<(AssetId, Option<Position>)>,
+    positions: Vec<(AssetId, Option<Position>)>,
 }
 
 impl Savepoint {
-    fn take(account: &AccountState, action: &Action) -> Self {
+    fn take<'e>(account: &AccountState, legs: impl Iterator<Item = &'e EconomicEvent>) -> Self {
         // Exhaustive, so a new field has to be placed in or out of the savepoint.
         let AccountState {
             account: _,
@@ -282,13 +282,17 @@ impl Savepoint {
             cash_total_account,
             cash_total_base,
         } = account;
-        let asset = match action {
-            Action::None => None,
-            Action::Trade { asset, .. }
-            | Action::SecurityTransfer { asset, .. }
-            | Action::Split { asset, .. }
-            | Action::OptionExpiry { asset, .. } => Some(asset),
-        };
+        let mut assets: Vec<&AssetId> = legs
+            .filter_map(|leg| match &leg.action {
+                Action::None => None,
+                Action::Trade { asset, .. }
+                | Action::SecurityTransfer { asset, .. }
+                | Action::Split { asset, .. }
+                | Action::OptionExpiry { asset, .. } => Some(asset),
+            })
+            .collect();
+        assets.sort();
+        assets.dedup();
         Self {
             cash: cash.clone(),
             totals: [
@@ -298,7 +302,10 @@ impl Savepoint {
                 *cash_total_account,
                 *cash_total_base,
             ],
-            position: asset.map(|asset| (asset.clone(), positions.get(asset).cloned())),
+            positions: assets
+                .into_iter()
+                .map(|asset| (asset.clone(), positions.get(asset).cloned()))
+                .collect(),
         }
     }
 
@@ -311,7 +318,7 @@ impl Savepoint {
             account.cash_total_account,
             account.cash_total_base,
         ] = self.totals;
-        if let Some((asset, position)) = self.position {
+        for (asset, position) in self.positions {
             match position {
                 Some(position) => account.positions.insert(asset, position),
                 None => account.positions.remove(&asset),
@@ -319,15 +326,15 @@ impl Savepoint {
         }
     }
 
-    /// Every other position is untouched, whether the event applied or not.
+    /// Every other position is untouched, whether the activity applied or not.
     #[cfg(debug_assertions)]
     fn check_footprint(&self, before: &AccountState, after: &AccountState) {
-        let own = self.position.as_ref().map(|(asset, _)| asset);
+        let own: Vec<&AssetId> = self.positions.iter().map(|(asset, _)| asset).collect();
         let others = |state: &AccountState| {
             state
                 .positions
                 .iter()
-                .filter(|(asset, _)| Some(*asset) != own)
+                .filter(|(asset, _)| !own.contains(asset))
                 .map(|(asset, position)| (asset.clone(), position.clone()))
                 .collect::<Vec<_>>()
         };
@@ -336,7 +343,7 @@ impl Savepoint {
         debug_assert_eq!(
             others(before),
             others(after),
-            "an event changed another position"
+            "an activity changed another position"
         );
     }
 }
@@ -362,14 +369,18 @@ impl Projector<'_> {
         cache: &mut BTreeMap<String, Vec<Lot>>,
         run: &mut RunLog,
     ) -> AccountState {
-        for event in events {
-            // A rejected event must leave no trace. Save only what an event
-            // can change instead of copying every position's lots.
-            let savepoint = Savepoint::take(&account, &event.action);
+        // An activity applies whole or not at all: a composite's legs (DRIP:
+        // income then buy) are consecutive events of one source, and a rejected
+        // leg rejects the activity. Save only what its legs can change instead
+        // of copying every position's lots.
+        for legs in events.chunk_by(|a, b| a.source == b.source) {
+            let savepoint = Savepoint::take(&account, legs.iter().copied());
             #[cfg(debug_assertions)]
             let before = account.clone();
             let mut effects = SideEffects::default();
-            let applied = self.apply(event, &mut account, cache, &mut effects, run);
+            let applied = legs
+                .iter()
+                .try_for_each(|leg| self.apply(leg, &mut account, cache, &mut effects, run));
             #[cfg(debug_assertions)]
             savepoint.check_footprint(&before, &account);
             match applied {
@@ -385,11 +396,12 @@ impl Projector<'_> {
                 }
                 Err(message) => {
                     savepoint.restore(&mut account);
+                    let activity = &legs[0].source;
                     #[cfg(debug_assertions)]
-                    debug_assert_eq!(account, before, "rejected {} left a trace", event.id);
+                    debug_assert_eq!(account, before, "rejected {activity} left a trace");
                     run.diagnostics.push(Diagnostic::error(
                         DiagnosticCode::ActivityRejected,
-                        event.id.as_str(),
+                        activity.as_str(),
                         message,
                     ));
                 }

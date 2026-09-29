@@ -2,14 +2,14 @@
 //! plus the in-flight transfer cache. A `ProjectionState` is a lossless
 //! checkpoint: `project(D..T, from state(D−1))` ≡ `project(genesis..T)` (I1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use super::scalar::{AccountId, ActivityId, AssetId, Currency, EventId};
-use crate::diagnostics::Diagnostic;
+use crate::diagnostics::{Diagnostic, DiagnosticCode};
 
 /// Inclusive calendar-date range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,4 +340,16 @@ pub struct ProjectionBundle {
     pub disposals: Vec<LotDisposal>,
     pub closures: Vec<LotClosure>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+impl ProjectionBundle {
+    /// Activities the fold rejected. They changed no state, so valuation and
+    /// attribution must not count them either.
+    pub fn rejected_activities(&self) -> BTreeSet<ActivityId> {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.code == DiagnosticCode::ActivityRejected)
+            .map(|d| ActivityId::new(d.source.as_str()))
+            .collect()
+    }
 }

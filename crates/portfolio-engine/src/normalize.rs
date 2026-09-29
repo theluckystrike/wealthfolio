@@ -104,62 +104,7 @@ pub fn normalize(raw: RawFacts) -> Result<Normalized, EngineError> {
 
     let transfer_pairs = resolve_transfer_pairs(&activities, &mut diagnostics);
 
-    let mut quotes = Vec::with_capacity(raw.quotes.len());
-    for quote in raw.quotes {
-        let asset = AssetId::new(quote.asset_id.clone());
-        let currency = Currency::parse(&quote.currency)
-            .or_else(|| assets.get(&asset).and_then(|a| a.quote_currency.clone()));
-        let Some(currency) = currency else {
-            diagnostics.push(Diagnostic::warning(
-                DiagnosticCode::MissingCurrency,
-                format!("{}@{}", quote.asset_id, quote.day),
-                "quote without a currency and no asset quote currency; ignored",
-            ));
-            continue;
-        };
-        // A zero or negative close is a broken row, not a price: using it
-        // would value the position at nothing while reporting Complete.
-        if quote.close <= Decimal::ZERO {
-            diagnostics.push(Diagnostic::warning(
-                DiagnosticCode::InvalidQuote,
-                format!("{}@{}", quote.asset_id, quote.day),
-                format!("quote close {} is not positive; ignored", quote.close),
-            ));
-            continue;
-        }
-        if quote.close > MAX_MAGNITUDE {
-            diagnostics.push(Diagnostic::warning(
-                DiagnosticCode::ValueOutOfRange,
-                format!("{}@{}", quote.asset_id, quote.day),
-                format!(
-                    "quote close {} is outside the kernel range; ignored",
-                    quote.close
-                ),
-            ));
-            continue;
-        }
-        quotes.push(QuoteObservation {
-            asset,
-            day: quote.day,
-            close: quote.close,
-            currency,
-            source: quote.source,
-        });
-    }
-    // One observation per asset and day. Several sources may quote the same
-    // day (the store is unique on asset, day and source); the winner is
-    // decided by source rank, then source name, then value, never by input
-    // order.
-    quotes.sort_by(|a, b| {
-        a.asset
-            .cmp(&b.asset)
-            .then_with(|| a.day.cmp(&b.day))
-            .then_with(|| source_rank(&a.source).cmp(&source_rank(&b.source)))
-            .then_with(|| a.source.cmp(&b.source))
-            .then_with(|| a.close.cmp(&b.close))
-            .then_with(|| a.currency.cmp(&b.currency))
-    });
-    quotes.dedup_by(|later, earlier| later.asset == earlier.asset && later.day == earlier.day);
+    let quotes = normalize_quotes(raw.quotes, &assets, &mut diagnostics);
 
     let mut fx_rates = Vec::with_capacity(raw.fx_rates.len());
     for rate in raw.fx_rates {
@@ -329,6 +274,74 @@ fn tracking_mode(raw: &str) -> TrackingMode {
 
 /// Same-day quote precedence: a manual price is an explicit override, a
 /// provider price is the reference, a broker trade price is the fallback.
+/// Quote rows as observations: each resolved to a currency (the row's, else
+/// its asset's quote currency), non-positive and out-of-range closes dropped,
+/// one observation per asset and day. `normalize` runs it over the facts; a
+/// windowed run calls it for each window's quotes against the same assets.
+pub fn normalize_quotes(
+    raw_quotes: Vec<RawQuote>,
+    assets: &BTreeMap<AssetId, AssetFacts>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<QuoteObservation> {
+    let mut quotes = Vec::with_capacity(raw_quotes.len());
+    for quote in raw_quotes {
+        let asset = AssetId::new(quote.asset_id.clone());
+        let currency = Currency::parse(&quote.currency)
+            .or_else(|| assets.get(&asset).and_then(|a| a.quote_currency.clone()));
+        let Some(currency) = currency else {
+            diagnostics.push(Diagnostic::warning(
+                DiagnosticCode::MissingCurrency,
+                format!("{}@{}", quote.asset_id, quote.day),
+                "quote without a currency and no asset quote currency; ignored",
+            ));
+            continue;
+        };
+        // A zero or negative close is a broken row, not a price: using it
+        // would value the position at nothing while reporting Complete.
+        if quote.close <= Decimal::ZERO {
+            diagnostics.push(Diagnostic::warning(
+                DiagnosticCode::InvalidQuote,
+                format!("{}@{}", quote.asset_id, quote.day),
+                format!("quote close {} is not positive; ignored", quote.close),
+            ));
+            continue;
+        }
+        if quote.close > MAX_MAGNITUDE {
+            diagnostics.push(Diagnostic::warning(
+                DiagnosticCode::ValueOutOfRange,
+                format!("{}@{}", quote.asset_id, quote.day),
+                format!(
+                    "quote close {} is outside the kernel range; ignored",
+                    quote.close
+                ),
+            ));
+            continue;
+        }
+        quotes.push(QuoteObservation {
+            asset,
+            day: quote.day,
+            close: quote.close,
+            currency,
+            source: quote.source,
+        });
+    }
+    // One observation per asset and day. Several sources may quote the same
+    // day (the store is unique on asset, day and source); the winner is
+    // decided by source rank, then source name, then value, never by input
+    // order.
+    quotes.sort_by(|a, b| {
+        a.asset
+            .cmp(&b.asset)
+            .then_with(|| a.day.cmp(&b.day))
+            .then_with(|| source_rank(&a.source).cmp(&source_rank(&b.source)))
+            .then_with(|| a.source.cmp(&b.source))
+            .then_with(|| a.close.cmp(&b.close))
+            .then_with(|| a.currency.cmp(&b.currency))
+    });
+    quotes.dedup_by(|later, earlier| later.asset == earlier.asset && later.day == earlier.day);
+    quotes
+}
+
 fn source_rank(source: &str) -> u8 {
     match source.trim().to_ascii_uppercase().as_str() {
         "MANUAL" => 0,

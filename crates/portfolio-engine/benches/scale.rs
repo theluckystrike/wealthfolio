@@ -153,7 +153,12 @@ fn run_pipeline(raw: RawFacts) -> usize {
     let bundle = engine.project().expect("project");
     let series = engine.value(&bundle);
     let lots = engine.lots(&bundle);
-    let inputs = engine.measure_inputs(&series, &lots, &bundle.disposals);
+    let inputs = engine.measure_inputs(
+        &series,
+        &lots,
+        &bundle.disposals,
+        &bundle.rejected_activities(),
+    );
     let scope: Vec<AccountId> = engine.facts().accounts().keys().cloned().collect();
     let result = measure_scope(
         &inputs,
