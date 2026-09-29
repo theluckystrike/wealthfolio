@@ -35,6 +35,38 @@ const SOURCE_PRIORITY_CASE: &str =
 const SOURCE_PRIORITY_CASE_Q: &str =
     "CASE q.source WHEN 'MANUAL' THEN 1 WHEN 'BROKER' THEN 3 ELSE 2 END";
 
+/// `SOURCE_PRIORITY_CASE` for rows already read.
+fn source_priority(source: &str) -> u8 {
+    match source {
+        "MANUAL" => 1,
+        "BROKER" => 3,
+        _ => 2,
+    }
+}
+
+/// One quote per asset and day from rows ordered by (asset, day): the source
+/// that ranks first, then the latest timestamp.
+fn best_per_day(rows: Vec<QuoteDB>) -> Vec<QuoteDB> {
+    fn rank(row: &QuoteDB) -> (u8, std::cmp::Reverse<&str>) {
+        (
+            source_priority(&row.source),
+            std::cmp::Reverse(row.timestamp.as_str()),
+        )
+    }
+    let mut best: Vec<QuoteDB> = Vec::with_capacity(rows.len());
+    for row in rows {
+        match best.last_mut() {
+            Some(last) if last.asset_id == row.asset_id && last.day == row.day => {
+                if rank(&row) < rank(last) {
+                    *last = row;
+                }
+            }
+            _ => best.push(row),
+        }
+    }
+    best
+}
+
 pub struct MarketDataRepository {
     pool: Arc<Pool<ConnectionManager<SqliteConnection>>>,
     writer: WriteHandle,
@@ -798,16 +830,13 @@ impl QuoteStore for MarketDataRepository {
                     placeholders = placeholders
                 )
             } else {
+                // Ranking the sources in SQL sorts every row of the range; the
+                // index already yields them in (asset, day) order, so the best
+                // source per day is picked while reading instead.
                 format!(
-                    "WITH RankedQuotes AS ( \
-                        SELECT q.*, \
-                            ROW_NUMBER() OVER (PARTITION BY q.asset_id, q.day ORDER BY {priority} ASC, q.timestamp DESC) as rn \
-                        FROM quotes q \
-                        WHERE q.asset_id IN ({placeholders}) AND q.day >= ? AND q.day <= ? \
-                    ) \
-                    SELECT * FROM RankedQuotes WHERE rn = 1 \
-                    ORDER BY asset_id, day ASC",
-                    priority = SOURCE_PRIORITY_CASE_Q,
+                    "SELECT q.* FROM quotes q \
+                     WHERE q.asset_id IN ({placeholders}) AND q.day >= ? AND q.day <= ? \
+                     ORDER BY q.asset_id, q.day",
                     placeholders = placeholders
                 )
             };
@@ -821,13 +850,13 @@ impl QuoteStore for MarketDataRepository {
             if let Some(source) = source {
                 query = query.bind::<Text, _>(source.to_storage_string());
             }
-            result.extend(
-                query
-                    .load::<QuoteDB>(&mut conn)
-                    .into_core()?
-                    .into_iter()
-                    .map(Quote::from),
-            );
+            let rows = query.load::<QuoteDB>(&mut conn).into_core()?;
+            let rows = if source.is_some() {
+                rows
+            } else {
+                best_per_day(rows)
+            };
+            result.extend(rows.into_iter().map(Quote::from));
         }
 
         result.sort_by(|left, right| {
@@ -2183,6 +2212,72 @@ mod tests {
         assert_eq!(range[1].timestamp.date_naive(), duplicate_day);
         assert_eq!(range[1].data_source, "YAHOO");
         assert_eq!(range[1].close, Decimal::from(61));
+    }
+
+    #[tokio::test]
+    async fn range_batch_keeps_the_best_source_of_each_day() {
+        let (repo, _temp) = create_test_repository().await;
+        insert_test_asset(&repo, "RANK-A");
+        insert_test_asset(&repo, "RANK-B");
+        let day = |d: u32| NaiveDate::from_ymd_opt(2024, 6, d).unwrap();
+        let at = |d: u32, hour: u32, source: &str, close: i64| {
+            let mut quote = quote_with_source("RANK-A", day(d), source, Decimal::from(close));
+            quote.timestamp = Utc.from_utc_datetime(&day(d).and_hms_opt(hour, 0, 0).unwrap());
+            quote
+        };
+        for quote in [
+            // Day 3: manual beats the provider and the broker.
+            at(3, 16, "BROKER", 13),
+            at(3, 16, "YAHOO", 12),
+            at(3, 16, "MANUAL", 11),
+            // Day 4: between providers the later one wins; the broker last.
+            at(4, 12, "STOOQ", 21),
+            at(4, 16, "YAHOO", 22),
+            at(4, 20, "BROKER", 23),
+            // Day 5: a broker quote alone still counts.
+            at(5, 16, "BROKER", 33),
+        ] {
+            repo.save_quote(&quote).await.expect("save quote");
+        }
+        repo.save_quote(&quote_with_source(
+            "RANK-B",
+            day(3),
+            "YAHOO",
+            Decimal::from(41),
+        ))
+        .await
+        .expect("save quote");
+
+        let asset_ids = [AssetId::new("RANK-B"), AssetId::new("RANK-A")];
+        let quotes = repo
+            .range_batch(&asset_ids, Day::new(day(3)), Day::new(day(5)), None)
+            .expect("get batch range");
+        let closes: Vec<(String, Decimal)> = quotes
+            .iter()
+            .map(|q| (q.asset_id.clone(), q.close))
+            .collect();
+        assert_eq!(
+            closes,
+            vec![
+                ("RANK-A".to_string(), Decimal::from(11)),
+                ("RANK-A".to_string(), Decimal::from(22)),
+                ("RANK-A".to_string(), Decimal::from(33)),
+                ("RANK-B".to_string(), Decimal::from(41)),
+            ]
+        );
+        let mut single = Vec::new();
+        for asset_id in &asset_ids {
+            single.extend(
+                repo.range(asset_id, Day::new(day(3)), Day::new(day(5)), None)
+                    .expect("get single-asset range"),
+            );
+        }
+        single.sort_by(|left, right| {
+            left.asset_id
+                .cmp(&right.asset_id)
+                .then_with(|| left.timestamp.cmp(&right.timestamp))
+        });
+        assert_eq!(quotes, single);
     }
 
     #[tokio::test]
