@@ -470,7 +470,10 @@ impl PortfolioCoordinator {
                         ))
                     });
             match computed {
-                Ok(computed) => Some(computed),
+                Ok(computed) => {
+                    log_rejections(&computed);
+                    Some(computed)
+                }
                 Err(error) => {
                     let message = error.to_string();
                     for plan in plans.iter_mut() {
@@ -888,6 +891,23 @@ pub async fn run_periodic_consistency(
 
 fn day_advanced(projected_through: NaiveDate, today: NaiveDate) -> Option<StaleReason> {
     (projected_through < today).then_some(StaleReason::DayAdvanced)
+}
+
+/// An activity the kernel rejected contributed nothing; log which one, as the
+/// legacy calculator did. The message stays out: it can carry quantities.
+fn log_rejections(computed: &persist::Computed) {
+    for diagnostic in computed
+        .ledger
+        .diagnostics
+        .iter()
+        .chain(&computed.bundle.diagnostics)
+        .filter(|diagnostic| diagnostic.severity == engine::Severity::Error)
+    {
+        warn!(
+            "Portfolio engine rejected {}: {:?}",
+            diagnostic.source, diagnostic.code
+        );
+    }
 }
 
 fn failures_for(account_ids: &[String], code: &str, message: &str) -> Vec<AccountFailure> {
