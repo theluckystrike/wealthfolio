@@ -166,6 +166,7 @@ fn run_pipeline(raw: RawFacts) -> usize {
         &scope,
         Window::default(),
         MeasureProfile::Full,
+        true,
     )
     .unwrap();
     series.values().map(|s| s.days.len()).sum::<usize>() + result.series.len()

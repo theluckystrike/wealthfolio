@@ -76,7 +76,7 @@ impl MeasureInputs<'_> {
 }
 
 /// What the caller will render (architecture §4.3).
-/// `Summary` skips IRR, annualisation, risk and the series; `Dashboard`
+/// `Summary` skips IRR, annualisation and risk; `Dashboard`
 /// additionally reports the exact value change net of flows as the headline
 /// amount and skips attribution, as the legacy dashboard cards did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -205,11 +205,13 @@ fn check_not_archived(inputs: &MeasureInputs<'_>, scope: &[AccountId]) -> Result
 }
 
 /// Performance of one account (legacy `calculate_account_performance`).
+/// `include_series` adds the daily return series (history responses only).
 pub fn measure_account(
     inputs: &MeasureInputs<'_>,
     account: &AccountId,
     window: Window,
     profile: MeasureProfile,
+    include_series: bool,
 ) -> Result<PerformanceResult, EngineError> {
     check_window(window)?;
     check_not_archived(inputs, std::slice::from_ref(account))?;
@@ -228,7 +230,7 @@ pub fn measure_account(
         &history,
         holdings,
         window.start,
-        profile == MeasureProfile::Full,
+        include_series,
         profile,
         inputs.is_cash_account(account),
         inputs.account_is_base(account),
@@ -251,14 +253,15 @@ pub fn measure_account(
     Ok(result)
 }
 
-/// Performance of an account scope (legacy `calculate_scoped_performance`
-/// with the full profile and a return series).
+/// Performance of an account scope (legacy `calculate_scoped_performance`);
+/// `include_series` as in [`measure_account`].
 pub fn measure_scope(
     inputs: &MeasureInputs<'_>,
     scope_id: &str,
     scope: &[AccountId],
     window: Window,
     profile: MeasureProfile,
+    include_series: bool,
 ) -> Result<PerformanceResult, EngineError> {
     check_window(window)?;
     check_not_archived(inputs, scope)?;
@@ -280,7 +283,7 @@ pub fn measure_scope(
         .any(|a| inputs.tracking(a) != TrackingMode::Holdings);
 
     if has_holdings && has_transactions {
-        let mut result = mixed_scope_performance(inputs, scope, window, profile);
+        let mut result = mixed_scope_performance(inputs, scope, window, profile, include_series);
         result.scope = scope_id.to_string();
         return Ok(result);
     }
@@ -318,7 +321,7 @@ pub fn measure_scope(
         &history,
         has_holdings,
         window.start,
-        profile == MeasureProfile::Full,
+        include_series,
         profile,
         all_cash,
         true,
@@ -598,7 +601,7 @@ fn performance_core(
         ..Attribution::default()
     };
 
-    let mut warnings = flow_quality_warnings(&flows);
+    let mut warnings = flow_quality_warnings(history, &flows);
     if holdings && start_opt.is_some() && has_estimated_holdings_flows(&flows) {
         warnings.push(QualityNote::HoldingsFlowsEstimated);
     }
@@ -723,11 +726,18 @@ fn split(delta: Decimal) -> (Decimal, Decimal) {
     }
 }
 
-fn flow_quality_warnings(flows: &[PeriodFlow]) -> Vec<QualityNote> {
+fn flow_quality_warnings(history: &[DailyValuation], flows: &[PeriodFlow]) -> Vec<QualityNote> {
     let mut warnings = Vec::new();
-    if flows
+    // A stored flow the valuation inferred from the net-contribution delta
+    // keeps its amount (`StoredGross` above) but was still inferred.
+    let stored_inferred = history
         .iter()
-        .any(|f| f.source == FlowSource::NetContributionFallback)
+        .skip(1)
+        .any(|day| day.flow.source == FlowSource::NetContributionFallback);
+    if stored_inferred
+        || flows
+            .iter()
+            .any(|f| f.source == FlowSource::NetContributionFallback)
     {
         warnings.push(QualityNote::NetContributionFlows);
     }
@@ -2227,6 +2237,7 @@ fn mixed_scope_performance(
     scope: &[AccountId],
     window: Window,
     profile: MeasureProfile,
+    include_series: bool,
 ) -> PerformanceResult {
     let is_all_time = window.start.is_none();
     // Legacy: dashboard requests measure components with the dashboard
@@ -2355,7 +2366,14 @@ fn mixed_scope_performance(
             reasons,
         });
     }
-    build_mixed_result(&components, metrics, skipped, base, window.start)
+    build_mixed_result(
+        &components,
+        metrics,
+        skipped,
+        base,
+        window.start,
+        include_series,
+    )
 }
 
 fn build_mixed_result(
@@ -2364,6 +2382,7 @@ fn build_mixed_result(
     skipped: Vec<QualityNote>,
     currency: &Currency,
     start_opt: Option<NaiveDate>,
+    include_series: bool,
 ) -> PerformanceResult {
     let is_all_time = start_opt.is_none();
     let mut attribution = Attribution::default();
@@ -2449,7 +2468,7 @@ fn build_mixed_result(
     };
 
     let mut series = Vec::new();
-    if value_return.is_some() {
+    if include_series && value_return.is_some() {
         if is_all_time {
             warnings.push(QualityNote::MixedSeriesUnavailable);
         } else {
@@ -2870,5 +2889,51 @@ mod tests {
         // Ordinary returns are unaffected.
         let ordinary = annualized_return(start, end, dec!(0.05)).unwrap();
         assert!(ordinary > dec!(0.7) && ordinary < dec!(0.8), "{ordinary}");
+    }
+
+    #[test]
+    fn a_stored_inferred_flow_keeps_its_amount_and_reports_the_inference() {
+        let measure = |source: FlowSource| {
+            let mut history = vec![
+                row("2026-05-01", dec!(100)),
+                row("2026-05-02", dec!(97.5)),
+                row("2026-05-03", dec!(99)),
+            ];
+            // The valuation inferred a 2.50 outflow from the net-contribution delta.
+            history[1].net_contribution_base = dec!(97.5);
+            history[2].net_contribution_base = dec!(97.5);
+            history[1].flow = DailyFlow {
+                inflow_base: Decimal::ZERO,
+                outflow_base: dec!(2.5),
+                source,
+            };
+            let currency = Currency::parse("CAD").unwrap();
+            performance_core(
+                &history,
+                false,
+                None,
+                false,
+                MeasureProfile::Full,
+                false,
+                true,
+                &currency,
+            )
+        };
+        let inferred = measure(FlowSource::NetContributionFallback);
+        let gross = measure(FlowSource::StoredGross);
+        assert_eq!(inferred.returns, gross.returns);
+        assert!(inferred.returns.twr.is_some());
+        assert!(inferred
+            .data_quality
+            .warnings
+            .contains(&QualityNote::NetContributionFlows));
+        assert!(inferred
+            .data_quality
+            .warnings
+            .contains(&QualityNote::DegradedFlowProvenance));
+        assert!(!gross
+            .data_quality
+            .warnings
+            .contains(&QualityNote::NetContributionFlows));
     }
 }

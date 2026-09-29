@@ -419,6 +419,7 @@ pub fn measure_account(
     account: &AccountId,
     window: Window,
     profile: MeasureProfile,         // Full | Summary | Dashboard
+    include_series: bool,            // the daily return series (history only)
 ) -> Result<PerformanceResult, EngineError>;
 
 pub fn measure_scope(
@@ -427,6 +428,7 @@ pub fn measure_scope(
     scope: &[AccountId],
     window: Window,
     profile: MeasureProfile,
+    include_series: bool,
 ) -> Result<PerformanceResult, EngineError>;
 
 /// Lot read models derived from a projection bundle.
@@ -448,9 +450,10 @@ pub fn facts_needed(
 
 `MeasureProfile` exists because callers need different depths: the dashboard
 card needs the exact value change net of flows and no attribution, a summary
-needs returns without IRR, risk or a series, and the performance page needs
-everything. The profile is an input, not a post-hoc trim, so the work is never
-done and thrown away.
+needs returns without IRR or risk, and the performance page needs everything.
+The daily return series is a separate input: only history responses draw it,
+so summaries at any profile skip it, as the legacy summaries did. Both are
+inputs, not post-hoc trims, so the work is never done and thrown away.
 
 **Pre- and post-conditions.**
 

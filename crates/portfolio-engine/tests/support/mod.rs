@@ -806,6 +806,7 @@ pub fn capture_account_performance(
             end: window.end,
         },
         MeasureProfile::Full,
+        true,
     );
     match result {
         Ok(result) => performance_value(&result),
@@ -827,6 +828,7 @@ pub fn capture_scope_performance(
             end: window.end,
         },
         MeasureProfile::Full,
+        true,
     );
     match result {
         Ok(result) => performance_value(&result),

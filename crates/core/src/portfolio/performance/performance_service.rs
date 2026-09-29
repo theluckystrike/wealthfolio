@@ -341,6 +341,7 @@ impl PerformanceService {
         start: Option<NaiveDate>,
         end: Option<NaiveDate>,
         profile: PerformanceSummaryProfile,
+        include_series: bool,
     ) -> Result<PerformanceResult> {
         let single;
         let account_ids: &[String] = match target {
@@ -384,12 +385,16 @@ impl PerformanceService {
             PerformanceSummaryProfile::Dashboard => engine::MeasureProfile::Dashboard,
         };
         let result = match target {
-            MeasureTarget::Account(id) => {
-                engine::measure_account(&inputs, &AccountId::new(id), window, kernel_profile)?
-            }
+            MeasureTarget::Account(id) => engine::measure_account(
+                &inputs,
+                &AccountId::new(id),
+                window,
+                kernel_profile,
+                include_series,
+            )?,
             MeasureTarget::Scope { id, accounts } => {
                 let scope: Vec<AccountId> = accounts.iter().map(AccountId::new).collect();
-                engine::measure_scope(&inputs, id, &scope, window, kernel_profile)?
+                engine::measure_scope(&inputs, id, &scope, window, kernel_profile, include_series)?
             }
         };
         Ok(from_kernel(result))
@@ -619,6 +624,7 @@ impl PerformanceServiceTrait for PerformanceService {
                     start_date,
                     end_date,
                     PerformanceSummaryProfile::Full,
+                    true,
                 )
                 .await
             }
@@ -656,6 +662,7 @@ impl PerformanceServiceTrait for PerformanceService {
             start_date,
             end_date,
             PerformanceSummaryProfile::Full,
+            true,
         )
         .await
     }
@@ -677,6 +684,7 @@ impl PerformanceServiceTrait for PerformanceService {
                     start_date,
                     end_date,
                     profile,
+                    false,
                 )
                 .await
             }
@@ -722,6 +730,7 @@ impl PerformanceServiceTrait for PerformanceService {
             start_date,
             end_date,
             profile,
+            false,
         )
         .await
     }
