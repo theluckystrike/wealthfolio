@@ -428,7 +428,6 @@ impl PortfolioCoordinator {
             sources: self.deps.sources.clone(),
             projections: Arc::clone(&self.deps.projections),
             lots: Arc::clone(&self.deps.lots),
-            loaded: Arc::clone(&loaded),
             resolved,
             cadence: self.deps.window_cadence,
         };

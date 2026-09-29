@@ -1,7 +1,7 @@
 //! Kernel stages over loaded facts, and kernel outputs in the row shapes the
 //! existing repositories and readers already understand.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rust_decimal::Decimal;
@@ -59,6 +59,9 @@ pub struct Resolved {
     pub surfaces: engine::ResolvedSurfaces,
     /// First activity or observed snapshot day, clamped to `as_of`.
     pub genesis: NaiveDate,
+    /// Assets each account's activities and observed snapshots reference:
+    /// the holders of an asset, and the prices valuing an account needs.
+    pub assets_by_account: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Resolved {
@@ -109,11 +112,29 @@ pub fn resolve(loaded: &LoadedFacts) -> Result<Resolved> {
             end: loaded.as_of,
         },
     );
+    let mut assets_by_account: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for activity in facts.activities() {
+        if let Some(asset) = &activity.asset {
+            assets_by_account
+                .entry(activity.account.as_str().to_string())
+                .or_default()
+                .insert(asset.as_str().to_string());
+        }
+    }
+    for snapshot in facts.observed_snapshots() {
+        for asset in snapshot.positions.keys() {
+            assets_by_account
+                .entry(snapshot.account.as_str().to_string())
+                .or_default()
+                .insert(asset.as_str().to_string());
+        }
+    }
     Ok(Resolved {
         facts,
         ledger,
         surfaces,
         genesis,
+        assets_by_account,
     })
 }
 

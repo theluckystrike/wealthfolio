@@ -1,8 +1,9 @@
-//! One run over the pending markers: a plan per account, then the refold and
-//! revalue loops. Each window is read, folded or revalued, and written before
-//! the next is read, so memory holds one window plus the running state.
+//! One run over the pending markers: a plan per account, then one pass over
+//! the windows. Each window is read, folded or revalued, and written before the
+//! next is read, so memory holds one window plus the running state.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Bound;
 use std::sync::Arc;
 
 use chrono::NaiveDate;
@@ -14,7 +15,7 @@ use wealthfolio_portfolio_engine::model::{
 use wealthfolio_portfolio_engine::{Diagnostic, DiagnosticCode};
 
 use super::persist::{self, Resolved, WindowCadence};
-use super::{blocking, facts, AccountPlan, FactSources, LoadedFacts, RebuildPlan};
+use super::{blocking, facts, AccountPlan, FactSources, RebuildPlan};
 use crate::errors::Result;
 use crate::lots::{LotDisposal, LotRepositoryTrait};
 use crate::portfolio::projection::{
@@ -74,28 +75,16 @@ pub(super) fn plan(
 ) -> Plan {
     let facts = &resolved.facts;
     let targets: BTreeSet<&str> = targets.iter().map(String::as_str).collect();
-    let mut holdings: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for activity in facts.activities() {
-        if let Some(asset) = &activity.asset {
-            holdings
-                .entry(activity.account.as_str())
-                .or_default()
-                .insert(asset.as_str());
-        }
-    }
-    for snapshot in facts.observed_snapshots() {
-        for asset in snapshot.positions.keys() {
-            holdings
-                .entry(snapshot.account.as_str())
-                .or_default()
-                .insert(asset.as_str());
-        }
-    }
+    let holdings = &resolved.assets_by_account;
     let holders = |asset: &str| -> Vec<&str> {
         targets
             .iter()
             .copied()
-            .filter(|t| holdings.get(t).is_some_and(|assets| assets.contains(asset)))
+            .filter(|t| {
+                holdings
+                    .get(*t)
+                    .is_some_and(|assets| assets.contains(asset))
+            })
             .collect()
     };
 
@@ -194,17 +183,192 @@ pub(super) struct RunContext {
     pub sources: FactSources,
     pub projections: Arc<dyn ProjectionStoreTrait>,
     pub lots: Arc<dyn LotRepositoryTrait>,
-    pub loaded: Arc<LoadedFacts>,
     pub resolved: Arc<Resolved>,
     pub cadence: WindowCadence,
 }
 
-/// Refolds, then revalues; returns what the run commits last (the caller adds
-/// the consumed markers).
+/// One pass over the windows. The fold runs in memory from genesis when an
+/// account refolds; from the first day an account rewrites, each window loads
+/// once the prices of the assets its accounts reference, values the refolded
+/// accounts from the fold and the revalued ones from their stored keyframes,
+/// and writes their rows together. Returns what the run commits last (the
+/// caller adds the consumed markers).
 pub(super) async fn execute(context: &RunContext, plan: &Plan) -> Result<RunCompletion> {
-    let completion = refold(context, &plan.refold).await?;
-    revalue(context, &plan.revalue).await?;
+    let resolved = Arc::clone(&context.resolved);
+    let starts: BTreeSet<NaiveDate> = plan
+        .refold
+        .values()
+        .chain(plan.revalue.values())
+        .copied()
+        .collect();
+    let Some(earliest) = starts.first().copied() else {
+        return Ok(RunCompletion::default());
+    };
+    let folds = !plan.refold.is_empty();
+    let as_of = resolved.facts.policy().as_of;
+    let range = if folds {
+        resolved.range()
+    } else {
+        DateRange {
+            start: earliest.max(resolved.genesis).min(as_of),
+            end: as_of,
+        }
+    };
+    let stored = Arc::new(stored_inputs(context, &plan.revalue).await?);
+
+    let owner: HashMap<String, String> = resolved
+        .facts
+        .activities()
+        .iter()
+        .map(|a| (a.id.as_str().to_string(), a.account.as_str().to_string()))
+        .collect();
+    let mut rejections: BTreeMap<String, Vec<RejectedActivity>> = plan
+        .refold
+        .keys()
+        .map(|account| (account.clone(), Vec::new()))
+        .collect();
+    let mut disposals: BTreeMap<String, Vec<KernelDisposal>> = BTreeMap::new();
+    let mut closures: Vec<LotClosure> = Vec::new();
+    let mut state: Option<ProjectionState> = None;
+    let mut started: BTreeSet<AccountId> = BTreeSet::new();
+    let mut written: BTreeSet<String> = BTreeSet::new();
+
+    for window in windows(context.cadence, range, &starts) {
+        let refold = writers(&plan.refold, window, &mut written);
+        let revalue = writers(&plan.revalue, window, &mut written);
+        let step = folds.then(|| {
+            let seed = if refold.is_empty() {
+                BTreeMap::new()
+            } else {
+                state
+                    .as_ref()
+                    .map(|s| {
+                        s.accounts
+                            .iter()
+                            .filter(|(id, _)| started.contains(*id))
+                            .map(|(id, account)| (id.clone(), account.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            FoldStep {
+                state: state.take(),
+                seed,
+                active: refold,
+            }
+        });
+        let job_resolved = Arc::clone(&resolved);
+        let sources = context.sources.clone();
+        let stored = Arc::clone(&stored);
+        let output =
+            blocking(move || run_window(&job_resolved, &sources, window, step, &revalue, &stored))
+                .await?;
+        if !output.rows.is_empty() {
+            context.projections.write_window(output.rows).await?;
+        }
+        let Some(folded) = output.folded else {
+            continue;
+        };
+        for diagnostic in folded.rejections {
+            let Some(account) = owner.get(&diagnostic.source) else {
+                continue;
+            };
+            if let Some(list) = rejections.get_mut(account) {
+                list.push(RejectedActivity {
+                    activity_id: diagnostic.source,
+                    message: diagnostic.message,
+                });
+            }
+        }
+        for disposal in folded.disposals {
+            if plan
+                .refold
+                .get(disposal.account.as_str())
+                .is_some_and(|from| disposal.date >= *from)
+            {
+                disposals
+                    .entry(disposal.account.as_str().to_string())
+                    .or_default()
+                    .push(disposal);
+            }
+        }
+        closures.extend(
+            folded
+                .closures
+                .into_iter()
+                .filter(|closure| closure.close_date >= earliest),
+        );
+        started.extend(folded.keyframed);
+        state = Some(folded.final_state);
+    }
+
+    let mut completion = RunCompletion::default();
+    let Some(final_state) = state else {
+        return Ok(completion);
+    };
+    let fx = engine::FxResolver {
+        surface: &resolved.surfaces.fx,
+        policy: resolved.facts.policy(),
+    };
+    let records = engine::lot_records(
+        &ProjectionBundle {
+            keyframes: BTreeMap::new(),
+            final_state,
+            disposals: Vec::new(),
+            closures,
+            diagnostics: Vec::new(),
+        },
+        &resolved.facts,
+        &fx,
+    );
+    for (account, from) in &plan.refold {
+        let lots = persist::lot_rows(&resolved, records.clone(), account)
+            .into_iter()
+            .filter(|lot| {
+                lot.close_date
+                    .as_deref()
+                    .and_then(|d| d.parse::<NaiveDate>().ok())
+                    .is_none_or(|closed| closed >= *from)
+            })
+            .collect();
+        let own: Vec<&KernelDisposal> = disposals
+            .get(account)
+            .map(|rows| rows.iter().collect())
+            .unwrap_or_default();
+        completion.lot_books.push(LotBook {
+            account_id: account.clone(),
+            since: *from,
+            lots,
+            disposals: persist::disposal_rows(&resolved, &own, account),
+        });
+    }
+    completion.rejections = rejections.into_iter().collect();
     Ok(completion)
+}
+
+/// The cadence windows over `range`, each also cut at every day an account
+/// starts rewriting, so a window only values accounts that write all of it.
+fn windows(
+    cadence: WindowCadence,
+    range: DateRange,
+    starts: &BTreeSet<NaiveDate>,
+) -> Vec<DateRange> {
+    let mut windows = Vec::new();
+    for window in cadence.windows(range) {
+        let mut start = window.start;
+        for cut in starts.range((Bound::Excluded(window.start), Bound::Included(window.end))) {
+            let Some(end) = cut.pred_opt() else {
+                continue;
+            };
+            windows.push(DateRange { start, end });
+            start = *cut;
+        }
+        windows.push(DateRange {
+            start,
+            end: window.end,
+        });
+    }
+    windows
 }
 
 /// Where an account's rows start in a window: it writes rows from
@@ -251,8 +415,54 @@ fn row_end(resolved: &Resolved, window: DateRange) -> Option<NaiveDate> {
     (window.end < resolved.facts.policy().as_of).then_some(window.end)
 }
 
-struct FoldedWindow {
+/// A window of the fold: the state carried in, the seeds of the accounts the
+/// window writes, and those writers.
+struct FoldStep {
+    state: Option<ProjectionState>,
+    seed: BTreeMap<AccountId, AccountState>,
+    active: Vec<Writer>,
+}
+
+/// What revaluing reads from the last run: stored disposals price unquoted
+/// outbound transfers, stored rejections keep the activities the last fold
+/// rejected out of the flows.
+struct StoredInputs {
+    disposals: Vec<KernelDisposal>,
+    rejected: Vec<Diagnostic>,
+}
+
+async fn stored_inputs(
+    context: &RunContext,
+    accounts: &BTreeMap<String, NaiveDate>,
+) -> Result<StoredInputs> {
+    if accounts.is_empty() {
+        return Ok(StoredInputs {
+            disposals: Vec::new(),
+            rejected: Vec::new(),
+        });
+    }
+    let mut stored_disposals: Vec<LotDisposal> = Vec::new();
+    for account in accounts.keys() {
+        stored_disposals.extend(context.lots.get_lot_disposals_for_account(account).await?);
+    }
+    let ids: Vec<String> = accounts.keys().cloned().collect();
+    Ok(StoredInputs {
+        disposals: super::rows::stored_disposals(&stored_disposals),
+        rejected: context
+            .projections
+            .rejections(&ids)?
+            .into_iter()
+            .map(|r| Diagnostic::error(DiagnosticCode::ActivityRejected, r.activity_id, r.message))
+            .collect(),
+    })
+}
+
+struct WindowOutput {
     rows: Vec<WindowRows>,
+    folded: Option<Folded>,
+}
+
+struct Folded {
     final_state: ProjectionState,
     keyframed: Vec<AccountId>,
     disposals: Vec<KernelDisposal>,
@@ -260,295 +470,152 @@ struct FoldedWindow {
     rejections: Vec<Diagnostic>,
 }
 
-async fn refold(
-    context: &RunContext,
-    accounts: &BTreeMap<String, NaiveDate>,
-) -> Result<RunCompletion> {
-    let mut completion = RunCompletion::default();
-    let Some(earliest) = accounts.values().min().copied() else {
-        return Ok(completion);
-    };
-    let resolved = Arc::clone(&context.resolved);
-    let owner: HashMap<String, String> = resolved
-        .facts
-        .activities()
-        .iter()
-        .map(|a| (a.id.as_str().to_string(), a.account.as_str().to_string()))
-        .collect();
-    let mut rejections: BTreeMap<String, Vec<RejectedActivity>> = accounts
-        .keys()
-        .map(|account| (account.clone(), Vec::new()))
-        .collect();
-    let mut disposals: BTreeMap<String, Vec<KernelDisposal>> = BTreeMap::new();
-    let mut closures: Vec<LotClosure> = Vec::new();
-    let mut state: Option<ProjectionState> = None;
-    let mut started: BTreeSet<AccountId> = BTreeSet::new();
-    let mut written: BTreeSet<String> = BTreeSet::new();
-
-    for window in context.cadence.windows(resolved.range()) {
-        let active = writers(accounts, window, &mut written);
-        let seed: BTreeMap<AccountId, AccountState> = if active.is_empty() {
-            BTreeMap::new()
-        } else {
-            state
-                .as_ref()
-                .map(|s| {
-                    s.accounts
-                        .iter()
-                        .filter(|(id, _)| started.contains(*id))
-                        .map(|(id, account)| (id.clone(), account.clone()))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        let job_resolved = Arc::clone(&resolved);
-        let sources = context.sources.clone();
-        let loaded = Arc::clone(&context.loaded);
-        let prior = state.take();
-        let folded = blocking(move || {
-            fold_window(
-                &job_resolved,
-                &sources,
-                &loaded,
-                window,
-                prior,
-                &seed,
-                &active,
-            )
-        })
-        .await?;
-        if !folded.rows.is_empty() {
-            context.projections.write_window(folded.rows).await?;
+impl Folded {
+    fn from_bundle(bundle: ProjectionBundle) -> Self {
+        Folded {
+            keyframed: bundle
+                .keyframes
+                .iter()
+                .filter(|(_, frames)| !frames.is_empty())
+                .map(|(id, _)| id.clone())
+                .collect(),
+            rejections: bundle
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == DiagnosticCode::ActivityRejected)
+                .cloned()
+                .collect(),
+            final_state: bundle.final_state,
+            disposals: bundle.disposals,
+            closures: bundle.closures,
         }
-        for diagnostic in folded.rejections {
-            let Some(account) = owner.get(&diagnostic.source) else {
-                continue;
-            };
-            if let Some(list) = rejections.get_mut(account) {
-                list.push(RejectedActivity {
-                    activity_id: diagnostic.source,
-                    message: diagnostic.message,
-                });
-            }
-        }
-        for disposal in folded.disposals {
-            if accounts
-                .get(disposal.account.as_str())
-                .is_some_and(|from| disposal.date >= *from)
-            {
-                disposals
-                    .entry(disposal.account.as_str().to_string())
-                    .or_default()
-                    .push(disposal);
-            }
-        }
-        closures.extend(
-            folded
-                .closures
-                .into_iter()
-                .filter(|closure| closure.close_date >= earliest),
-        );
-        started.extend(folded.keyframed);
-        state = Some(folded.final_state);
     }
-
-    let Some(final_state) = state else {
-        return Ok(completion);
-    };
-    let fx = engine::FxResolver {
-        surface: &resolved.surfaces.fx,
-        policy: resolved.facts.policy(),
-    };
-    let records = engine::lot_records(
-        &ProjectionBundle {
-            keyframes: BTreeMap::new(),
-            final_state,
-            disposals: Vec::new(),
-            closures,
-            diagnostics: Vec::new(),
-        },
-        &resolved.facts,
-        &fx,
-    );
-    for (account, from) in accounts {
-        let lots = persist::lot_rows(&resolved, records.clone(), account)
-            .into_iter()
-            .filter(|lot| {
-                lot.close_date
-                    .as_deref()
-                    .and_then(|d| d.parse::<NaiveDate>().ok())
-                    .is_none_or(|closed| closed >= *from)
-            })
-            .collect();
-        let own: Vec<&KernelDisposal> = disposals
-            .get(account)
-            .map(|rows| rows.iter().collect())
-            .unwrap_or_default();
-        completion.lot_books.push(LotBook {
-            account_id: account.clone(),
-            since: *from,
-            lots,
-            disposals: persist::disposal_rows(&resolved, &own, account),
-        });
-    }
-    completion.rejections = rejections.into_iter().collect();
-    Ok(completion)
 }
 
-fn fold_window(
+/// Folds the window (when the run refolds), then loads its prices once for
+/// every account it writes and values both kinds against them.
+fn run_window(
     resolved: &Resolved,
     sources: &FactSources,
-    loaded: &LoadedFacts,
     window: DateRange,
-    state: Option<ProjectionState>,
-    seed: &BTreeMap<AccountId, AccountState>,
-    active: &[Writer],
-) -> Result<FoldedWindow> {
+    fold: Option<FoldStep>,
+    revalue: &[Writer],
+    stored: &StoredInputs,
+) -> Result<WindowOutput> {
     let fx = engine::FxResolver {
         surface: &resolved.surfaces.fx,
         policy: resolved.facts.policy(),
     };
-    let bundle = engine::project(&resolved.ledger, &resolved.facts, &fx, state, window)?;
-    let mut rows = Vec::with_capacity(active.len());
-    if !active.is_empty() {
-        let quotes = facts::window_quotes(sources, &loaded.asset_ids, window.start, window.end)?;
+    let fold = match fold {
+        Some(step) => {
+            let bundle =
+                engine::project(&resolved.ledger, &resolved.facts, &fx, step.state, window)?;
+            Some((bundle, step.seed, step.active))
+        }
+        None => None,
+    };
+    let refold: &[Writer] = fold.as_ref().map_or(&[], |(_, _, active)| active);
+    let mut rows = Vec::new();
+    if !refold.is_empty() || !revalue.is_empty() {
+        let assets: BTreeSet<&String> = refold
+            .iter()
+            .chain(revalue)
+            .filter_map(|writer| resolved.assets_by_account.get(&writer.account))
+            .flatten()
+            .collect();
+        let assets: Vec<String> = assets.into_iter().cloned().collect();
+        let quotes = facts::window_quotes(sources, &assets, window.start, window.end)?;
         let surfaces = resolved.window_surfaces(quotes);
-        let series = engine::value_window(
-            &engine::ValueInputs {
-                resolved: engine::Resolved {
-                    facts: &resolved.facts,
-                    ledger: &resolved.ledger,
-                    surfaces: &surfaces,
-                    range: window,
-                },
-                bundle: &bundle,
+        if let Some((bundle, seed, active)) = &fold {
+            rows.extend(refold_rows(
+                resolved, &surfaces, window, bundle, seed, active,
+            ));
+        }
+        if !revalue.is_empty() {
+            rows.extend(revalue_rows(
+                resolved, sources, &surfaces, window, revalue, stored,
+            )?);
+        }
+    }
+    Ok(WindowOutput {
+        rows,
+        folded: fold.map(|(bundle, _, _)| Folded::from_bundle(bundle)),
+    })
+}
+
+fn refold_rows(
+    resolved: &Resolved,
+    surfaces: &engine::ResolvedSurfaces,
+    window: DateRange,
+    bundle: &ProjectionBundle,
+    seed: &BTreeMap<AccountId, AccountState>,
+    active: &[Writer],
+) -> Vec<WindowRows> {
+    if active.is_empty() {
+        return Vec::new();
+    }
+    let series = engine::value_window(
+        &engine::ValueInputs {
+            resolved: engine::Resolved {
+                facts: &resolved.facts,
+                ledger: &resolved.ledger,
+                surfaces,
+                range: window,
             },
-            seed,
-            Some(&valued(active)),
-        );
-        let base = resolved.facts.policy().base_currency.as_str();
-        for writer in active {
-            let id = AccountId::new(writer.account.as_str());
-            let Some(account) = resolved.facts.accounts().get(&id) else {
-                // No facts left (the account was emptied): clear its rows.
-                rows.push(WindowRows {
-                    account_id: writer.account.clone(),
-                    start: writer.clear_from,
-                    end: row_end(resolved, window),
-                    snapshots: Some(Vec::new()),
-                    valuations: Vec::new(),
-                });
-                continue;
-            };
-            let first_day = writer.from.max(window.start);
-            let frames: Vec<&Keyframe> = bundle
-                .keyframes
-                .get(&id)
-                .map(|frames| frames.iter().filter(|f| f.date >= first_day).collect())
-                .unwrap_or_default();
+            bundle,
+        },
+        seed,
+        Some(&valued(active)),
+    );
+    let base = resolved.facts.policy().base_currency.as_str();
+    let mut rows = Vec::with_capacity(active.len());
+    for writer in active {
+        let id = AccountId::new(writer.account.as_str());
+        let Some(account) = resolved.facts.accounts().get(&id) else {
+            // No facts left (the account was emptied): clear its rows.
             rows.push(WindowRows {
                 account_id: writer.account.clone(),
                 start: writer.clear_from,
                 end: row_end(resolved, window),
-                snapshots: Some(persist::snapshot_rows(
-                    &frames,
-                    &writer.account,
-                    &account.currency,
-                )),
-                valuations: series
-                    .get(&id)
-                    .map(|s| persist::valuation_rows(s, &writer.account, base))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|row| row.valuation_date >= first_day)
-                    .collect(),
+                snapshots: Some(Vec::new()),
+                valuations: Vec::new(),
             });
-        }
-    }
-    let keyframed = bundle
-        .keyframes
-        .iter()
-        .filter(|(_, frames)| !frames.is_empty())
-        .map(|(id, _)| id.clone())
-        .collect();
-    let rejections = bundle
-        .diagnostics
-        .iter()
-        .filter(|d| d.code == DiagnosticCode::ActivityRejected)
-        .cloned()
-        .collect();
-    Ok(FoldedWindow {
-        rows,
-        final_state: bundle.final_state,
-        keyframed,
-        disposals: bundle.disposals,
-        closures: bundle.closures,
-        rejections,
-    })
-}
-
-async fn revalue(context: &RunContext, accounts: &BTreeMap<String, NaiveDate>) -> Result<()> {
-    let Some(earliest) = accounts.values().min().copied() else {
-        return Ok(());
-    };
-    let resolved = Arc::clone(&context.resolved);
-    let as_of = resolved.facts.policy().as_of;
-    // Stored disposals price unquoted outbound transfers; stored rejections
-    // keep the activities the last fold rejected out of the flows.
-    let mut stored_disposals: Vec<LotDisposal> = Vec::new();
-    for account in accounts.keys() {
-        stored_disposals.extend(context.lots.get_lot_disposals_for_account(account).await?);
-    }
-    let disposals = Arc::new(super::rows::stored_disposals(&stored_disposals));
-    let ids: Vec<String> = accounts.keys().cloned().collect();
-    let rejected: Arc<Vec<Diagnostic>> = Arc::new(
-        context
-            .projections
-            .rejections(&ids)?
-            .into_iter()
-            .map(|r| Diagnostic::error(DiagnosticCode::ActivityRejected, r.activity_id, r.message))
-            .collect(),
-    );
-    let range = DateRange {
-        start: earliest.max(resolved.genesis).min(as_of),
-        end: as_of,
-    };
-    let mut written: BTreeSet<String> = BTreeSet::new();
-    for window in context.cadence.windows(range) {
-        let active = writers(accounts, window, &mut written);
-        if active.is_empty() {
             continue;
-        }
-        let job_resolved = Arc::clone(&resolved);
-        let sources = context.sources.clone();
-        let loaded = Arc::clone(&context.loaded);
-        let disposals = Arc::clone(&disposals);
-        let rejected = Arc::clone(&rejected);
-        let rows = blocking(move || {
-            revalue_window(
-                &job_resolved,
-                &sources,
-                &loaded,
-                window,
-                &active,
-                &disposals,
-                &rejected,
-            )
-        })
-        .await?;
-        context.projections.write_window(rows).await?;
+        };
+        let first_day = writer.from.max(window.start);
+        let frames: Vec<&Keyframe> = bundle
+            .keyframes
+            .get(&id)
+            .map(|frames| frames.iter().filter(|f| f.date >= first_day).collect())
+            .unwrap_or_default();
+        rows.push(WindowRows {
+            account_id: writer.account.clone(),
+            start: writer.clear_from,
+            end: row_end(resolved, window),
+            snapshots: Some(persist::snapshot_rows(
+                &frames,
+                &writer.account,
+                &account.currency,
+            )),
+            valuations: series
+                .get(&id)
+                .map(|s| persist::valuation_rows(s, &writer.account, base))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|row| row.valuation_date >= first_day)
+                .collect(),
+        });
     }
-    Ok(())
+    rows
 }
 
-fn revalue_window(
+fn revalue_rows(
     resolved: &Resolved,
     sources: &FactSources,
-    loaded: &LoadedFacts,
+    surfaces: &engine::ResolvedSurfaces,
     window: DateRange,
     active: &[Writer],
-    disposals: &[KernelDisposal],
-    rejected: &[Diagnostic],
+    stored: &StoredInputs,
 ) -> Result<Vec<WindowRows>> {
     let mut keyframes: BTreeMap<AccountId, Vec<Keyframe>> = BTreeMap::new();
     let mut seed: BTreeMap<AccountId, AccountState> = BTreeMap::new();
@@ -591,18 +658,16 @@ fn revalue_window(
             accounts: BTreeMap::new(),
             transfer_cache: BTreeMap::new(),
         },
-        disposals: disposals.to_vec(),
+        disposals: stored.disposals.clone(),
         closures: Vec::new(),
-        diagnostics: rejected.to_vec(),
+        diagnostics: stored.rejected.clone(),
     };
-    let quotes = facts::window_quotes(sources, &loaded.asset_ids, window.start, window.end)?;
-    let surfaces = resolved.window_surfaces(quotes);
     let series = engine::value_window(
         &engine::ValueInputs {
             resolved: engine::Resolved {
                 facts: &resolved.facts,
                 ledger: &resolved.ledger,
-                surfaces: &surfaces,
+                surfaces,
                 range: window,
             },
             bundle: &bundle,

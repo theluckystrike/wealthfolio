@@ -157,13 +157,17 @@ refold is not resumed from a stored state: folding from the first activity in
 memory, without valuing or writing the windows before the stale day, is cheap
 next to the writes it avoids, and needs no checkpoint table.
 
-**Windows.** A run walks its range in windows (calendar years). Each window is
-folded from the previous window's state, valued from that state with the
-window's quotes plus each asset's last quote before it, and written before the
-next window is read, so memory holds one window plus the running state however
-long the history. Activities, FX rates and observed snapshots load whole; the
-provider-adjusted splits are resolved once from the quotes around each split.
-Window invariance (P-WIN) makes a windowed run equal to one run over the range.
+**Windows.** A run walks its range in one pass of windows (calendar years), cut
+at each day an account starts rewriting. The fold carries its state from window
+to window in memory; before the first rewritten day it only folds. From then on
+each window loads once the quotes of the assets its accounts reference (plus
+each asset's last quote before the window), values the refolded accounts from
+the fold and the revalued ones from their stored keyframes against those quotes,
+and writes their rows together before the next window is read, so memory holds
+one window plus the running state however long the history. Activities, FX rates
+and observed snapshots load whole; the provider-adjusted splits are resolved
+once from the quotes around each split. Window invariance (P-WIN) makes a
+windowed run equal to one run over the range.
 
 **Completion.** After the last window a run commits, in one transaction, the lot
 books of the refolded accounts (open lots and lots closed since the stale day),
@@ -451,9 +455,9 @@ pub fn facts_needed(
 `MeasureProfile` exists because callers need different depths: the dashboard
 card needs the exact value change net of flows and no attribution, a summary
 needs returns without IRR or risk, and the performance page needs everything.
-The daily return series is a separate input: only history responses draw it,
-so summaries at any profile skip it, as the legacy summaries did. Both are
-inputs, not post-hoc trims, so the work is never done and thrown away.
+The daily return series is a separate input: only history responses draw it, so
+summaries at any profile skip it, as the legacy summaries did. Both are inputs,
+not post-hoc trims, so the work is never done and thrown away.
 
 **Pre- and post-conditions.**
 

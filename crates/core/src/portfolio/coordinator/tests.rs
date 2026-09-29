@@ -1128,3 +1128,87 @@ async fn manual_snapshots_survive_a_rebuild() {
         .iter()
         .any(|s| s.source == SnapshotSource::Calculated));
 }
+
+#[tokio::test]
+async fn one_run_refolds_and_revalues_different_accounts_like_a_fresh_rebuild() {
+    // acc-b's deposit changes (acc-b and its transfer partner acc-a refold)
+    // while a new close revalues the holdings account acc-h from 01-10: one
+    // job writes both kinds, in windows cut at each account's first day.
+    let scenario = scenario("NOM-MIX-01");
+    let before = scenario.facts();
+    let mut after = before.clone();
+    let deposit = after
+        .activities
+        .iter_mut()
+        .find(|a| a.id == "dep-2")
+        .expect("dep-2");
+    deposit.amount = deposit
+        .amount
+        .map(|amount| amount + rust_decimal_macros::dec!(100));
+    let edited: Vec<Activity> = vec![deposit.clone()];
+    let template = before
+        .quotes
+        .iter()
+        .find(|q| q.asset_id == "aapl" && q.timestamp.date_naive().to_string() == "2025-01-09")
+        .expect("aapl close on 01-09")
+        .clone();
+    let late = Quote {
+        id: "aapl-2025-01-10".to_string(),
+        timestamp: template.timestamp + chrono::Duration::days(1),
+        close: rust_decimal_macros::dec!(109),
+        ..template
+    };
+    let revalued_from = late.timestamp.date_naive();
+    after.quotes.push(late.clone());
+
+    for cadence in [
+        WindowCadence::Days(2),
+        WindowCadence::Days(3),
+        WindowCadence::Year,
+    ] {
+        let live = harness_with(before.clone(), cadence).await;
+        live.coordinator
+            .run_job(request(), &SilentObserver)
+            .await
+            .unwrap();
+        live.change_activities(Vec::new(), edited.clone(), &[], &before.activities);
+        live.add_quotes(vec![late.clone()]);
+        let report = live
+            .coordinator
+            .run_job(request(), &SilentObserver)
+            .await
+            .unwrap();
+        assert!(
+            report.failures.is_empty(),
+            "{cadence:?}: {:?}",
+            report.failures
+        );
+        for account in ["acc-a", "acc-b"] {
+            assert!(
+                matches!(plan_of(&report, account), Some(RebuildPlan::Refold { .. })),
+                "{cadence:?}: {account} refolds"
+            );
+        }
+        assert_eq!(
+            plan_of(&report, "acc-h"),
+            Some(RebuildPlan::Revalue {
+                from: revalued_from
+            }),
+            "{cadence:?}"
+        );
+
+        let fresh = harness_with(after.clone(), cadence).await;
+        fresh
+            .coordinator
+            .run_job(request(), &SilentObserver)
+            .await
+            .unwrap();
+        for account in ["acc-a", "acc-b", "acc-h"] {
+            assert_eq!(
+                normalized_valuations(live.rows(account)),
+                normalized_valuations(fresh.rows(account)),
+                "{cadence:?}: valuations of {account}"
+            );
+        }
+    }
+}
