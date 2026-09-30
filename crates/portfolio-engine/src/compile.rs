@@ -134,7 +134,7 @@ fn compile_leg(leg: &Leg, account: &AccountFacts, facts: &CanonicalFacts) -> Eco
     };
     let action = action_for(activity, &mut diagnostics);
     let contribution = contribution_for(activity, facts);
-    let flow = flow_for(activity, facts, cash.as_ref(), &mut diagnostics);
+    let flow = flow_for(activity, facts, multiplier, cash.as_ref(), &mut diagnostics);
     let attribution = attribution_for(activity, account);
 
     EconomicEvent {
@@ -427,6 +427,7 @@ fn contribution_for(activity: &Activity, facts: &CanonicalFacts) -> Contribution
 fn flow_for(
     activity: &Activity,
     facts: &CanonicalFacts,
+    multiplier: Decimal,
     cash: Option<&CashEffect>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Flow {
@@ -464,13 +465,16 @@ fn flow_for(
                 }
             };
             let value = if activity.is_security_transfer {
-                let book_basis = arith::mul(activity.quantity, activity.unit_price)
-                    .filter(|basis| !basis.is_zero())
-                    .or_else(|| {
-                        (activity.kind == TransferIn && !activity.quantity.is_zero())
-                            .then(|| activity.amount.unwrap_or_default().abs())
-                            .filter(|basis| !basis.is_zero())
-                    });
+                // The basis the projection books for the lot (contract
+                // multiplier included), so a flow at cost matches it.
+                let book_basis =
+                    arith::product(&[activity.quantity, activity.unit_price, multiplier])
+                        .filter(|basis| !basis.is_zero())
+                        .or_else(|| {
+                            (activity.kind == TransferIn && !activity.quantity.is_zero())
+                                .then(|| activity.amount.unwrap_or_default().abs())
+                                .filter(|basis| !basis.is_zero())
+                        });
                 FlowValue::SecurityAtMarket {
                     quantity: activity.quantity,
                     book_basis,
