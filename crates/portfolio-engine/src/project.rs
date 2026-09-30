@@ -318,6 +318,25 @@ struct RunLog {
     diagnostics: Vec<Diagnostic>,
 }
 
+impl RunLog {
+    /// A conversion the fold went without: "no FROM->TO rate on DAY", then
+    /// what the missing rate cost.
+    fn no_rate(
+        &mut self,
+        source: impl Into<String>,
+        from: &str,
+        to: &str,
+        on: impl std::fmt::Display,
+        then: &str,
+    ) {
+        self.diagnostics.push(Diagnostic::warning(
+            DiagnosticCode::FxUnavailable,
+            source,
+            format!("no {from}->{to} rate on {on}{then}"),
+        ));
+    }
+}
+
 struct Projector<'a> {
     facts: &'a CanonicalFacts,
     fx: &'a FxResolver<'a>,
@@ -726,14 +745,13 @@ impl Projector<'_> {
             match self.fx.convert(amount, from, account_currency, event.date) {
                 Some(converted) => converted,
                 None => {
-                    run.diagnostics.push(Diagnostic::warning(
-                        DiagnosticCode::FxUnavailable,
+                    run.no_rate(
                         event.source.as_str(),
-                        format!(
-                            "no {from}->{account_currency} rate on {}; net contribution not updated",
-                            event.date
-                        ),
-                    ));
+                        from,
+                        account_currency,
+                        event.date,
+                        "; net contribution not updated",
+                    );
                     Decimal::ZERO
                 }
             },
@@ -748,16 +766,13 @@ impl Projector<'_> {
         {
             Some(converted) => converted,
             None => {
-                run.diagnostics.push(Diagnostic::warning(
-                    DiagnosticCode::FxUnavailable,
+                run.no_rate(
                     event.source.as_str(),
-                    format!(
-                        "no {}->{} rate on {}; base contribution not updated",
-                        event.currency,
-                        self.base(),
-                        event.date
-                    ),
-                ));
+                    event.currency.as_str(),
+                    self.base(),
+                    event.date,
+                    "; base contribution not updated",
+                );
                 Decimal::ZERO
             }
         }
@@ -1715,11 +1730,13 @@ impl Projector<'_> {
         {
             Some(converted) => converted,
             None => {
-                run.diagnostics.push(Diagnostic::warning(
-                    DiagnosticCode::FxUnavailable,
+                run.no_rate(
                     event.source.as_str(),
-                    format!("no {position_currency}->{account_currency} rate on {}; net contribution not updated", event.date),
-                ));
+                    position_currency,
+                    account_currency,
+                    event.date,
+                    "; net contribution not updated",
+                );
                 Decimal::ZERO
             }
         }
@@ -1792,11 +1809,13 @@ impl Projector<'_> {
     ) -> Option<Decimal> {
         let rate = self.fx.rate(from, to, event.date);
         if rate.is_none() {
-            run.diagnostics.push(Diagnostic::warning(
-                DiagnosticCode::FxUnavailable,
+            run.no_rate(
                 event.source.as_str(),
-                format!("no {from}->{to} rate on {} for lot basis", event.date),
-            ));
+                from,
+                to,
+                event.date,
+                " for lot basis",
+            );
         }
         rate
     }
@@ -1831,14 +1850,13 @@ impl Projector<'_> {
             return converted;
         }
         if fallback_date == lot.acquisition_date {
-            run.diagnostics.push(Diagnostic::warning(
-                DiagnosticCode::FxUnavailable,
+            run.no_rate(
                 event.source.as_str(),
-                format!(
-                    "no {position_currency}->{target} rate on {}; lot basis excluded",
-                    lot.acquisition_date
-                ),
-            ));
+                position_currency,
+                target,
+                lot.acquisition_date,
+                "; lot basis excluded",
+            );
             return Decimal::ZERO;
         }
         match self
@@ -1847,7 +1865,13 @@ impl Projector<'_> {
         {
             Some(converted) => converted,
             None => {
-                run.diagnostics.push(Diagnostic::warning(DiagnosticCode::FxUnavailable, event.source.as_str(), format!("no {position_currency}->{target} rate on {} or {fallback_date}; lot basis excluded", lot.acquisition_date)));
+                run.no_rate(
+                    event.source.as_str(),
+                    position_currency,
+                    target,
+                    format!("{} or {fallback_date}", lot.acquisition_date),
+                    "; lot basis excluded",
+                );
                 Decimal::ZERO
             }
         }
@@ -1905,15 +1929,13 @@ impl Projector<'_> {
                 } else {
                     match self.fx.convert(*amount, code, target, day) {
                         Some(converted) => *total += converted,
-                        None => {
-                            run.diagnostics.push(Diagnostic::warning(
-                                DiagnosticCode::FxUnavailable,
-                                format!("{}@{day}", state.account),
-                                format!(
-                                    "no {code}->{target} rate on {day}; cash {amount} {code} excluded from the {target} total"
-                                ),
-                            ));
-                        }
+                        None => run.no_rate(
+                            format!("{}@{day}", state.account),
+                            code,
+                            target,
+                            day,
+                            &format!("; cash {amount} {code} excluded from the {target} total"),
+                        ),
                     }
                 }
             }
