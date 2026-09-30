@@ -1030,10 +1030,9 @@ impl<'a> Valuer<'a> {
         let policy = &self.resolved.facts.policy;
         let from = policy.major_currency(currency).to_string();
         let base = self.base().to_string();
-        if from == base {
-            return Some(amount);
-        }
-        match self.fx.convert(amount, &from, &base, event.date) {
+        // From the currency as recorded: pence convert through their
+        // factor, as cash and net contribution do.
+        match self.fx.convert(amount, currency, &base, event.date) {
             Some(converted) => Some(converted),
             None => {
                 self.report(
