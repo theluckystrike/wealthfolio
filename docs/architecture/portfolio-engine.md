@@ -332,8 +332,11 @@ pub struct EconomicEvent {
 **Flow provenance.** A flow carries its scope (a matched internal transfer is
 external to an account and zero to the portfolio) and how its amount was
 obtained: cash amount, quote-derived market value, cost-basis fallback,
-removed-lot basis, legacy amount, unknown boundary. Provenance gates return
-eligibility and never upgrades under aggregation.
+removed-lot basis, legacy amount, unknown boundary, and, when a day's net
+contribution moved without a priced flow, the net-contribution change. `value`
+stamps every day's flow with its provenance and `measure` computes from those
+flows as stamped: it infers no flow from stored rows and relabels none.
+Provenance gates return eligibility and never upgrades under aggregation.
 
 **Transfer pairing** is resolved in `normalize` from the transfer group id only,
 deterministically. A group with a leg count other than two, mismatched assets,

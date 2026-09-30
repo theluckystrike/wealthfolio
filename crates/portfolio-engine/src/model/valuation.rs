@@ -79,7 +79,8 @@ pub enum FlowSource {
     LegacyActivityAmountFallback,
     UnknownBoundaryTransfer,
     UnpricedHoldingsTransition,
-    /// Stored amounts whose provenance was not explicit (measure relabel).
+    /// Stored amounts whose provenance was not recorded (rows written before
+    /// the value stage stamped every flow); the kernel never produces it.
     StoredGross,
     NetContributionFallback,
     /// Two or more distinct sources on one day, at least one degraded.
@@ -110,6 +111,12 @@ impl FlowSource {
             self,
             Self::NoFlow | Self::CashAmount | Self::QuoteDerivedMarketValue | Self::MixedExact
         )
+    }
+
+    /// Whether the day's amounts are known, exact or estimated: every source
+    /// but the markers of a flow that could not be determined.
+    pub fn has_known_amount(self) -> bool {
+        !self.is_unavailable_for_returns()
     }
 
     pub fn is_unavailable_for_returns(self) -> bool {

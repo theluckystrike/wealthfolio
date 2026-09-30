@@ -441,7 +441,7 @@ fn performance_core(
             let prev_value = pair[0].total_value_base;
             let curr_value = pair[1].total_value_base;
             let flow = flows[index];
-            let (inflow, outflow) = if flow.source.is_explicit_gross() {
+            let (inflow, outflow) = if flow.source.has_known_amount() {
                 (flow.inflow, flow.outflow)
             } else {
                 (Decimal::ZERO, Decimal::ZERO)
@@ -601,7 +601,7 @@ fn performance_core(
         ..Attribution::default()
     };
 
-    let mut warnings = flow_quality_warnings(history, &flows);
+    let mut warnings = flow_quality_warnings(&flows);
     if holdings && start_opt.is_some() && has_estimated_holdings_flows(&flows) {
         warnings.push(QualityNote::HoldingsFlowsEstimated);
     }
@@ -669,75 +669,26 @@ fn performance_core(
     result
 }
 
-/// Legacy `daily_external_flows`: the stored row's flow, relabelled
-/// `StoredGross` when amounts exist without explicit provenance, else the
-/// net-contribution delta.
+/// Each day's external flow as the value stage stamped it, with its
+/// provenance: measure infers nothing from stored rows.
 fn period_flows(history: &[DailyValuation]) -> Vec<PeriodFlow> {
     history
-        .windows(2)
-        .map(|pair| {
-            let (prev, curr) = (&pair[0], &pair[1]);
-            let date = curr.date;
-            let flow = curr.flow;
-            if flow.source == FlowSource::NoFlow
-                && flow.inflow_base.is_zero()
-                && flow.outflow_base.is_zero()
-            {
-                return PeriodFlow {
-                    date,
-                    inflow: Decimal::ZERO,
-                    outflow: Decimal::ZERO,
-                    source: FlowSource::NoFlow,
-                };
-            }
-            if flow.source.is_unavailable_for_returns() || flow.source.is_explicit_gross() {
-                return PeriodFlow {
-                    date,
-                    inflow: flow.inflow_base,
-                    outflow: flow.outflow_base,
-                    source: flow.source,
-                };
-            }
-            if !flow.inflow_base.is_zero() || !flow.outflow_base.is_zero() {
-                return PeriodFlow {
-                    date,
-                    inflow: flow.inflow_base,
-                    outflow: flow.outflow_base,
-                    source: FlowSource::StoredGross,
-                };
-            }
-            let delta = curr.net_contribution_base - prev.net_contribution_base;
-            let (inflow, outflow) = split(delta);
-            PeriodFlow {
-                date,
-                inflow,
-                outflow,
-                source: FlowSource::NetContributionFallback,
-            }
+        .iter()
+        .skip(1)
+        .map(|day| PeriodFlow {
+            date: day.date,
+            inflow: day.flow.inflow_base,
+            outflow: day.flow.outflow_base,
+            source: day.flow.source,
         })
         .collect()
 }
 
-fn split(delta: Decimal) -> (Decimal, Decimal) {
-    if delta.is_sign_negative() {
-        (Decimal::ZERO, -delta)
-    } else {
-        (delta, Decimal::ZERO)
-    }
-}
-
-fn flow_quality_warnings(history: &[DailyValuation], flows: &[PeriodFlow]) -> Vec<QualityNote> {
+fn flow_quality_warnings(flows: &[PeriodFlow]) -> Vec<QualityNote> {
     let mut warnings = Vec::new();
-    // A stored flow the valuation inferred from the net-contribution delta
-    // keeps its amount (`StoredGross` above) but was still inferred.
-    let stored_inferred = history
+    if flows
         .iter()
-        .skip(1)
-        .any(|day| day.flow.source == FlowSource::NetContributionFallback);
-    if stored_inferred
-        || flows
-            .iter()
-            .any(|f| f.source == FlowSource::NetContributionFallback)
+        .any(|f| f.source == FlowSource::NetContributionFallback)
     {
         warnings.push(QualityNote::NetContributionFlows);
     }
@@ -1345,7 +1296,7 @@ fn holdings_return(
     let start_value = start.total_value_base;
     let net_explicit: Decimal = flows
         .iter()
-        .filter(|f| f.source.is_explicit_gross())
+        .filter(|f| f.source.has_known_amount())
         .map(|f| f.net())
         .sum();
     let change = end.total_value_base - start_value - net_explicit;
@@ -1358,7 +1309,7 @@ fn holdings_return(
 fn has_estimated_holdings_flows(flows: &[PeriodFlow]) -> bool {
     flows
         .iter()
-        .any(|f| f.source.is_explicit_gross() && (!f.inflow.is_zero() || !f.outflow.is_zero()))
+        .any(|f| f.source.has_known_amount() && (!f.inflow.is_zero() || !f.outflow.is_zero()))
 }
 
 // -------------------------------------------------------- result shaping
@@ -2553,7 +2504,7 @@ fn mixed_component_series(component: &MixedComponent) -> Vec<MixedSeriesPoint> {
         .skip(1)
         .zip(flows.iter())
         .map(|(point, flow)| {
-            if !holdings || flow.source.is_explicit_gross() {
+            if !holdings || flow.source.has_known_amount() {
                 net_flow += flow.net();
             }
             MixedSeriesPoint {
@@ -2891,47 +2842,61 @@ mod tests {
         assert!(ordinary > dec!(0.7) && ordinary < dec!(0.8), "{ordinary}");
     }
 
-    #[test]
-    fn a_stored_inferred_flow_keeps_its_amount_and_reports_the_inference() {
-        let measure = |source: FlowSource| {
-            let mut history = vec![
-                row("2026-05-01", dec!(100)),
-                row("2026-05-02", dec!(97.5)),
-                row("2026-05-03", dec!(99)),
-            ];
-            // The valuation inferred a 2.50 outflow from the net-contribution delta.
-            history[1].net_contribution_base = dec!(97.5);
-            history[2].net_contribution_base = dec!(97.5);
-            history[1].flow = DailyFlow {
-                inflow_base: Decimal::ZERO,
-                outflow_base: dec!(2.5),
-                source,
-            };
-            let currency = Currency::parse("CAD").unwrap();
-            performance_core(
-                &history,
-                false,
-                None,
-                false,
-                MeasureProfile::Full,
-                false,
-                true,
-                &currency,
-            )
+    /// Three days where the second has a 2.50 outflow stamped with `source`
+    /// and the net contribution drops by 2.50.
+    fn with_stamped_outflow(source: FlowSource) -> PerformanceResult {
+        let mut history = vec![
+            row("2026-05-01", dec!(100)),
+            row("2026-05-02", dec!(97.5)),
+            row("2026-05-03", dec!(99)),
+        ];
+        history[1].net_contribution_base = dec!(97.5);
+        history[2].net_contribution_base = dec!(97.5);
+        history[1].flow = DailyFlow {
+            inflow_base: Decimal::ZERO,
+            outflow_base: if source == FlowSource::NoFlow {
+                Decimal::ZERO
+            } else {
+                dec!(2.5)
+            },
+            source,
         };
-        let inferred = measure(FlowSource::NetContributionFallback);
-        let gross = measure(FlowSource::StoredGross);
-        assert_eq!(inferred.returns, gross.returns);
+        let currency = Currency::parse("CAD").unwrap();
+        performance_core(
+            &history,
+            false,
+            None,
+            false,
+            MeasureProfile::Full,
+            false,
+            true,
+            &currency,
+        )
+    }
+
+    #[test]
+    fn a_stamped_inferred_flow_counts_as_stamped_and_reports_the_inference() {
+        let inferred = with_stamped_outflow(FlowSource::NetContributionFallback);
+        let exact = with_stamped_outflow(FlowSource::CashAmount);
+        assert_eq!(inferred.returns, exact.returns);
         assert!(inferred.returns.twr.is_some());
-        assert!(inferred
-            .data_quality
-            .warnings
-            .contains(&QualityNote::NetContributionFlows));
-        assert!(inferred
-            .data_quality
-            .warnings
-            .contains(&QualityNote::DegradedFlowProvenance));
-        assert!(!gross
+        for note in [
+            QualityNote::NetContributionFlows,
+            QualityNote::DegradedFlowProvenance,
+        ] {
+            assert!(inferred.data_quality.warnings.contains(&note), "{note:?}");
+            assert!(!exact.data_quality.warnings.contains(&note), "{note:?}");
+        }
+    }
+
+    #[test]
+    fn measure_infers_no_flow_the_value_stage_did_not_stamp() {
+        // The net contribution drops by 2.50 but no flow was stamped: the
+        // drop is a loss, not an outflow measure reconstructs.
+        let unstamped = with_stamped_outflow(FlowSource::NoFlow);
+        let stamped = with_stamped_outflow(FlowSource::CashAmount);
+        assert_ne!(unstamped.returns.twr, stamped.returns.twr);
+        assert!(!unstamped
             .data_quality
             .warnings
             .contains(&QualityNote::NetContributionFlows));
