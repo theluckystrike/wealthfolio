@@ -317,7 +317,20 @@ impl ProjectionStoreTrait for ProjectionStore {
                         )
                         .execute(conn)
                         .map_err(StorageError::from)?;
+                        // A lot the book re-emits unchanged is left as stored.
+                        let stored: HashMap<String, LotRecordDB> = l::lots
+                            .filter(l::account_id.eq(&account))
+                            .filter(l::is_closed.eq(0).or(l::close_date.ge(since.clone())))
+                            .select(LotRecordDB::as_select())
+                            .load::<LotRecordDB>(conn)
+                            .map_err(StorageError::from)?
+                            .into_iter()
+                            .map(|lot| (lot.id().to_string(), lot))
+                            .collect();
                         for lot in &normalized {
+                            if stored.get(lot.id()).is_some_and(|row| row.same_lot(lot)) {
+                                continue;
+                            }
                             diesel::insert_into(l::lots)
                                 .values(lot)
                                 .on_conflict(l::id)
@@ -875,6 +888,42 @@ mod tests {
         let mut expected = vec![(id(2), "10".to_string()), (id(3), "7".to_string())];
         expected.sort();
         assert_eq!(positions(), expected);
+    }
+
+    #[tokio::test]
+    async fn a_lot_book_rewrites_only_the_lots_that_changed() {
+        let db = setup();
+        let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());
+        let lots = LotsRepository::new(db.pool.clone(), db.writer.clone());
+        let commit = |book: Vec<LotRecord>| RunCompletion {
+            lot_books: vec![LotBook {
+                account_id: "acc1".to_string(),
+                since: GENESIS,
+                lots: book,
+                disposals: Vec::new(),
+            }],
+            ..RunCompletion::default()
+        };
+        store
+            .complete_run(commit(vec![lot("lot-a"), lot("lot-b")]))
+            .await
+            .unwrap();
+
+        // The next run re-emits lot-a unchanged and lot-b partly sold, both
+        // stamped with the run's time.
+        let later = "2026-01-01T00:00:00.000Z".to_string();
+        let mut same = lot("lot-a");
+        same.updated_at.clone_from(&later);
+        let mut sold = lot("lot-b");
+        sold.remaining_quantity = "4".to_string();
+        sold.updated_at.clone_from(&later);
+        store.complete_run(commit(vec![same, sold])).await.unwrap();
+
+        let stored = lots.get_all_lots_for_account("acc1").await.unwrap();
+        let find = |id: &str| stored.iter().find(|l| l.id == id).expect("lot").clone();
+        assert_eq!(find("lot-a").updated_at, "2025-01-02T00:00:00.000Z");
+        assert_eq!(find("lot-b").remaining_quantity, "4");
+        assert_eq!(find("lot-b").updated_at, later);
     }
 
     #[tokio::test]

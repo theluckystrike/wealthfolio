@@ -26,7 +26,7 @@ use wealthfolio_core::portfolio::snapshot::Position;
 
 // ── Diesel model ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Queryable, Selectable, Insertable, AsChangeset)]
+#[derive(Debug, Clone, PartialEq, Queryable, Selectable, Insertable, AsChangeset)]
 #[diesel(table_name = crate::schema::lots)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 #[diesel(treat_none_as_null = true)]
@@ -64,6 +64,14 @@ pub(crate) struct LotRecordDB {
 impl LotRecordDB {
     pub(crate) fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Every column but the timestamps matches.
+    pub(crate) fn same_lot(&self, other: &Self) -> bool {
+        let mut stamped = self.clone();
+        stamped.created_at.clone_from(&other.created_at);
+        stamped.updated_at.clone_from(&other.updated_at);
+        stamped == *other
     }
 }
 
