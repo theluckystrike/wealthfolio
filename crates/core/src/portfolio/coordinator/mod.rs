@@ -461,13 +461,24 @@ impl PortfolioCoordinator {
                         );
                     }
                 }
-                let consumed = if failures.is_empty() {
-                    markers
-                } else {
-                    // A failed account's markers must survive for the next
-                    // run; the simplest safe rule keeps them all.
-                    Vec::new()
-                };
+                // An excluded account was not projected: its own markers stay,
+                // and it is marked from the beginning, so whatever this run
+                // consumes (shared price, FX, asset or policy markers, a
+                // transfer partner's) reaches it once it projects again,
+                // however its failure gets fixed. Every other marker is
+                // consumed, so one failing account costs the others nothing.
+                for account in &excluded {
+                    self.deps
+                        .projections
+                        .invalidate(MarkerScope::Account(account.clone()), GENESIS)
+                        .await?;
+                }
+                let consumed = markers
+                    .into_iter()
+                    .filter(|marker| {
+                        !matches!(&marker.scope, MarkerScope::Account(id) if excluded.contains(id))
+                    })
+                    .collect();
                 self.deps
                     .projections
                     .complete_run(crate::portfolio::projection::RunCompletion {

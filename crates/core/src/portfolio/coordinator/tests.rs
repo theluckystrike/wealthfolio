@@ -1077,6 +1077,105 @@ async fn an_out_of_policy_observed_snapshot_fails_only_its_account() {
     );
 }
 
+/// An account that cannot be projected keeps only its own markers: the
+/// others are consumed, so later runs do not rebuild the healthy accounts
+/// again, and a price change made meanwhile still reaches the failing
+/// account once it is fixed, even when the fix marks it only from a later
+/// day.
+#[tokio::test]
+async fn a_failing_account_holds_back_only_its_own_markers() {
+    let scenario = scenario("NOM-MIX-01");
+    let facts = scenario.facts();
+    let holdings = "acc-h".to_string();
+    let live = harness(facts.clone()).await;
+    live.coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+
+    // A snapshot dated a month ahead (a typo) makes the account fail; the
+    // store's triggers mark it from that day.
+    let bad_date = facts.as_of + chrono::Duration::days(30);
+    live.snapshot_repo
+        .save_snapshots(&[manual_snapshot(&holdings, bad_date)])
+        .await
+        .unwrap();
+    live.store
+        .mark(MarkerScope::Account(holdings.clone()), bad_date);
+    let pending_scopes = |live: &Harness| -> Vec<MarkerScope> {
+        live.projections
+            .pending_markers()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.scope)
+            .collect()
+    };
+    let report = live
+        .coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert_eq!(report.failures[0].code, "INVALID_SNAPSHOT_DATE");
+    assert_eq!(
+        pending_scopes(&live),
+        vec![MarkerScope::Account(holdings.clone())]
+    );
+
+    // Nothing changed: the healthy accounts are not rebuilt again.
+    let report = live
+        .coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    assert!(report.plans.is_empty(), "{:?}", report.plans);
+
+    // A price changes while the account is out: its holders are revalued
+    // and the price marker is consumed.
+    let template = facts
+        .quotes
+        .iter()
+        .find(|q| q.timestamp.date_naive().to_string() == "2025-01-09")
+        .expect("01-09 close")
+        .clone();
+    let changed = Quote {
+        id: "late-quote".to_string(),
+        timestamp: template.timestamp + chrono::Duration::days(1),
+        close: template.close * rust_decimal_macros::dec!(1.5),
+        ..template
+    };
+    live.add_quotes(vec![changed.clone()]);
+    let report = live
+        .coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    assert!(!report.plans.is_empty());
+    assert_eq!(
+        pending_scopes(&live),
+        vec![MarkerScope::Account(holdings.clone())]
+    );
+
+    // The typo is removed; the delete trigger marks the account only from
+    // the bad day. It still catches up with the price change.
+    live.snapshot_repo
+        .delete_snapshots_for_account_and_dates(&holdings, &[bad_date])
+        .await
+        .unwrap();
+    live.store
+        .mark(MarkerScope::Account(holdings.clone()), bad_date);
+    let report = live
+        .coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert!(pending_scopes(&live).is_empty());
+    let mut after = facts.clone();
+    after.quotes.push(changed);
+    assert_matches_a_fresh_rebuild(&live, &after, "failing account fixed").await;
+}
+
 #[tokio::test]
 async fn a_changed_transfer_leg_refolds_its_partner() {
     let scenario = scenario("NOM-TXF-01");
