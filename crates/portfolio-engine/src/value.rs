@@ -148,9 +148,20 @@ fn value_series(
             &account.currency,
         );
         let end = resolved.range.end;
+        // A window is valued from the day before it (holdings flows compare
+        // consecutive days), not from its first keyframe: for a holdings
+        // account that is the last snapshot before the window, however old.
+        let from = match seed {
+            Some(_) => resolved
+                .range
+                .start
+                .pred_opt()
+                .map_or(first, |day| day.max(first)),
+            None => first,
+        };
         let mut days = Vec::new();
         let mut active = 0usize;
-        for day in first.iter_days().take_while(|day| *day <= end) {
+        for day in from.iter_days().take_while(|day| *day <= end) {
             while active + 1 < keyframes.len() && keyframes[active + 1].date <= day {
                 active += 1;
             }
