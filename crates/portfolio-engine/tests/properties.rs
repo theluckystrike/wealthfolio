@@ -1062,3 +1062,541 @@ fn p_total_no_panics_on_mutated_inputs() {
         }
     }
 }
+
+/// Arrays sorted by content, so a comparison ignores the order rows come out
+/// in (the order accounts are folded in, for one).
+fn canonical(value: Value) -> Value {
+    match value {
+        Value::Array(items) => {
+            let mut items: Vec<Value> = items.into_iter().map(canonical).collect();
+            items.sort_by_cached_key(|item| item.to_string());
+            Value::Array(items)
+        }
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, canonical(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// P-NAMES: account ids name accounts, they do not order them. Renaming every
+/// account so their sort order reverses changes no output once the names are
+/// mapped back.
+#[test]
+fn p_names_account_ids_carry_no_order() {
+    let mut checked = 0usize;
+    for scenario in corpus() {
+        if scenario.accounts.len() < 2 {
+            continue;
+        }
+        let mut ids: Vec<String> = scenario.accounts.iter().map(|a| a.id.clone()).collect();
+        ids.sort();
+        let renamed_as: BTreeMap<String, String> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), format!("~{:03}~{id}", ids.len() - i)))
+            .collect();
+        let mut renamed = scenario.clone();
+        for account in &mut renamed.accounts {
+            account.id = renamed_as[&account.id].clone();
+        }
+        for activity in &mut renamed.activities {
+            activity.account = renamed_as[&activity.account].clone();
+        }
+        for snapshot in &mut renamed.observed_snapshots {
+            snapshot.account = renamed_as[&snapshot.account].clone();
+        }
+        for window in &mut renamed.performance_windows {
+            for id in window.accounts.iter_mut().flatten() {
+                *id = renamed_as[id.as_str()].clone();
+            }
+        }
+        let mut text =
+            serde_json::to_string(&body(&Pipeline::from_scenario(&renamed), &renamed)).unwrap();
+        for (id, new) in &renamed_as {
+            text = text.replace(new.as_str(), id);
+        }
+        let restored = canonical(serde_json::from_str(&text).unwrap());
+        let reference = canonical(body(&Pipeline::from_scenario(&scenario), &scenario));
+        assert_same(&scenario.id, "P-NAMES", &restored, &reference);
+        checked += 1;
+    }
+    assert!(
+        checked > 20,
+        "only {checked} multi-account scenarios renamed"
+    );
+}
+
+/// What must not depend on the unit amounts were entered in: values, flows
+/// and returns (lots and cash buckets keep the unit they were booked in).
+fn money_view(body: Value) -> Value {
+    let mut view = serde_json::Map::new();
+    for (id, account) in body["accounts"].as_object().into_iter().flatten() {
+        view.insert(
+            id.clone(),
+            serde_json::json!({
+                "valuations": account["valuations"],
+                "flows": account["flows"],
+                "performance": account["performance"],
+            }),
+        );
+    }
+    serde_json::json!({
+        "accounts": view,
+        "portfolio": body["portfolio"],
+        "portfolio_flows": body["portfolio_flows"],
+    })
+}
+
+/// P-UNITS: an amount in a minor unit is the same money as in its major
+/// unit. Rewriting every plain USD activity in cents (USX, amounts ×100)
+/// changes no value, flow or return.
+#[test]
+fn p_units_minor_units_are_the_same_money() {
+    const MONEY: [&str; 11] = [
+        "DEPOSIT",
+        "WITHDRAWAL",
+        "BUY",
+        "SELL",
+        "DIVIDEND",
+        "INTEREST",
+        "FEE",
+        "TAX",
+        "TRANSFER_IN",
+        "TRANSFER_OUT",
+        "CREDIT",
+    ];
+    let hundred = Decimal::from(100);
+    let mut checked = 0usize;
+    for scenario in corpus() {
+        let account_currency: BTreeMap<String, String> = scenario
+            .accounts
+            .iter()
+            .map(|a| (a.id.clone(), a.currency.clone()))
+            .collect();
+        let mut cents = scenario.clone();
+        let mut rewritten = 0usize;
+        for activity in &mut cents.activities {
+            let currency = activity
+                .currency
+                .clone()
+                .unwrap_or_else(|| account_currency[&activity.account].clone());
+            // A supplied rate or a currency in the metadata is quoted
+            // against the unit as entered: leave those rows alone.
+            let plain = activity.fx_rate.is_none()
+                && activity.activity_type_override.is_none()
+                && activity
+                    .metadata
+                    .as_ref()
+                    .is_none_or(|m| !m.to_string().to_lowercase().contains("currency"));
+            // In cents the row must still be valid input (EDGE-MAG-02 sits
+            // at the largest accepted magnitude).
+            let fits = [
+                activity.amount,
+                activity.unit_price,
+                activity.fee,
+                activity.tax,
+            ]
+            .iter()
+            .flatten()
+            .all(|value| (value.0 * hundred).abs() <= MAX_MAGNITUDE);
+            if currency != "USD"
+                || !plain
+                || !fits
+                || !MONEY.contains(&activity.activity_type.as_str())
+            {
+                continue;
+            }
+            activity.currency = Some("USX".to_string());
+            for value in [
+                &mut activity.amount,
+                &mut activity.unit_price,
+                &mut activity.fee,
+                &mut activity.tax,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                value.0 *= hundred;
+            }
+            rewritten += 1;
+        }
+        if rewritten == 0 {
+            continue;
+        }
+        let reference = money_view(body(&Pipeline::from_scenario(&scenario), &scenario));
+        let in_cents = money_view(body(&Pipeline::from_scenario(&cents), &cents));
+        assert_same(&scenario.id, "P-UNITS", &in_cents, &reference);
+        checked += 1;
+    }
+    assert!(checked > 20, "only {checked} scenarios rewritten in cents");
+}
+
+/// An account state valued on `day` from the public surfaces, by P-RECON's
+/// rule; `None` when a price or rate is missing, or a position is alternative
+/// or split-adjusted (the valuer's own rules).
+fn revalue(
+    pipeline: &Pipeline,
+    state: &AccountState,
+    day: NaiveDate,
+    split_assets: &BTreeSet<&AssetId>,
+) -> Option<Decimal> {
+    let policy = pipeline.facts().policy();
+    let fx = pipeline.fx();
+    let currency = state.currency.as_str();
+    let mut total = Decimal::ZERO;
+    for (asset, position) in &state.positions {
+        if position.quantity.is_zero() {
+            continue;
+        }
+        if position.alternative || split_assets.contains(asset) {
+            return None;
+        }
+        let quote = pipeline.surfaces().quotes.latest_on_or_before(asset, day)?;
+        let (major, unit) = policy.normalize_currency(quote.currency.as_str());
+        let multiplier = pipeline
+            .facts()
+            .assets()
+            .get(asset)
+            .map(|a| a.contract_multiplier)
+            .unwrap_or(Decimal::ONE);
+        total +=
+            position.quantity * quote.close * unit * multiplier * fx.rate(major, currency, day)?;
+    }
+    for (bucket, amount) in &state.cash {
+        let (major, unit) = policy.normalize_currency(bucket.as_str());
+        total += *amount * unit * fx.rate(major, currency, day)?;
+    }
+    Some(total)
+}
+
+/// P-FLOW: money moved in or out is what the account's value moved by. On a
+/// day whose only events for an account are deposits, withdrawals and
+/// transfers without charges, the account's value less its previous state's
+/// value at the same prices equals the day's net flow. The account currency
+/// shares the base's major unit, so no cross rate stands between them.
+/// Catches a flow in the wrong unit, scale or direction, whichever stage got
+/// it wrong.
+#[test]
+fn p_flow_flows_account_for_the_value_they_move() {
+    let mut checked = 0usize;
+    for scenario in corpus() {
+        let pipeline = Pipeline::from_scenario(&scenario);
+        let policy = pipeline.facts().policy();
+        let base = policy
+            .major_currency(policy.base_currency.as_str())
+            .to_string();
+        let split_assets: BTreeSet<&AssetId> = pipeline
+            .surfaces()
+            .splits
+            .iter()
+            .map(|s| &s.asset)
+            .collect();
+        let mut days: BTreeMap<(&AccountId, NaiveDate), Vec<&EconomicEvent>> = BTreeMap::new();
+        for event in &pipeline.ledger().events {
+            days.entry((&event.account, event.date))
+                .or_default()
+                .push(event);
+        }
+        let rejected = pipeline.bundle.rejected_activities();
+        // A linked conversion inside one account moves no money in or out:
+        // a rate better than the market's is a gain (#1655, as in P-TXF).
+        let conversion = |e: &EconomicEvent| {
+            pipeline
+                .facts()
+                .transfer_pairs()
+                .pair_for(&e.source)
+                .is_some_and(|p| p.in_account == p.out_account && p.contribution_neutral)
+        };
+        for ((account, day), events) in &days {
+            let pure = events.iter().all(|e| {
+                matches!(
+                    e.kind,
+                    ActivityKind::Deposit
+                        | ActivityKind::Withdrawal
+                        | ActivityKind::TransferIn
+                        | ActivityKind::TransferOut
+                ) && e.charges.fee.is_zero()
+                    && e.charges.tax.is_zero()
+                    && !rejected.contains(&e.source)
+                    && !conversion(e)
+            });
+            if !pure
+                || policy.major_currency(pipeline.facts().accounts()[*account].currency.as_str())
+                    != base
+            {
+                continue;
+            }
+            let (Some(frames), Some(series)) = (
+                pipeline.bundle.keyframes.get(*account),
+                pipeline.series.get(*account),
+            ) else {
+                continue;
+            };
+            // The opening day's value is where returns start, not a flow.
+            let Some(row) = series.days.iter().skip(1).find(|d| d.date == *day) else {
+                continue;
+            };
+            if row.value_status != ValueStatus::Complete
+                || matches!(
+                    row.flow.source,
+                    FlowSource::Unknown | FlowSource::UnknownBoundaryTransfer
+                )
+            {
+                continue;
+            }
+            let Some(after) = frames.iter().find(|k| k.date == *day) else {
+                continue;
+            };
+            let Some(value_after) = revalue(&pipeline, &after.state, *day, &split_assets) else {
+                continue;
+            };
+            let value_before = match frames.iter().rev().find(|k| k.date < *day) {
+                Some(before) => match revalue(&pipeline, &before.state, *day, &split_assets) {
+                    Some(value) => value,
+                    None => continue,
+                },
+                None => Decimal::ZERO,
+            };
+            let moved = value_after - value_before;
+            let flow = row.flow.inflow_base - row.flow.outflow_base;
+            assert!(
+                (moved - flow).abs() <= DUST,
+                "{}: P-FLOW violated for {account} on {day}: value moved {moved}, net flow {flow} ({:?})",
+                scenario.id,
+                row.flow.source
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 20, "only {checked} flow days checked");
+}
+
+/// State at the end of `day` (the last keyframe on or before it).
+fn state_on(frames: Option<&Vec<Keyframe>>, day: NaiveDate) -> Option<&AccountState> {
+    frames?
+        .iter()
+        .rev()
+        .find(|k| k.date <= day)
+        .map(|k| &k.state)
+}
+
+/// P-REJECT: a rejected activity is as if it had never been entered. Folding
+/// without it leaves every account in the same state on every day, and the
+/// fold reports nothing about the attempt but the rejection.
+#[test]
+fn p_reject_a_rejected_activity_leaves_no_trace() {
+    let mut checked = 0usize;
+    for scenario in corpus() {
+        let pipeline = Pipeline::from_scenario(&scenario);
+        let rejected = pipeline.bundle.rejected_activities();
+        if rejected.is_empty() {
+            continue;
+        }
+        let mut without = scenario.clone();
+        without
+            .activities
+            .retain(|a| !rejected.contains(&ActivityId::new(a.id.as_str())));
+        let other = Pipeline::from_scenario(&without);
+        for (account, frames) in &pipeline.bundle.keyframes {
+            for frame in frames {
+                let expected = state_on(other.bundle.keyframes.get(account), frame.date)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        AccountState::empty(account.clone(), frame.state.currency.clone())
+                    });
+                assert_same(
+                    &scenario.id,
+                    &format!("P-REJECT ({account} on {})", frame.date),
+                    &serde_json::to_value(&frame.state).unwrap(),
+                    &serde_json::to_value(&expected).unwrap(),
+                );
+            }
+        }
+        let reported: Vec<Value> = pipeline
+            .bundle
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                !(d.code == DiagnosticCode::ActivityRejected
+                    && rejected.contains(&ActivityId::new(d.source.as_str())))
+            })
+            .map(|d| serde_json::to_value(d).unwrap())
+            .collect();
+        let expected: Vec<Value> = other
+            .bundle
+            .diagnostics
+            .iter()
+            .map(|d| serde_json::to_value(d).unwrap())
+            .collect();
+        assert_same(
+            &scenario.id,
+            "P-REJECT (diagnostics)",
+            &canonical(Value::Array(reported)),
+            &canonical(Value::Array(expected)),
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no scenario rejects an activity");
+}
+
+/// P-TXF-LEGS: a security transfer moves lots, it does not make them. The
+/// incoming leg of a pair opens what the outgoing leg removed (units, cost in
+/// base and in the receiving currency, acquisition dates), and no lot is left
+/// behind in the transfer cache. A transfer valued at cost carries the cost
+/// the fold booked for it.
+#[test]
+fn p_txf_legs_transfers_carry_their_lots() {
+    let mut checked = 0usize;
+    for scenario in corpus() {
+        let pipeline = Pipeline::from_scenario(&scenario);
+        let rejected = pipeline.bundle.rejected_activities();
+        let lots = pipeline.lots();
+        let fx = pipeline.fx();
+        // The leg that moves the securities (a fee compiles into its own event).
+        let event_of = |source: &ActivityId| {
+            pipeline.ledger().events.iter().find(|e| {
+                e.source == *source && matches!(e.action, Action::SecurityTransfer { .. })
+            })
+        };
+        let opened_by = |event: &EconomicEvent| -> Vec<&LotRecord> {
+            lots.iter()
+                .filter(|l| {
+                    l.account == event.account && l.open_activity.as_ref() == Some(&event.source)
+                })
+                .collect()
+        };
+
+        for pair in pipeline
+            .facts()
+            .transfer_pairs()
+            .iter()
+            .filter(|p| p.security)
+        {
+            if rejected.contains(&pair.transfer_out) || rejected.contains(&pair.transfer_in) {
+                continue;
+            }
+            let (Some(out), Some(incoming)) =
+                (event_of(&pair.transfer_out), event_of(&pair.transfer_in))
+            else {
+                continue;
+            };
+            // Incoming lots that first cover a short are split (NOM-TXF-04).
+            if pipeline
+                .bundle
+                .disposals
+                .iter()
+                .any(|d| d.event == incoming.id)
+            {
+                continue;
+            }
+            let removed: Vec<&LotDisposal> = pipeline
+                .bundle
+                .disposals
+                .iter()
+                .filter(|d| d.event == out.id)
+                .collect();
+            if removed.is_empty() {
+                continue;
+            }
+            let added = opened_by(incoming);
+            let id = format!("{}: P-TXF-LEGS {}", scenario.id, pair.group_id);
+            let sent_units: Decimal = removed.iter().map(|d| d.quantity).sum();
+            let received_units: Decimal = added.iter().map(|l| l.original_quantity).sum();
+            assert_eq!(received_units, sent_units, "{id}: units");
+            // A leg's fee is capitalised into the lots it delivers (§ the
+            // TRANSFER_IN row): costs compare only without one.
+            let fees = !out.charges.fee.is_zero() || !incoming.charges.fee.is_zero();
+            let sent_base: Decimal = removed.iter().map(|d| d.cost_basis_base).sum();
+            let received_base: Decimal = added.iter().map(|l| l.original_cost_basis_base).sum();
+            assert!(
+                fees || (received_base - sent_base).abs() <= DUST,
+                "{id}: cost in base {received_base} received, {sent_base} sent"
+            );
+
+            let sources: Option<Vec<&LotRecord>> = removed
+                .iter()
+                .map(|d| {
+                    lots.iter()
+                        .find(|l| l.id == d.lot_id && l.account == out.account)
+                })
+                .collect();
+            let Some(sources) = sources else {
+                continue;
+            };
+            let mut sent_dates: Vec<NaiveDate> = sources.iter().map(|l| l.open_date).collect();
+            let mut received_dates: Vec<NaiveDate> = added.iter().map(|l| l.open_date).collect();
+            sent_dates.sort();
+            received_dates.sort();
+            assert_eq!(received_dates, sent_dates, "{id}: acquisition dates");
+            if let Some(receiving) = added.first().map(|l| l.currency.as_str()).filter(|_| !fees) {
+                let sent = removed
+                    .iter()
+                    .zip(&sources)
+                    .map(|(d, lot)| {
+                        fx.convert(d.cost_basis, d.currency.as_str(), receiving, lot.open_date)
+                    })
+                    .sum::<Option<Decimal>>();
+                if let Some(sent) = sent {
+                    let received: Decimal = added.iter().map(|l| l.original_cost_basis).sum();
+                    assert!(
+                        (received - sent).abs() <= DUST,
+                        "{id}: cost {received} {receiving} received, {sent} sent"
+                    );
+                }
+            }
+            checked += 1;
+        }
+
+        // Nothing stranded: a cached group waits for an incoming leg after the range.
+        let end = pipeline.range().end;
+        for group in pipeline.bundle.final_state.transfer_cache.keys() {
+            let pending = pipeline
+                .facts()
+                .transfer_pairs()
+                .iter()
+                .find(|p| p.group_id == *group)
+                .and_then(|p| event_of(&p.transfer_in))
+                .is_some_and(|e| e.date > end);
+            assert!(
+                pending,
+                "{}: P-TXF-LEGS lots of {group} left in the transfer cache",
+                scenario.id
+            );
+        }
+
+        // A transfer valued at cost carries the cost the fold booked, less
+        // the charges capitalised into it (they are no flow, NOM-TXF-03).
+        let effects = pipeline.effects(&pipeline.bundle.disposals, &rejected);
+        for effect in &effects.events {
+            let Some(flow) = &effect.flow else { continue };
+            if flow.source != FlowSource::CostBasisFallback {
+                continue;
+            }
+            let Some(event) = event_of(&effect.source) else {
+                continue;
+            };
+            let added = opened_by(event);
+            if added.is_empty() {
+                continue;
+            }
+            let booked: Decimal = added
+                .iter()
+                .map(|l| l.original_cost_basis_base - l.fee_allocated_base - l.tax_allocated_base)
+                .sum();
+            assert!(
+                (flow.amount - booked).abs() <= DUST,
+                "{}: P-TXF-LEGS {} flows {} at cost but booked {booked}",
+                scenario.id,
+                effect.source,
+                flow.amount
+            );
+        }
+    }
+    assert!(
+        checked > 5,
+        "only {checked} security transfer pairs checked"
+    );
+}
