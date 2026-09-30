@@ -129,6 +129,7 @@ pub fn project_accounts(
     }
 
     let mut keyframes: BTreeMap<AccountId, Vec<Keyframe>> = BTreeMap::new();
+    let mut book_costs: BTreeMap<AccountId, BTreeMap<AssetId, Decimal>> = BTreeMap::new();
     for day in range.days() {
         let eligible: Vec<&AccountId> = eligible_from
             .iter()
@@ -156,7 +157,14 @@ pub fn project_accounts(
             let next = if events.is_empty() {
                 account
             } else {
-                projector.fold_day(account, events, day, &mut state.transfer_cache, &mut run)
+                projector.fold_day(
+                    account,
+                    events,
+                    day,
+                    &mut state.transfer_cache,
+                    book_costs.entry(account_id.clone()).or_default(),
+                    &mut run,
+                )
             };
             keyframes
                 .entry(account_id.clone())
@@ -287,6 +295,18 @@ struct Savepoint {
     positions: Vec<(AssetId, Option<Position>)>,
 }
 
+/// The position an event may change besides cash and the account totals
+/// (checked in debug builds): the asset its action names.
+fn footprint(event: &EconomicEvent) -> Option<&AssetId> {
+    match &event.action {
+        Action::None => None,
+        Action::Trade { asset, .. }
+        | Action::SecurityTransfer { asset, .. }
+        | Action::Split { asset, .. }
+        | Action::OptionExpiry { asset, .. } => Some(asset),
+    }
+}
+
 impl Savepoint {
     fn take<'e>(account: &AccountState, legs: impl Iterator<Item = &'e EconomicEvent>) -> Self {
         // Exhaustive, so a new field has to be placed in or out of the savepoint.
@@ -301,15 +321,7 @@ impl Savepoint {
             cash_total_account,
             cash_total_base,
         } = account;
-        let mut assets: Vec<&AssetId> = legs
-            .filter_map(|leg| match &leg.action {
-                Action::None => None,
-                Action::Trade { asset, .. }
-                | Action::SecurityTransfer { asset, .. }
-                | Action::Split { asset, .. }
-                | Action::OptionExpiry { asset, .. } => Some(asset),
-            })
-            .collect();
+        let mut assets: Vec<&AssetId> = legs.filter_map(footprint).collect();
         assets.sort();
         assets.dedup();
         Self {
@@ -380,12 +392,15 @@ impl Projector<'_> {
             .unwrap_or_else(|| AssetFacts::fallback(asset.clone(), currency.clone()))
     }
 
+    /// `book_costs` holds each untouched position's book cost in account
+    /// currency from an earlier day of the same fold.
     fn fold_day(
         &self,
         mut account: AccountState,
         events: &[&EconomicEvent],
         day: NaiveDate,
         cache: &mut BTreeMap<String, Vec<Lot>>,
+        book_costs: &mut BTreeMap<AssetId, Decimal>,
         run: &mut RunLog,
     ) -> AccountState {
         // An activity applies whole or not at all: a composite's legs (DRIP:
@@ -429,16 +444,44 @@ impl Projector<'_> {
 
         // Book cost in account currency at acquisition FX, then the
         // precomputed per-position scalars, then cash totals (once per day).
+        // Only the positions the day's events touched can change, so the
+        // others keep their figures (acquisition FX does not move with the
+        // day), except a position without lots (converted at the day's rate)
+        // and a failed conversion (reported every day).
+        let touched: BTreeSet<&AssetId> = events.iter().filter_map(|e| footprint(e)).collect();
         let account_currency = account.currency.clone();
-        account.cost_basis = account
-            .positions
-            .values()
-            .map(|position| {
-                self.position_cost_basis_in_account_currency(position, &account_currency, day, run)
-            })
-            .sum();
+        let mut cost_basis = Decimal::ZERO;
+        for (asset, position) in &account.positions {
+            let cached = if touched.contains(asset) {
+                None
+            } else {
+                book_costs.get(asset).copied()
+            };
+            cost_basis += match cached {
+                Some(cost) => cost,
+                None => {
+                    let reported = run.diagnostics.len();
+                    let cost = self.position_cost_basis_in_account_currency(
+                        position,
+                        &account_currency,
+                        day,
+                        run,
+                    );
+                    if position.lots.is_empty() || run.diagnostics.len() > reported {
+                        book_costs.remove(asset);
+                    } else {
+                        book_costs.insert(asset.clone(), cost);
+                    }
+                    cost
+                }
+            };
+        }
+        account.cost_basis = cost_basis;
         let base = self.base().to_string();
-        for position in account.positions.values_mut() {
+        for (asset, position) in account.positions.iter_mut() {
+            if !touched.contains(asset) {
+                continue;
+            }
             position.cost_basis_account =
                 self.precompute_cost_basis(position, account_currency.as_str());
             position.cost_basis_base = self.precompute_cost_basis(position, &base);
