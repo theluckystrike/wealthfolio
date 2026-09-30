@@ -1184,15 +1184,12 @@ impl Projector<'_> {
                 .cloned()
                 .collect();
             if let Some(g) = paired_group.as_deref() {
-                if cover_abs > Decimal::ZERO || !added.is_empty() {
-                    effects.cache_removals.push(g.to_string());
-                } else {
-                    run.diagnostics.push(Diagnostic::warning(
-                        DiagnosticCode::ActivityRejected,
-                        event.source.as_str(),
-                        format!("TRANSFER_IN booked none of the cached lots for {asset} (negative lots not allowed); cache kept"),
-                    ));
+                if cover_abs.is_zero() && added.is_empty() {
+                    // Rejected whole, so the fee is not paid either; the
+                    // lots stay cached.
+                    return Err(format!("TRANSFER_IN booked none of the cached lots for {asset} (negative lots not allowed); cache kept"));
                 }
+                effects.cache_removals.push(g.to_string());
             }
             (cost_basis, added, cover)
         } else {
