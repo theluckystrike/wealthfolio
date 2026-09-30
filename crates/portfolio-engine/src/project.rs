@@ -307,7 +307,7 @@ fn order_by_transfer_dependencies<'a>(
 struct SideEffects {
     disposals: Vec<LotDisposal>,
     closures: Vec<LotClosure>,
-    cache_inserts: Vec<(String, Vec<Lot>)>,
+    cache_inserts: Vec<(String, StagedLots)>,
     cache_removals: Vec<String>,
 }
 
@@ -499,7 +499,7 @@ impl Projector<'_> {
         &self,
         mut account: AccountState,
         events: &[&EconomicEvent],
-        cache: &mut BTreeMap<String, Vec<Lot>>,
+        cache: &mut BTreeMap<String, StagedLots>,
         run: &mut RunLog,
     ) -> AccountState {
         // An activity applies whole or not at all: a composite's legs (DRIP:
@@ -597,7 +597,7 @@ impl Projector<'_> {
         &self,
         event: &EconomicEvent,
         state: &mut AccountState,
-        cache: &BTreeMap<String, Vec<Lot>>,
+        cache: &BTreeMap<String, StagedLots>,
         effects: &mut SideEffects,
         run: &mut RunLog,
     ) -> Result<(), String> {
@@ -786,6 +786,48 @@ impl Projector<'_> {
                 .event_dates
                 .get(pair.transfer_in.as_str())
                 .is_some_and(|date| *date >= out_date)
+    }
+
+    /// Staged lots in the receiving position's currency. An asset without a
+    /// quote currency takes its opening activity's, so the two positions of
+    /// a transfer can differ: amounts then convert at each lot's acquisition
+    /// rate, and its stored rates scale so its account and base cost stay
+    /// the same. No rate rejects the transfer, as it does a trade.
+    fn staged_lots_in(&self, staged: &StagedLots, currency: &str) -> Result<Vec<Lot>, String> {
+        let from = staged.currency.as_str();
+        if from == currency || from.is_empty() || currency.is_empty() {
+            return Ok(staged.lots.clone());
+        }
+        staged
+            .lots
+            .iter()
+            .map(|lot| {
+                let rate = self
+                    .fx
+                    .rate(from, currency, lot.acquisition_date)
+                    .ok_or_else(|| {
+                        format!(
+                            "failed to convert the transferred lots from {from} to {currency} on {}",
+                            lot.acquisition_date
+                        )
+                    })?;
+                let convert = |amount: Decimal| checked(arith::mul(amount, rate), "transferred lot");
+                Ok(Lot {
+                    cost_basis: convert(lot.cost_basis)?,
+                    acquisition_price: convert(lot.acquisition_price)?,
+                    fees: convert(lot.fees)?,
+                    original_fees: convert(lot.original_fees)?,
+                    taxes: convert(lot.taxes)?,
+                    original_taxes: convert(lot.original_taxes)?,
+                    fx_rate_to_position: lot
+                        .fx_rate_to_position
+                        .and_then(|r| arith::mul(r, rate)),
+                    fx_rate_to_account: lot.fx_rate_to_account.and_then(|r| arith::div(r, rate)),
+                    fx_rate_to_base: lot.fx_rate_to_base.and_then(|r| arith::div(r, rate)),
+                    ..lot.clone()
+                })
+            })
+            .collect()
     }
 
     // --------------------------------------------------------------- trades
@@ -1120,7 +1162,7 @@ impl Projector<'_> {
         quantity: Decimal,
         unit_price: Decimal,
         legacy_amount: Option<Decimal>,
-        cache: &BTreeMap<String, Vec<Lot>>,
+        cache: &BTreeMap<String, StagedLots>,
         effects: &mut SideEffects,
         run: &mut RunLog,
     ) -> Result<(), String> {
@@ -1139,7 +1181,10 @@ impl Projector<'_> {
         let position = self.position_mut(state, asset, &info, event);
         let position_currency = position.currency.clone();
         let paired_group = self.pair(event).map(|pair| pair.group_id.clone());
-        let cached = paired_group.as_deref().and_then(|g| cache.get(g).cloned());
+        let cached = match paired_group.as_deref().and_then(|g| cache.get(g)) {
+            Some(staged) => Some(self.staged_lots_in(staged, position_currency.as_str())?),
+            None => None,
+        };
         let paired = cached.is_some();
 
         let (cost_basis_asset, added_lots, cover) = if let Some(lots) = cached {
@@ -1433,9 +1478,13 @@ impl Projector<'_> {
         }
         if let Some(pair) = self.pair(event) {
             if !reduction.removed_lots.is_empty() && self.incoming_leg_pending(pair, event.date) {
-                effects
-                    .cache_inserts
-                    .push((pair.group_id.clone(), reduction.removed_lots));
+                effects.cache_inserts.push((
+                    pair.group_id.clone(),
+                    StagedLots {
+                        currency: position_currency.clone(),
+                        lots: reduction.removed_lots,
+                    },
+                ));
             }
         }
         Ok(())

@@ -33,7 +33,15 @@ pub struct ProjectionState {
     /// Lots removed by a TRANSFER_OUT awaiting the paired TRANSFER_IN, keyed
     /// by `source_group_id`. Part of the state so a checkpoint carries
     /// in-flight transfers across a range boundary.
-    pub transfer_cache: BTreeMap<String, Vec<Lot>>,
+    pub transfer_cache: BTreeMap<String, StagedLots>,
+}
+
+/// Lots between the legs of a transfer, in the currency of the position
+/// they left.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StagedLots {
+    pub currency: Currency,
+    pub lots: Vec<Lot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

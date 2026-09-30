@@ -49,10 +49,11 @@ activities:
     )
     .expect("first chunk")
     .final_state;
-    for lot in checkpoint
+    for lot in &mut checkpoint
         .transfer_cache
         .get_mut("g")
         .expect("lots in flight")
+        .lots
     {
         lot.quantity = -lot.quantity;
         lot.original_quantity = -lot.original_quantity;
