@@ -19,6 +19,7 @@ use crate::compile::CompiledLedger;
 use crate::diagnostics::{Diagnostic, DiagnosticCode};
 use crate::error::EngineError;
 use crate::model::*;
+use crate::project::position_book_cost;
 use crate::resolve::{FxResolver, ResolvedSurfaces};
 
 /// A quote or FX rate carried at least this many days is reported once per
@@ -722,8 +723,11 @@ impl<'a> Valuer<'a> {
             }
         }
 
-        let cost_basis =
+        let (cost_basis, converted) =
             self.cost_basis_in(keyframe, day, &account_currency, |p| p.cost_basis_account);
+        if !converted {
+            basis_status = basis_status.combine(BasisStatus::Unknown);
+        }
         let fx_rate_to_base = if account_currency == base {
             Some(Decimal::ONE)
         } else {
@@ -773,7 +777,11 @@ impl<'a> Valuer<'a> {
                 flow: DailyFlow::default(),
             };
         };
-        let cost_basis_base = self.cost_basis_in(keyframe, day, &base, |p| p.cost_basis_base);
+        let (cost_basis_base, converted) =
+            self.cost_basis_in(keyframe, day, &base, |p| p.cost_basis_base);
+        if !converted {
+            basis_status = basis_status.combine(BasisStatus::Unknown);
+        }
         let value_status = if unavailable {
             ValueStatus::Unavailable
         } else if unpriced == 0 {
@@ -808,45 +816,42 @@ impl<'a> Valuer<'a> {
     /// Book cost in `target`: the precomputed acquisition-FX scalar, else the
     /// total at the day's FX. Keyframes carry no lots, so a full run and a
     /// revalue from stored rows convert the same way.
+    /// The positions' book cost in `target` (the fold's rule, see
+    /// [`position_book_cost`]); whether every cost converted.
     fn cost_basis_in(
         &mut self,
         keyframe: &ValuationKeyframe,
         day: NaiveDate,
         target: &str,
-        precomputed: impl Fn(&PricedPosition) -> Option<Decimal>,
-    ) -> Decimal {
-        let policy = &self.resolved.facts.policy;
+        at_acquisition: impl Fn(&PricedPosition) -> Option<Decimal>,
+    ) -> (Decimal, bool) {
         let mut total = Decimal::ZERO;
+        let mut converted = true;
         for (asset, position) in &keyframe.positions {
-            if position.alternative || position.total_cost_basis.is_zero() {
-                continue;
-            }
-            if let Some(scalar) = precomputed(position) {
-                total += scalar;
-                continue;
-            }
-            let position_currency = policy
-                .major_currency(position.currency.as_str())
-                .to_string();
-            // No acquisition-FX scalar (a lot lacked its rate): the book cost
-            // converts at the day's rate, as a revalue from stored rows does.
-            match self.fx.rate(&position_currency, target, day) {
-                Some(rate) => match arith::mul(position.total_cost_basis, rate) {
-                    Some(converted) => total += converted,
-                    None => self.report(
-                        DiagnosticCode::ValueOutOfRange,
+            match position_book_cost(
+                &self.fx,
+                position.alternative,
+                position.currency.as_str(),
+                position.total_cost_basis,
+                at_acquisition(position),
+                target,
+                day,
+            ) {
+                Some(cost) => total += cost,
+                None => {
+                    converted = false;
+                    self.report(
+                        DiagnosticCode::FxUnavailable,
                         format!("{}:basis:{asset}", self.account),
-                        format!("the book cost of {asset} in {target} is outside the kernel range; omitted from the converted basis"),
-                    ),
-                },
-                None => self.report(
-                    DiagnosticCode::FxUnavailable,
-                    format!("{}:basis:{asset}", self.account),
-                    format!("no {position_currency}->{target} rate on {day}; book cost of {asset} omitted from the converted basis"),
-                ),
+                        format!(
+                            "no {}->{target} rate on {day}; book cost of {asset} unknown",
+                            position.currency
+                        ),
+                    );
+                }
             }
         }
-        total
+        (total, converted)
     }
 
     /// Legacy transfer-flow ladder + removed-lot-basis substitution.

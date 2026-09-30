@@ -129,7 +129,6 @@ pub fn project_accounts(
     }
 
     let mut keyframes: BTreeMap<AccountId, Vec<Keyframe>> = BTreeMap::new();
-    let mut book_costs: BTreeMap<AccountId, BTreeMap<AssetId, Decimal>> = BTreeMap::new();
     for day in range.days() {
         let eligible: Vec<&AccountId> = eligible_from
             .iter()
@@ -157,14 +156,7 @@ pub fn project_accounts(
             let next = if events.is_empty() {
                 account
             } else {
-                projector.fold_day(
-                    account,
-                    events,
-                    day,
-                    &mut state.transfer_cache,
-                    book_costs.entry(account_id.clone()).or_default(),
-                    &mut run,
-                )
+                projector.fold_day(account, events, day, &mut state.transfer_cache, &mut run)
             };
             keyframes
                 .entry(account_id.clone())
@@ -295,6 +287,25 @@ struct Savepoint {
     positions: Vec<(AssetId, Option<Position>)>,
 }
 
+/// The book-cost rule, one for the fold's account totals and valuation: a
+/// position's cost at acquisition FX when it has one (`at_acquisition`),
+/// else its total at `day`'s rate. Alternative assets and positions without a
+/// cost carry none. `None` when no rate converts it.
+pub(crate) fn position_book_cost(
+    fx: &FxResolver<'_>,
+    alternative: bool,
+    currency: &str,
+    total_cost_basis: Decimal,
+    at_acquisition: Option<Decimal>,
+    target: &str,
+    day: NaiveDate,
+) -> Option<Decimal> {
+    if alternative || total_cost_basis.is_zero() {
+        return Some(Decimal::ZERO);
+    }
+    at_acquisition.or_else(|| fx.convert(total_cost_basis, currency, target, day))
+}
+
 /// The position an event may change besides cash and the account totals
 /// (checked in debug builds): the asset its action names.
 fn footprint(event: &EconomicEvent) -> Option<&AssetId> {
@@ -392,15 +403,12 @@ impl Projector<'_> {
             .unwrap_or_else(|| AssetFacts::fallback(asset.clone(), currency.clone()))
     }
 
-    /// `book_costs` holds each untouched position's book cost in account
-    /// currency from an earlier day of the same fold.
     fn fold_day(
         &self,
         mut account: AccountState,
         events: &[&EconomicEvent],
         day: NaiveDate,
         cache: &mut BTreeMap<String, Vec<Lot>>,
-        book_costs: &mut BTreeMap<AssetId, Decimal>,
         run: &mut RunLog,
     ) -> AccountState {
         // An activity applies whole or not at all: a composite's legs (DRIP:
@@ -442,50 +450,43 @@ impl Projector<'_> {
             }
         }
 
-        // Book cost in account currency at acquisition FX, then the
-        // precomputed per-position scalars, then cash totals (once per day).
-        // Only the positions the day's events touched can change, so the
-        // others keep their figures (acquisition FX does not move with the
-        // day), except a position without lots (converted at the day's rate)
-        // and a failed conversion (reported every day).
+        // Book costs at acquisition FX of the positions the day's events
+        // touched (the others keep theirs: acquisition FX does not move with
+        // the day), then the account's total by the same rule as valuation,
+        // then cash totals (once per day).
         let touched: BTreeSet<&AssetId> = events.iter().filter_map(|e| footprint(e)).collect();
-        let account_currency = account.currency.clone();
-        let mut cost_basis = Decimal::ZERO;
-        for (asset, position) in &account.positions {
-            let cached = if touched.contains(asset) {
-                None
-            } else {
-                book_costs.get(asset).copied()
-            };
-            cost_basis += match cached {
-                Some(cost) => cost,
-                None => {
-                    let reported = run.diagnostics.len();
-                    let cost = self.position_cost_basis_in_account_currency(
-                        position,
-                        &account_currency,
-                        day,
-                        run,
-                    );
-                    if position.lots.is_empty() || run.diagnostics.len() > reported {
-                        book_costs.remove(asset);
-                    } else {
-                        book_costs.insert(asset.clone(), cost);
-                    }
-                    cost
-                }
-            };
-        }
-        account.cost_basis = cost_basis;
+        let account_currency = account.currency.as_str().to_string();
         let base = self.base().to_string();
         for (asset, position) in account.positions.iter_mut() {
             if !touched.contains(asset) {
                 continue;
             }
-            position.cost_basis_account =
-                self.precompute_cost_basis(position, account_currency.as_str());
-            position.cost_basis_base = self.precompute_cost_basis(position, &base);
+            position.cost_basis_account = self.book_cost(position, &account_currency);
+            position.cost_basis_base = self.book_cost(position, &base);
         }
+        let mut cost_basis = Decimal::ZERO;
+        for (asset, position) in &account.positions {
+            match position_book_cost(
+                self.fx,
+                position.alternative,
+                position.currency.as_str(),
+                position.total_cost_basis,
+                position.cost_basis_account,
+                &account_currency,
+                day,
+            ) {
+                Some(cost) => cost_basis += cost,
+                None => run.diagnostics.push(Diagnostic::warning(
+                    DiagnosticCode::FxUnavailable,
+                    asset.as_str(),
+                    format!(
+                        "no {}->{account_currency} rate on {day}; book cost excluded",
+                        position.currency
+                    ),
+                )),
+            }
+        }
+        account.cost_basis = cost_basis;
         self.compute_cash_totals(&mut account, day, run);
         account
     }
@@ -1650,21 +1651,7 @@ impl Projector<'_> {
         event: &EconomicEvent,
         run: &mut RunLog,
     ) -> Decimal {
-        if position_currency == target {
-            return lot.cost_basis;
-        }
-        if let Some(converted) = lot
-            .stored_fx_rate_to(target)
-            .and_then(|rate| arith::mul(lot.cost_basis, rate))
-        {
-            return converted;
-        }
-        if let Some(converted) = self.fx.convert(
-            lot.cost_basis,
-            position_currency,
-            target,
-            lot.acquisition_date,
-        ) {
+        if let Some(converted) = self.lot_book_cost(lot, position_currency, target) {
             return converted;
         }
         if fallback_date == lot.acquisition_date {
@@ -1690,79 +1677,38 @@ impl Projector<'_> {
         }
     }
 
-    /// Legacy `position_cost_basis_in_account_currency`.
-    fn position_cost_basis_in_account_currency(
-        &self,
-        position: &Position,
-        account_currency: &Currency,
-        day: NaiveDate,
-        run: &mut RunLog,
-    ) -> Decimal {
-        let position_currency = position.currency.as_str();
-        let target = account_currency.as_str();
-        if position_currency.is_empty() {
-            return Decimal::ZERO;
+    /// A lot's book cost in `target`: its cost at the lot's stored rate to
+    /// `target`, else at its acquisition date's rate (the resolver applies
+    /// minor units). `None` when no rate converts it.
+    fn lot_book_cost(&self, lot: &Lot, position_currency: &str, target: &str) -> Option<Decimal> {
+        if position_currency == target {
+            return Some(lot.cost_basis);
         }
-        let soft_convert = |amount: Decimal, date: NaiveDate, run: &mut RunLog| {
-            if position_currency == target {
-                return amount;
-            }
-            match self.fx.convert(amount, position_currency, target, date) {
-                Some(converted) => converted,
-                None => {
-                    run.diagnostics.push(Diagnostic::warning(
-                        DiagnosticCode::FxUnavailable,
-                        position.asset.as_str(),
-                        format!(
-                            "no {position_currency}->{target} rate on {date}; book cost excluded"
-                        ),
-                    ));
-                    Decimal::ZERO
-                }
-            }
-        };
+        lot.stored_fx_rate_to(target)
+            .and_then(|rate| arith::mul(lot.cost_basis, rate))
+            .or_else(|| {
+                self.fx.convert(
+                    lot.cost_basis,
+                    position_currency,
+                    target,
+                    lot.acquisition_date,
+                )
+            })
+    }
+
+    /// A position's book cost in `target` at acquisition FX: the sum of its
+    /// lots'. `None` without lots, or when a lot does not convert (the day's
+    /// rate then applies, see [`position_book_cost`]).
+    fn book_cost(&self, position: &Position, target: &str) -> Option<Decimal> {
         if position.lots.is_empty() {
-            return soft_convert(position.total_cost_basis, day, run);
+            return None;
         }
         position
             .lots
             .iter()
             .filter(|lot| !lot.quantity.is_zero() && !lot.cost_basis.is_zero())
-            .map(|lot| {
-                match lot
-                    .stored_fx_rate_to(target)
-                    .and_then(|rate| arith::mul(lot.cost_basis, rate))
-                {
-                    Some(converted) => converted,
-                    None => soft_convert(lot.cost_basis, lot.acquisition_date, run),
-                }
-            })
+            .map(|lot| self.lot_book_cost(lot, position.currency.as_str(), target))
             .sum()
-    }
-
-    /// Legacy `compute_position_cost_basis_from_lots` (major-unit codes).
-    fn precompute_cost_basis(&self, position: &Position, target: &str) -> Option<Decimal> {
-        if position.lots.is_empty() {
-            return None;
-        }
-        let policy = &self.facts.policy;
-        let position_currency = policy.major_currency(position.currency.as_str());
-        let target_major = policy.major_currency(target);
-        let mut total = Decimal::ZERO;
-        for lot in &position.lots {
-            if lot.cost_basis.is_zero() {
-                continue;
-            }
-            if let Some(rate) = lot.stored_fx_rate_to(target_major) {
-                total += arith::mul(lot.cost_basis, rate)?;
-                continue;
-            }
-            let rate = self
-                .fx
-                .rate(position_currency, target_major, lot.acquisition_date)?;
-            total += arith::mul(lot.cost_basis, rate)?;
-        }
-        Some(total)
     }
 
     /// Cash totals in account and base currency, once per day; an

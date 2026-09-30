@@ -137,6 +137,8 @@ expected_notes: >
   `gbp` bucket (-25) that no rate converts, so the keyframe totals exclude
   it (cash_total_account_currency 1000) with diagnostics, the lot has no
   book FX to GBP/USD (fx_rate_to_base 0), and acc-lower's rows from 01-03
-  are Unavailable (bucket and position unpriced) rather than missing. The
+  are Unavailable (bucket and position unpriced) rather than missing, with
+  basis_status partialUnknown: the position's book cost converts to neither
+  GBP nor USD, so it is left out of cost_basis and reported. The
   rates are observed on 01-02 only, so each account reports a CarriedFxRate
   informational diagnostic (8 days by 01-10).

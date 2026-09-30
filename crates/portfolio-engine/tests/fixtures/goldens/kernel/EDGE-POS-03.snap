@@ -38,7 +38,7 @@ baseline:
             USD: "899.999999"
           cash_total_account_currency: "899.999999"
           cash_total_base_currency: "899.999999"
-          cost_basis: "100.000001"
+          cost_basis: "100.0000005"
           date: 2025-01-03
           net_contribution: "1000"
           net_contribution_base: "1000"
@@ -66,7 +66,7 @@ baseline:
             USD: "999.999999"
           cash_total_account_currency: "999.999999"
           cash_total_base_currency: "999.999999"
-          cost_basis: "0.0000005"
+          cost_basis: "0"
           date: 2025-01-06
           net_contribution: "1000"
           net_contribution_base: "1000"

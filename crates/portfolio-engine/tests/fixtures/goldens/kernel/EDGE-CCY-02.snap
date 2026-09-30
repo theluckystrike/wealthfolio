@@ -1050,7 +1050,7 @@ baseline:
           total_value: "1000"
           total_value_base: "1250"
           value_status: complete
-        - basis_status: complete
+        - basis_status: partialUnknown
           book_basis: "1000"
           book_basis_base: "1250"
           cash_balance: "1000"
@@ -1070,7 +1070,7 @@ baseline:
           total_value: "1000"
           total_value_base: "1250"
           value_status: unavailable
-        - basis_status: complete
+        - basis_status: partialUnknown
           book_basis: "1000"
           book_basis_base: "1250"
           cash_balance: "1000"
@@ -1090,7 +1090,7 @@ baseline:
           total_value: "1000"
           total_value_base: "1250"
           value_status: unavailable
-        - basis_status: complete
+        - basis_status: partialUnknown
           book_basis: "1000"
           book_basis_base: "1250"
           cash_balance: "1000"
@@ -1110,7 +1110,7 @@ baseline:
           total_value: "1000"
           total_value_base: "1250"
           value_status: unavailable
-        - basis_status: complete
+        - basis_status: partialUnknown
           book_basis: "1000"
           book_basis_base: "1250"
           cash_balance: "1000"
@@ -1130,7 +1130,7 @@ baseline:
           total_value: "1000"
           total_value_base: "1250"
           value_status: unavailable
-        - basis_status: complete
+        - basis_status: partialUnknown
           book_basis: "1000"
           book_basis_base: "1250"
           cash_balance: "1000"
@@ -1150,7 +1150,7 @@ baseline:
           total_value: "1000"
           total_value_base: "1250"
           value_status: unavailable
-        - basis_status: complete
+        - basis_status: partialUnknown
           book_basis: "1000"
           book_basis_base: "1250"
           cash_balance: "1000"
@@ -1170,7 +1170,7 @@ baseline:
           total_value: "1000"
           total_value_base: "1250"
           value_status: unavailable
-        - basis_status: complete
+        - basis_status: partialUnknown
           book_basis: "1000"
           book_basis_base: "1250"
           cash_balance: "1000"
@@ -1190,7 +1190,7 @@ baseline:
           total_value: "1000"
           total_value_base: "1250"
           value_status: unavailable
-        - basis_status: complete
+        - basis_status: partialUnknown
           book_basis: "1000"
           book_basis_base: "1250"
           cash_balance: "1000"
@@ -1822,7 +1822,7 @@ baseline:
     - "value/acc-ils:ILS->USD: Info CarriedFxRate: ILS->USD rate taken from an observation up to 8 days away (valued 2025-01-10)"
     - "value/acc-kwd:KWD->USD: Info CarriedFxRate: KWD->USD rate taken from an observation up to 8 days away (valued 2025-01-10)"
     - "value/acc-lower:GBP->USD: Info CarriedFxRate: GBP->USD rate taken from an observation up to 8 days away (valued 2025-01-10)"
-    - "value/acc-lower:basis:lower-asset: Warning FxUnavailable: no gbp->GBP rate on 2025-01-03; book cost of lower-asset omitted from the converted basis"
+    - "value/acc-lower:basis:lower-asset: Warning FxUnavailable: no gbp->GBP rate on 2025-01-03; book cost of lower-asset unknown"
     - "value/acc-lower:cash:gbp->GBP: Warning FxUnavailable: no gbp->GBP rate on 2025-01-03; cash bucket excluded"
     - "value/acc-lower:gbp->GBP: Warning FxUnavailable: no gbp->GBP rate on 2025-01-03; lower-asset unpriced"
     - "value/acc-zar:ZAR->USD: Info CarriedFxRate: ZAR->USD rate taken from an observation up to 8 days away (valued 2025-01-10)"

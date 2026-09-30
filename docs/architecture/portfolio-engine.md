@@ -594,6 +594,15 @@ product shows when the inputs are imperfect.
   the converted total with an `FxUnavailable` diagnostic, in the projection as
   in valuation, and a flow that cannot be priced is `Unknown` so it gates
   returns instead of vanishing.
+- **Book cost has one rule.** A lot converts at its stored rate to the target
+  currency, else at its acquisition date's rate (minor units applied, so pence
+  become pounds before a pound rate); a position's book cost is its lots' sum,
+  or, without lots or when a lot does not convert, its total at the day's rate.
+  Alternative assets and positions without a cost carry none. The fold's account
+  total and the valuation's cost basis both apply this rule, so a keyframe and
+  its day's valuation always agree (P-BOOK). A book cost no rate converts is
+  left out, reported, and counted as unknown in the day's basis status
+  (`PartialUnknown` beside known costs).
 - **A non-positive price or rate is a broken row.** Quote closes and FX rates at
   or below zero are dropped at normalise with a diagnostic instead of being
   used, so a glitch cannot value a position at nothing or a bucket at zero while

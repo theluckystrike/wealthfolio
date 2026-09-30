@@ -60,15 +60,16 @@ expected_notes: >
   01-03: cash 899.999999; frac position quantity 1.000000005, basis
   100.0000005; dust position quantity 0, average_cost 0, total_cost_basis
   0 (aggregates zeroed) while lot buy-dust remains with remaining_quantity
-  0.000000005 and remaining_cost_basis 0.0000005; the keyframe cost_basis
-  (100.000001) still includes the dust lot's 0.0000005 via the lot walk, and
-  the dust position keeps cost_basis_account/base 0.0000005. 01-06: cash
+  0.000000005 and remaining_cost_basis 0.0000005; the dust position keeps
+  cost_basis_account/base 0.0000005, but the keyframe cost_basis (100.0000005)
+  skips the zero-aggregate position, by the book-cost rule valuation uses
+  too. 01-06: cash
   999.999999; frac position quantity 0 with NO lots; lot buy-frac is CLOSED
   (original_quantity 1.000000005, close_activity sell-frac); disposal
   sell-frac quantity 1, proceeds 100, cost_basis 100 (prorated 100.0000005 x
   1/1.000000005), realized 0. Valuations: dust (zero quantity) and closed
-  frac contribute nothing and the valuation cost_basis skips the
-  zero-aggregate dust position (0 on 01-06 vs 0.0000005 on the keyframe);
+  frac contribute nothing and the cost_basis skips the zero-aggregate dust
+  position (0 from 01-06, on the keyframe as on the valuation);
   01-03 investment 100.0000005, total 999.9999995; 01-06 onward cash-only
   999.999999 (the 0.0000005 dust residual is the missing money). NOTE: the
   golden is rendered at 8 dp with half-even rounding, so 1.000000005 prints
