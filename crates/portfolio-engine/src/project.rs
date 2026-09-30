@@ -290,7 +290,8 @@ struct Savepoint {
 /// The book-cost rule, one for the fold's account totals and valuation: a
 /// position's cost at acquisition FX when it has one (`at_acquisition`),
 /// else its total at `day`'s rate. Alternative assets and positions without a
-/// cost carry none. `None` when no rate converts it.
+/// cost carry none. When it does not convert, the diagnostic code and why:
+/// no rate, or a converted total outside the kernel range.
 pub(crate) fn position_book_cost(
     fx: &FxResolver<'_>,
     alternative: bool,
@@ -299,11 +300,25 @@ pub(crate) fn position_book_cost(
     at_acquisition: Option<Decimal>,
     target: &str,
     day: NaiveDate,
-) -> Option<Decimal> {
+) -> Result<Decimal, (DiagnosticCode, String)> {
     if alternative || total_cost_basis.is_zero() {
-        return Some(Decimal::ZERO);
+        return Ok(Decimal::ZERO);
     }
-    at_acquisition.or_else(|| fx.convert(total_cost_basis, currency, target, day))
+    if let Some(cost) = at_acquisition {
+        return Ok(cost);
+    }
+    let rate = fx.rate(currency, target, day).ok_or_else(|| {
+        (
+            DiagnosticCode::FxUnavailable,
+            format!("no {currency}->{target} rate on {day}"),
+        )
+    })?;
+    arith::mul(total_cost_basis, rate).ok_or_else(|| {
+        (
+            DiagnosticCode::ValueOutOfRange,
+            format!("the book cost in {target} on {day} is outside the kernel range"),
+        )
+    })
 }
 
 /// The position an event may change besides cash and the account totals
@@ -475,14 +490,11 @@ impl Projector<'_> {
                 &account_currency,
                 day,
             ) {
-                Some(cost) => cost_basis += cost,
-                None => run.diagnostics.push(Diagnostic::warning(
-                    DiagnosticCode::FxUnavailable,
+                Ok(cost) => cost_basis += cost,
+                Err((code, reason)) => run.diagnostics.push(Diagnostic::warning(
+                    code,
                     asset.as_str(),
-                    format!(
-                        "no {}->{account_currency} rate on {day}; book cost excluded",
-                        position.currency
-                    ),
+                    format!("{reason}; book cost excluded"),
                 )),
             }
         }

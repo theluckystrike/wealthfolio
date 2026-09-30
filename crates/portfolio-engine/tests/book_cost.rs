@@ -7,6 +7,7 @@ mod support;
 use rust_decimal::Decimal;
 use support::*;
 use wealthfolio_portfolio_engine::model::*;
+use wealthfolio_portfolio_engine::DiagnosticCode;
 
 /// On every keyframe day, the keyframe's cost basis is the valuation's.
 #[test]
@@ -79,4 +80,56 @@ fx_rates:
     assert_eq!(position.total_cost_basis, Decimal::from(25000));
     assert_eq!(position.cost_basis_account, Some(Decimal::new(3125, 1)));
     assert_eq!(frame.state.cost_basis, Decimal::new(3125, 1));
+}
+
+/// A book cost that converts outside the kernel range is reported as out of
+/// range, by the fold and by the valuation, not as a missing rate: the rate
+/// is there. The lot moves into a USD account, where it has no stored rate.
+#[test]
+fn a_book_cost_out_of_range_is_not_reported_as_a_missing_rate() {
+    let scenario: Scenario = serde_yaml::from_str(
+        r#"
+id: BOOK-RANGE-01
+policy: { base_currency: EUR, timezone: UTC, as_of: 2025-01-08 }
+accounts:
+  - { id: acc-gbp, currency: GBP }
+  - { id: acc-usd, currency: USD }
+assets:
+  - { id: big, quote_ccy: GBP }
+activities:
+  - { id: buy-1, account: acc-gbp, type: BUY, date: 2025-01-03T10:00:00Z, asset: big, quantity: 10000000000, unit_price: 5000000000, amount: "50000000000000000000" }
+  - { id: out-1, account: acc-gbp, type: TRANSFER_OUT, date: 2025-01-06T10:00:00Z, asset: big, quantity: 10000000000, unit_price: 5000000000, source_group_id: g1 }
+  - { id: in-1, account: acc-usd, type: TRANSFER_IN, date: 2025-01-06T11:00:00Z, asset: big, quantity: 10000000000, unit_price: 5000000000, source_group_id: g1 }
+quotes:
+  - { asset: big, day: 2025-01-03, close: 5000000000 }
+fx_rates:
+  - { from: GBP, to: USD, day: 2025-01-02, rate: 2.5 }
+  - { from: GBP, to: EUR, day: 2025-01-02, rate: 1.2 }
+"#,
+    )
+    .expect("scenario");
+    let pipeline = Pipeline::run(scenario.raw_facts()).expect("pipeline");
+
+    let folded: Vec<_> = pipeline
+        .bundle
+        .diagnostics
+        .iter()
+        .filter(|d| d.source == "big" && d.message.ends_with("book cost excluded"))
+        .map(|d| d.code)
+        .collect();
+    assert!(!folded.is_empty(), "the fold reports the book cost");
+    assert!(
+        folded
+            .iter()
+            .all(|code| *code == DiagnosticCode::ValueOutOfRange),
+        "{folded:?}"
+    );
+
+    let valued: Vec<_> = pipeline.series[&AccountId::new("acc-usd")]
+        .diagnostics
+        .iter()
+        .filter(|d| d.source == "acc-usd:basis:big")
+        .map(|d| d.code)
+        .collect();
+    assert_eq!(valued, vec![DiagnosticCode::ValueOutOfRange]);
 }

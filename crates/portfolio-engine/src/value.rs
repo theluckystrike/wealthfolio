@@ -813,11 +813,10 @@ impl<'a> Valuer<'a> {
         }
     }
 
-    /// Book cost in `target`: the precomputed acquisition-FX scalar, else the
-    /// total at the day's FX. Keyframes carry no lots, so a full run and a
-    /// revalue from stored rows convert the same way.
     /// The positions' book cost in `target` (the fold's rule, see
-    /// [`position_book_cost`]); whether every cost converted.
+    /// [`position_book_cost`]); whether every cost converted. Keyframes carry
+    /// no lots, so a full run and a revalue from stored rows convert the same
+    /// way.
     fn cost_basis_in(
         &mut self,
         keyframe: &ValuationKeyframe,
@@ -837,16 +836,13 @@ impl<'a> Valuer<'a> {
                 target,
                 day,
             ) {
-                Some(cost) => total += cost,
-                None => {
+                Ok(cost) => total += cost,
+                Err((code, reason)) => {
                     converted = false;
                     self.report(
-                        DiagnosticCode::FxUnavailable,
+                        code,
                         format!("{}:basis:{asset}", self.account),
-                        format!(
-                            "no {}->{target} rate on {day}; book cost of {asset} unknown",
-                            position.currency
-                        ),
+                        format!("{reason}; book cost of {asset} unknown"),
                     );
                 }
             }
