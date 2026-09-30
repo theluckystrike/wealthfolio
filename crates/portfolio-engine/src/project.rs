@@ -508,6 +508,7 @@ impl Projector<'_> {
         // of copying every position's lots.
         for legs in events.chunk_by(|a, b| a.source == b.source) {
             let savepoint = Savepoint::take(&account, legs.iter().copied());
+            let reported = run.diagnostics.len();
             #[cfg(debug_assertions)]
             let before = account.clone();
             let mut effects = SideEffects::default();
@@ -528,7 +529,10 @@ impl Projector<'_> {
                     }
                 }
                 Err(message) => {
+                    // Nothing the attempt did stays, its warnings included:
+                    // only the rejection is reported.
                     savepoint.restore(&mut account);
+                    run.diagnostics.truncate(reported);
                     let activity = &legs[0].source;
                     #[cfg(debug_assertions)]
                     debug_assert_eq!(account, before, "rejected {activity} left a trace");
