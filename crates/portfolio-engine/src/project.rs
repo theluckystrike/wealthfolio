@@ -135,6 +135,11 @@ pub fn project_accounts(
             .filter(|(_, start)| **start <= day)
             .map(|(id, _)| *id)
             .collect();
+        // Each account folding today, with how far its activities got. The
+        // account is taken out and put back once its day is closed: a day's
+        // fold reads only its own account, so there is no need to copy it.
+        let mut folds: Vec<(&AccountId, &[&EconomicEvent], usize, Option<AccountState>)> =
+            Vec::new();
         for account_id in
             order_by_transfer_dependencies(&eligible, &by_account_day, &facts.transfer_pairs, day)
         {
@@ -147,25 +152,74 @@ pub fn project_accounts(
             if !is_first_day && events.is_empty() {
                 continue;
             }
-            // Taken out and put back below: a day's fold reads only its own
-            // account, so there is no need to copy it.
             let account = state
                 .accounts
                 .remove(account_id)
                 .expect("scoped account has state");
-            let next = if events.is_empty() {
-                account
-            } else {
-                projector.fold_day(account, events, day, &mut state.transfer_cache, &mut run)
-            };
-            keyframes
-                .entry(account_id.clone())
-                .or_default()
-                .push(Keyframe {
-                    date: day,
-                    state: next.without_lots(),
-                });
-            state.accounts.insert(account_id.clone(), next);
+            folds.push((account_id, events, 0, Some(account)));
+        }
+        // Accounts fold in that order, except that one waits at an incoming
+        // security transfer whose outgoing leg another account folds later
+        // today: transfers both ways on one day make the order a cycle, and
+        // lots must leave before they arrive. When every account waits (legs
+        // dated against each other), the first goes on regardless.
+        let today: BTreeSet<&ActivityId> = folds
+            .iter()
+            .flat_map(|(_, events, _, _)| events.iter().map(|e| &e.source))
+            .collect();
+        let mut applied: BTreeSet<&ActivityId> = BTreeSet::new();
+        let mut force = false;
+        while folds.iter().any(|(_, _, _, account)| account.is_some()) {
+            let mut moved = false;
+            for (account_id, events, next, slot) in folds.iter_mut() {
+                let Some(mut account) = slot.take() else {
+                    continue;
+                };
+                let events: &[&EconomicEvent] = events;
+                let end = if std::mem::take(&mut force) {
+                    let source = &events[*next].source;
+                    *next
+                        + events[*next..]
+                            .iter()
+                            .take_while(|e| e.source == *source)
+                            .count()
+                } else {
+                    events[*next..]
+                        .iter()
+                        .position(|e| projector.awaits_outgoing_leg(e, &today, &applied))
+                        .map_or(events.len(), |offset| *next + offset)
+                };
+                if end > *next {
+                    account = projector.apply_activities(
+                        account,
+                        &events[*next..end],
+                        &mut state.transfer_cache,
+                        &mut run,
+                    );
+                    applied.extend(events[*next..end].iter().map(|e| &e.source));
+                    *next = end;
+                    moved = true;
+                }
+                if *next < events.len() {
+                    *slot = Some(account);
+                    continue;
+                }
+                moved = true;
+                let closed = if events.is_empty() {
+                    account
+                } else {
+                    projector.close_day(account, events, day, &mut run)
+                };
+                keyframes
+                    .entry((*account_id).clone())
+                    .or_default()
+                    .push(Keyframe {
+                        date: day,
+                        state: closed.without_lots(),
+                    });
+                state.accounts.insert((*account_id).clone(), closed);
+            }
+            force = !moved;
         }
     }
     state.date = range.end;
@@ -418,11 +472,33 @@ impl Projector<'_> {
             .unwrap_or_else(|| AssetFacts::fallback(asset.clone(), currency.clone()))
     }
 
-    fn fold_day(
+    /// Whether `event` is an incoming security transfer whose outgoing leg
+    /// another account folds today and has not folded yet.
+    fn awaits_outgoing_leg(
+        &self,
+        event: &EconomicEvent,
+        today: &BTreeSet<&ActivityId>,
+        applied: &BTreeSet<&ActivityId>,
+    ) -> bool {
+        matches!(
+            event.action,
+            Action::SecurityTransfer {
+                direction: Direction::In,
+                ..
+            }
+        ) && self.pair(event).is_some_and(|pair| {
+            pair.security
+                && pair.out_account != event.account
+                && today.contains(&pair.transfer_out)
+                && !applied.contains(&pair.transfer_out)
+        })
+    }
+
+    /// Applies the day's activities in order (see [`Self::close_day`]).
+    fn apply_activities(
         &self,
         mut account: AccountState,
         events: &[&EconomicEvent],
-        day: NaiveDate,
         cache: &mut BTreeMap<String, Vec<Lot>>,
         run: &mut RunLog,
     ) -> AccountState {
@@ -464,7 +540,17 @@ impl Projector<'_> {
                 }
             }
         }
+        account
+    }
 
+    /// Closes the day once all its activities are applied.
+    fn close_day(
+        &self,
+        mut account: AccountState,
+        events: &[&EconomicEvent],
+        day: NaiveDate,
+        run: &mut RunLog,
+    ) -> AccountState {
         // Book costs at acquisition FX of the positions the day's events
         // touched (the others keep theirs: acquisition FX does not move with
         // the day), then the account's total by the same rule as valuation,
