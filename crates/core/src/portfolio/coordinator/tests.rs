@@ -134,8 +134,9 @@ async fn harness_with(facts: ScenarioFacts, cadence: WindowCadence) -> Harness {
 impl Harness {
     /// Applies activity changes to the doubles and records what the SQLite
     /// triggers would: each changed row's account from the day before its
-    /// UTC date, and its transfer partners from theirs. `before` holds the
-    /// rows as they were (updates and deletions mark their old date too).
+    /// UTC date, its transfer partners from theirs, and a split's asset.
+    /// `before` holds the rows as they were (updates and deletions mark their
+    /// old date too).
     fn change_activities(
         &self,
         added: Vec<Activity>,
@@ -155,6 +156,9 @@ impl Harness {
         all.extend(changed.iter().cloned());
         for activity in &changed {
             self.mark_activity(activity);
+            if let (Some(asset), "SPLIT") = (&activity.asset_id, activity.effective_type()) {
+                self.store.mark(MarkerScope::Asset(asset.clone()), GENESIS);
+            }
             if let Some(group) = &activity.source_group_id {
                 for partner in all.iter().filter(|a| {
                     a.source_group_id.as_ref() == Some(group) && a.account_id != activity.account_id
@@ -740,6 +744,109 @@ async fn a_new_day_revalues_only_the_new_day() {
     assert_eq!(rows.last().unwrap().valuation_date, tomorrow);
     untouched_before(&rows_before, &rows, tomorrow);
     assert!(harness.coordinator.stale_accounts().unwrap().is_empty());
+}
+
+/// Every account's rows and lots equal those of a fresh run over `facts`.
+async fn assert_matches_a_fresh_rebuild(live: &Harness, facts: &ScenarioFacts, label: &str) {
+    let fresh = harness(facts.clone()).await;
+    fresh
+        .coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    for account in facts.accounts.iter().filter(|a| !a.is_archived) {
+        assert_eq!(
+            normalized_valuations(live.rows(&account.id)),
+            normalized_valuations(fresh.rows(&account.id)),
+            "{label}: valuations of {}",
+            account.id
+        );
+        let incremental = live
+            .lot_repo
+            .get_all_lots_for_account(&account.id)
+            .await
+            .unwrap();
+        let rebuilt = fresh
+            .lot_repo
+            .get_all_lots_for_account(&account.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            format!("{:#?}", normalized_lots(incremental)),
+            format!("{:#?}", normalized_lots(rebuilt)),
+            "{label}: lots of {}",
+            account.id
+        );
+    }
+}
+
+/// A split decides how every earlier close of its asset reads: editing one
+/// revalues its holders from the beginning, not from the split's day.
+#[tokio::test]
+async fn a_split_edit_revalues_its_holders_from_the_beginning() {
+    let scenario = scenario("EDGE-QT-04");
+    let facts = scenario.facts();
+    let live = harness(facts.clone()).await;
+    live.coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+
+    let mut after = facts.clone();
+    let split = after
+        .activities
+        .iter_mut()
+        .find(|a| a.activity_type == "SPLIT")
+        .expect("split");
+    split.amount = Some(rust_decimal_macros::dec!(4));
+    let split = split.clone();
+    live.change_activities(Vec::new(), vec![split], &[], &facts.activities);
+    let report = live
+        .coordinator
+        .ensure_consistent(MarketSyncMode::None, &SilentObserver)
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_matches_a_fresh_rebuild(&live, &after, "split edited").await;
+}
+
+/// An activity dated after today is left out of the fold; the day it comes
+/// due, the account folds it rather than only valuing the new day.
+#[tokio::test]
+async fn a_future_activity_is_folded_when_its_day_comes() {
+    let scenario = scenario("NOM-TRADE-01");
+    let mut facts = scenario.facts();
+    let mut deposit = facts
+        .activities
+        .iter()
+        .find(|a| a.activity_type == "DEPOSIT")
+        .expect("deposit")
+        .clone();
+    deposit.id = "scheduled-deposit".to_string();
+    deposit.activity_date = as_of_instant(facts.as_of, &facts.timezone) + chrono::Duration::days(2);
+    facts.activities.push(deposit);
+    let live = harness(facts.clone()).await;
+    live.coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+
+    let mut later = facts.clone();
+    later.as_of = facts.as_of + chrono::Duration::days(3);
+    crate::utils::clock::set_frozen(as_of_instant(later.as_of, &later.timezone));
+    let report = live
+        .coordinator
+        .ensure_consistent(MarketSyncMode::None, &SilentObserver)
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let account = &facts.accounts[0].id;
+    assert!(
+        matches!(plan_of(&report, account), Some(RebuildPlan::Refold { .. })),
+        "{:?}",
+        plan_of(&report, account)
+    );
+    assert_matches_a_fresh_rebuild(&live, &later, "scheduled deposit due").await;
 }
 
 #[tokio::test]

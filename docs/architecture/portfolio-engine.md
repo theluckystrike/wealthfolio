@@ -136,16 +136,20 @@ the same transaction.
 **Markers.** Triggers write rows of `projection_state`: an account id (its
 activities, accounting settings or observed snapshots changed: refold it),
 `a:<asset>` (the asset's kind, quote currency, instrument type or contract
-multiplier changed: refold its holders), `q:<asset>` (its prices changed:
-revalue its holders), `fx:<asset>` (an FX asset's rates changed) and `@all` (the
-base currency or the timezone changed: refold everything). Each carries the
-first stale day and a version every write bumps. An activity marks its account
-from the day before its UTC date (its local day is within a day of it) and its
-transfer partners from theirs. The projection's own calculated rows mark
+multiplier changed, or one of its splits), `q:<asset>` (its prices changed),
+`fx:<asset>` (an FX asset's rates changed) and `@all` (the base currency or the
+timezone changed). Each carries the first changed day and a version every write
+bumps. An activity marks its account from the day before its UTC date (its local
+day is within a day of it) and its transfer partners from theirs. Markers record
+what changed, never what it affects. The projection's own calculated rows mark
 nothing. The migration starts with `@all` from the beginning, so the first run
 rebuilds everything.
 
-**Plans.** A job maps the markers onto accounts and picks one path per account:
+**Plans.** What a change affects is the kernel's answer, derived from what its
+stages read (`impact`, §4.3): a job turns each marker into the fact change it
+records, adds what only its store knows (an account whose valuations end before
+today, whose valued range therefore grew; an account never valued), and gets
+back one path and first stale day per account:
 
 | Verdict                                                  | Plan        | Work                                                                   |
 | -------------------------------------------------------- | ----------- | ---------------------------------------------------------------------- |
@@ -153,10 +157,17 @@ rebuilds everything.
 | Prices or FX changed, or the day moved                   | **Revalue** | value stored keyframes (or observed snapshots) from the day; rows only |
 | Facts changed (the account, a partner, an asset, policy) | **Refold**  | fold from the first activity; rewrite rows from the day                |
 
-Conversions take the nearest FX observation in either direction, so a changed
-rate reaches back to the day after its pair's previous observation: every
-account revalues from there, and only accounts with activity since then also
-refold (the fold converts on activity days alone).
+The kernel's rules: prices revalue their asset's holders from the day, or from
+the beginning when the close is one of the two around a split (they decide
+whether the provider already adjusted the series, which rescales every earlier
+price). Conversions take the nearest FX observation in either direction, so a
+changed rate reaches back to the day after its pair's previous observation:
+every account revalues from there, and only accounts with activity since then
+also refold (the fold converts on activity days alone). Asset facts and splits
+refold the asset's holders from the beginning. When the day moves, facts dated
+in the new days (a scheduled deposit) were outside the previous range, so their
+account refolds; a split among them revalues its asset's holders from the
+beginning. A refold reaches the account's transfer partners.
 
 Holdings-mode accounts only revalue: their facts are observed snapshots. A
 refold is not resumed from a stored state: folding the refolded accounts (and
@@ -205,7 +216,7 @@ stay visible to pairing so a transfer to or from them classifies correctly.
 crates/portfolio-engine/
 ├── Cargo.toml            # runtime deps: the closed list below
 ├── src/
-│   ├── lib.rs            # public API: Engine, the six stages, facts_needed
+│   ├── lib.rs            # public API: Engine, the six stages, facts_needed, impact
 │   ├── engine.rs         # Engine: normalise, compile, resolve once; derive on request
 │   ├── model/            # scalars, Policy, facts, events, states, reports
 │   ├── normalize.rs      # stage 1: parsing, ordering, transfer pairing
@@ -214,6 +225,7 @@ crates/portfolio-engine/
 │   ├── project.rs        # stage 4: the fold
 │   ├── value.rs          # stage 5: pricing and flow finalisation
 │   ├── measure.rs        # stage 6: returns, attribution, risk
+│   ├── impact.rs         # which stored outputs a change of facts makes stale
 │   └── diagnostics.rs
 └── tests/                # scenarios, goldens, property laws (§5)
 ```
@@ -456,6 +468,16 @@ pub fn lot_records(
     fx: &FxResolver<'_>,
 ) -> Vec<LotRecord>;
 
+/// Which accounts `changes` make stale over the facts as they are now, and
+/// the first day each must be refolded or revalued from (I11). The shell
+/// records changes (an account from a day, an asset, an asset's prices, an
+/// FX rate, the valued range growing, policy), never their consequences.
+pub fn impact(
+    facts: &CanonicalFacts,
+    surfaces: &ResolvedSurfaces,
+    changes: &[FactChange],
+) -> Impact;
+
 /// What the shell must load for a scope and range: assets, currency pairs,
 /// the observation window and the transfer-pair closure, plus the transfer
 /// groups the loaded facts cannot pair yet (load them and ask again). Pure.
@@ -596,6 +618,7 @@ Testable contract; the property suite (§5) encodes each one.
 | **I8**  | **Valuation reconciliation.** Day over day, `Δvalue = flows + event effects + market and FX movement + unreconciled`, where the residual is an explicit diagnostic term, never silently absorbed.                                                                                                                                                                   |
 | **I9**  | **Aggregation.** Portfolio valuation = Σ account valuations for the same day and policy; portfolio flows = account flows net of internal transfers; statuses and provenance combine by their absorption laws.                                                                                                                                                       |
 | **I10** | **Degradation honesty.** Every carried, missing, estimated or fallback input is visible in a status or a diagnostic. No silent zeros, no silent `rate = 1`, no silent currency default, no silent fills.                                                                                                                                                            |
+| **I11** | **Impact soundness.** After a change of facts, a full run differs from the one before only where `impact` says: nothing in an account it does not name, nothing before an account's stale day, and no keyframe, lot or disposal of an account it only revalues (P-IMPACT).                                                                                          |
 
 ### 4.7 Determinism rules
 
@@ -629,8 +652,8 @@ Testable contract; the property suite (§5) encodes each one.
   checkpoint stays byte-identical across machines.
 - FX nearest-neighbour resolution may look forward in time. A valuation is
   deterministic given the surface, and the surface is part of the facts; a
-  late-arriving rate changing history is therefore a recalculation trigger for
-  the shell (the quote marker a rate write leaves), not a kernel concern.
+  late-arriving rate changing history is a change of facts like any other: the
+  shell records the write, and `impact` says how far back it reaches.
 
 ### 4.8 Memory envelope and scoping
 

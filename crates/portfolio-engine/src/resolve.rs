@@ -69,6 +69,20 @@ impl FxSurface {
         self.series.is_empty()
     }
 
+    /// The last observation day of the pair before `before`, from either
+    /// direction (an observation also registers its inverse).
+    pub(crate) fn previous_observation(
+        &self,
+        from: &str,
+        to: &str,
+        before: NaiveDate,
+    ) -> Option<NaiveDate> {
+        self.series
+            .get(&(from.to_string(), to.to_string()))
+            .and_then(|days| days.range(..before).next_back())
+            .map(|(day, _)| *day)
+    }
+
     /// Nearest observation for a direct pair: exact day, else the closer of
     /// the last-before and first-after observations (tie → past), with its
     /// distance in days from `date`.
@@ -316,7 +330,7 @@ impl QuoteSurface {
     }
 
     /// Positive closes by day (split-adjustment heuristic input).
-    fn positive_closes(&self, asset: &AssetId) -> BTreeMap<NaiveDate, Decimal> {
+    pub(crate) fn positive_closes(&self, asset: &AssetId) -> BTreeMap<NaiveDate, Decimal> {
         self.by_asset
             .get(asset)
             .map(|series| {

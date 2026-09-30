@@ -3,7 +3,7 @@
 -- as the fact that changed, so a crash or a killed app never loses it.
 --
 -- scope       an account id: refold the account from dirty_from
---             'a:<asset>': the asset's facts changed, refold its holders
+--             'a:<asset>': the asset's facts or splits changed, refold its holders
 --             'q:<asset>': its prices changed, revalue its holders
 --             'fx:<asset>': an FX rate changed, revalue every account (and refold
 --             those with activity) from the pair's previous observation
@@ -23,7 +23,8 @@ INSERT INTO projection_state (scope, dirty_from, version) VALUES ('@all', '0001-
 
 -- An activity's local business day is within a day of its UTC date, so one day
 -- earlier is always early enough. Its transfer partners' legs (same
--- source_group_id) are dirty from their own dates.
+-- source_group_id) are dirty from their own dates. A split also marks its
+-- asset: it decides how every earlier price of the asset is read.
 CREATE TRIGGER projection_activity_insert AFTER INSERT ON activities
 BEGIN
     INSERT INTO projection_state (scope, dirty_from, version)
@@ -38,6 +39,12 @@ BEGIN
       AND p.account_id <> NEW.account_id
     ON CONFLICT (scope) DO UPDATE SET
         dirty_from = min(coalesce(projection_state.dirty_from, excluded.dirty_from), excluded.dirty_from),
+        version = projection_state.version + 1;
+    INSERT INTO projection_state (scope, dirty_from, version)
+    SELECT 'a:' || NEW.asset_id, '0001-01-01', 1
+    WHERE coalesce(NEW.activity_type_override, NEW.activity_type) = 'SPLIT' AND NEW.asset_id IS NOT NULL
+    ON CONFLICT (scope) DO UPDATE SET
+        dirty_from = '0001-01-01',
         version = projection_state.version + 1;
 END;
 
@@ -62,6 +69,18 @@ BEGIN
     ON CONFLICT (scope) DO UPDATE SET
         dirty_from = min(coalesce(projection_state.dirty_from, excluded.dirty_from), excluded.dirty_from),
         version = projection_state.version + 1;
+    INSERT INTO projection_state (scope, dirty_from, version)
+    SELECT 'a:' || OLD.asset_id, '0001-01-01', 1
+    WHERE coalesce(OLD.activity_type_override, OLD.activity_type) = 'SPLIT' AND OLD.asset_id IS NOT NULL
+    ON CONFLICT (scope) DO UPDATE SET
+        dirty_from = '0001-01-01',
+        version = projection_state.version + 1;
+    INSERT INTO projection_state (scope, dirty_from, version)
+    SELECT 'a:' || NEW.asset_id, '0001-01-01', 1
+    WHERE coalesce(NEW.activity_type_override, NEW.activity_type) = 'SPLIT' AND NEW.asset_id IS NOT NULL
+    ON CONFLICT (scope) DO UPDATE SET
+        dirty_from = '0001-01-01',
+        version = projection_state.version + 1;
 END;
 
 CREATE TRIGGER projection_activity_delete AFTER DELETE ON activities
@@ -77,6 +96,12 @@ BEGIN
     WHERE OLD.source_group_id IS NOT NULL AND p.source_group_id = OLD.source_group_id
     ON CONFLICT (scope) DO UPDATE SET
         dirty_from = min(coalesce(projection_state.dirty_from, excluded.dirty_from), excluded.dirty_from),
+        version = projection_state.version + 1;
+    INSERT INTO projection_state (scope, dirty_from, version)
+    SELECT 'a:' || OLD.asset_id, '0001-01-01', 1
+    WHERE coalesce(OLD.activity_type_override, OLD.activity_type) = 'SPLIT' AND OLD.asset_id IS NOT NULL
+    ON CONFLICT (scope) DO UPDATE SET
+        dirty_from = '0001-01-01',
         version = projection_state.version + 1;
 END;
 

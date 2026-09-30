@@ -679,6 +679,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn split_writes_mark_their_asset() {
+        let db = setup();
+        let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());
+        let clear = || async {
+            store
+                .complete_run(RunCompletion {
+                    consumed: store.pending_markers().unwrap(),
+                    ..RunCompletion::default()
+                })
+                .await
+                .unwrap();
+        };
+        clear().await;
+        sql(
+            &db,
+            "INSERT INTO activities (id, account_id, asset_id, activity_type, status, activity_date, \
+             currency, is_user_modified, needs_review, created_at, updated_at) \
+             VALUES ('buy-1', 'acc1', 'AAPL', 'BUY', 'POSTED', '2025-01-03T15:00:00Z', 'USD', 0, 0, \
+             datetime('now'), datetime('now'))",
+        );
+        assert_eq!(dirty(&db, "a:AAPL"), None, "a trade marks only its account");
+
+        sql(
+            &db,
+            "INSERT INTO activities (id, account_id, asset_id, activity_type, status, activity_date, \
+             currency, is_user_modified, needs_review, created_at, updated_at) \
+             VALUES ('split-1', 'acc1', 'AAPL', 'SPLIT', 'POSTED', '2025-01-20T15:00:00Z', 'USD', 0, 0, \
+             datetime('now'), datetime('now'))",
+        );
+        assert_eq!(dirty(&db, "a:AAPL").as_deref(), Some("0001-01-01"));
+        assert_eq!(dirty(&db, "acc1").as_deref(), Some("2025-01-02"));
+
+        clear().await;
+        sql(
+            &db,
+            "UPDATE activities SET amount = '3' WHERE id = 'split-1'",
+        );
+        assert_eq!(dirty(&db, "a:AAPL").as_deref(), Some("0001-01-01"));
+        clear().await;
+        sql(
+            &db,
+            "UPDATE activities SET activity_type_override = 'SPLIT' WHERE id = 'buy-1'",
+        );
+        assert_eq!(
+            dirty(&db, "a:AAPL").as_deref(),
+            Some("0001-01-01"),
+            "an override to a split"
+        );
+        clear().await;
+        sql(&db, "DELETE FROM activities WHERE id = 'split-1'");
+        assert_eq!(dirty(&db, "a:AAPL").as_deref(), Some("0001-01-01"));
+    }
+
+    #[tokio::test]
     async fn prices_and_fx_rates_mark_their_asset() {
         let db = setup();
         let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());

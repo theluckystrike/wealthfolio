@@ -422,7 +422,7 @@ impl PortfolioCoordinator {
         let resolved = Arc::new(blocking(move || persist::resolve(&job_facts)).await?);
         let plan = run::plan(
             &resolved,
-            &loaded.fx_days,
+            &loaded.fx_pairs,
             &markers,
             &last_valued,
             today,

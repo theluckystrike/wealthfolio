@@ -16,10 +16,7 @@ use crate::portfolio::valuation::DailyAccountValuation;
 
 /// "Recompute everything": the day the triggers write for a change that has
 /// no date (account or asset facts, policy, the first run).
-pub const GENESIS: NaiveDate = match NaiveDate::from_ymd_opt(1, 1, 1) {
-    Some(day) => day,
-    None => panic!("valid date"),
-};
+pub const GENESIS: NaiveDate = wealthfolio_portfolio_engine::BEGINNING;
 
 /// What a marker says is stale.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

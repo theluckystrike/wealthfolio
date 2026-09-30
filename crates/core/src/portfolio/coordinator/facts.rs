@@ -302,9 +302,9 @@ pub struct LoadedFacts {
     /// Facts for the transfer closure of the scope; `raw.quotes` holds only
     /// the closes around split dates.
     pub raw: RawFacts,
-    /// Observation days of each FX asset: how far back a changed rate
-    /// reaches (lookups take the nearest observation either way).
-    pub fx_days: BTreeMap<String, BTreeSet<NaiveDate>>,
+    /// The currency pair of each FX asset with rates, so a marked FX asset
+    /// names the rate that changed.
+    pub fx_pairs: BTreeMap<String, (String, String)>,
     /// Holdings accounts with an observed snapshot outside the supported
     /// date range (account id, date): they fail instead of projecting.
     pub invalid_snapshot_dates: Vec<(String, NaiveDate)>,
@@ -472,13 +472,15 @@ pub fn load(
     }
 
     let fx_rows = deps.fx_rates.get_historical_exchange_rates()?;
-    let mut fx_days: BTreeMap<String, BTreeSet<NaiveDate>> = BTreeMap::new();
-    for rate in &fx_rows {
-        fx_days
-            .entry(rate.id.clone())
-            .or_default()
-            .insert(rate.timestamp.date_naive());
-    }
+    let fx_pairs: BTreeMap<String, (String, String)> = fx_rows
+        .iter()
+        .map(|r| {
+            (
+                r.id.clone(),
+                (r.from_currency.clone(), r.to_currency.clone()),
+            )
+        })
+        .collect();
     let fx_rates: Vec<RawFxRate> = fx_rows
         .iter()
         .map(|r| RawFxRate {
@@ -501,7 +503,7 @@ pub fn load(
 
     Ok(LoadedFacts {
         scope,
-        fx_days,
+        fx_pairs,
         raw: RawFacts {
             policy,
             accounts,

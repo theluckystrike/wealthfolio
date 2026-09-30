@@ -9,10 +9,10 @@ use std::sync::Arc;
 use chrono::NaiveDate;
 use wealthfolio_portfolio_engine as engine;
 use wealthfolio_portfolio_engine::model::{
-    AccountId, AccountState, DateRange, Keyframe, LotClosure, LotDisposal as KernelDisposal,
-    ProjectionBundle, ProjectionState, TrackingMode,
+    AccountId, AccountState, AssetId, DateRange, Keyframe, LotClosure,
+    LotDisposal as KernelDisposal, ProjectionBundle, ProjectionState, TrackingMode,
 };
-use wealthfolio_portfolio_engine::{Diagnostic, DiagnosticCode};
+use wealthfolio_portfolio_engine::{Diagnostic, DiagnosticCode, FactChange};
 
 use super::persist::{self, Resolved, WindowCadence};
 use super::{blocking, facts, AccountPlan, FactSources, RebuildPlan};
@@ -48,164 +48,96 @@ impl Plan {
     }
 }
 
-fn lower(map: &mut BTreeMap<String, NaiveDate>, account: &str, day: NaiveDate) -> bool {
-    match map.get_mut(account) {
-        Some(existing) if *existing <= day => false,
-        Some(existing) => {
-            *existing = day;
-            true
-        }
-        None => {
-            map.insert(account.to_string(), day);
-            true
-        }
-    }
-}
-
-/// Maps the markers onto `targets`: asset markers reach the accounts holding
-/// the asset, an FX rate reaches back to its pair's previous observation, a
-/// refold reaches the account's transfer partners (their lots and flows come
-/// from its legs), and an account whose valuations end before today is
-/// revalued from the next day.
+/// Asks the kernel which targets the markers make stale, each marker being
+/// the change of facts it records. The day moving extends every account
+/// valued before today from the next day; an account with facts but never
+/// valued folds from genesis.
 pub(super) fn plan(
     resolved: &Resolved,
-    fx_days: &BTreeMap<String, BTreeSet<NaiveDate>>,
+    fx_pairs: &BTreeMap<String, (String, String)>,
     markers: &[ProjectionMarker],
     last_valued: &HashMap<String, NaiveDate>,
     today: NaiveDate,
     targets: &[String],
 ) -> Plan {
     let facts = &resolved.facts;
-    let targets: BTreeSet<&str> = targets.iter().map(String::as_str).collect();
-    let holdings = &resolved.assets_by_account;
-    let mut last_activity: BTreeMap<&str, NaiveDate> = BTreeMap::new();
-    for activity in facts.activities() {
-        let last = last_activity
-            .entry(activity.account.as_str())
-            .or_insert(activity.date);
-        *last = (*last).max(activity.date);
-    }
-    let holders = |asset: &str| -> Vec<&str> {
-        targets
-            .iter()
-            .copied()
-            .filter(|t| {
-                holdings
-                    .get(*t)
-                    .is_some_and(|assets| assets.contains(asset))
-            })
-            .collect()
-    };
-
-    let mut plan = Plan::default();
-    for marker in markers {
-        let day = marker.dirty_from;
-        match &marker.scope {
-            MarkerScope::All => {
-                for target in &targets {
-                    lower(&mut plan.refold, target, day);
-                }
-            }
-            MarkerScope::Account(id) if targets.contains(id.as_str()) => {
-                lower(&mut plan.refold, id, day);
-            }
-            MarkerScope::Account(_) => {}
-            MarkerScope::Asset(asset) => {
-                for target in holders(asset) {
-                    lower(&mut plan.refold, target, day);
-                }
-            }
-            MarkerScope::Prices(asset) => {
-                for target in holders(asset) {
-                    lower(&mut plan.revalue, target, day);
-                }
-            }
-            MarkerScope::Fx(asset) => {
-                // Conversions take the nearest observation either way, so a
-                // changed rate reaches back to the day after the pair's
-                // previous one (the quote's day and the rate's UTC day may
-                // differ by one). Valuations convert every day; the fold only
-                // on activity days.
-                let before = day.pred_opt().unwrap_or(day);
-                let from = fx_days
-                    .get(asset)
-                    .and_then(|days| days.range(..before).next_back())
-                    .and_then(|previous| previous.succ_opt())
-                    .unwrap_or(GENESIS)
-                    .min(day);
-                for target in &targets {
-                    lower(&mut plan.revalue, target, from);
-                    if last_activity.get(target).is_some_and(|last| *last >= from) {
-                        lower(&mut plan.refold, target, from);
-                    }
-                }
-            }
-        }
-    }
-    loop {
-        let mut changed = false;
-        for pair in facts.transfer_pairs().iter() {
-            for (from, to) in [
-                (&pair.out_account, &pair.in_account),
-                (&pair.in_account, &pair.out_account),
-            ] {
-                let Some(day) = plan.refold.get(from.as_str()).copied() else {
-                    continue;
-                };
-                if targets.contains(to.as_str()) {
-                    changed |= lower(&mut plan.refold, to.as_str(), day);
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    let has_facts = |account: &str| holdings.contains_key(account);
-    for target in &targets {
-        match last_valued.get(*target) {
+    let mut changes: Vec<FactChange> = markers
+        .iter()
+        .map(|marker| fact_change(marker, fx_pairs))
+        .collect();
+    let has_facts: BTreeSet<&str> = facts
+        .activities()
+        .iter()
+        .map(|a| a.account.as_str())
+        .chain(
+            facts
+                .observed_snapshots()
+                .iter()
+                .map(|s| s.account.as_str()),
+        )
+        .collect();
+    for target in targets {
+        let account = AccountId::new(target.as_str());
+        match last_valued.get(target) {
             Some(last) if *last < today => {
-                if let Some(next) = last.succ_opt() {
-                    lower(&mut plan.revalue, target, next);
+                if let Some(from) = last.succ_opt() {
+                    changes.push(FactChange::Extended { account, from });
                 }
             }
             Some(_) => {}
-            // Never projected: nothing stored to revalue.
-            None if has_facts(target) => {
-                lower(&mut plan.refold, target, GENESIS);
+            None if has_facts.contains(target.as_str()) => {
+                changes.push(FactChange::Account {
+                    account,
+                    from: GENESIS,
+                });
             }
             None => {}
         }
     }
-    let accounts = facts.accounts();
-    let holdings_mode: Vec<String> = plan
-        .refold
-        .keys()
-        .filter(|id| {
-            accounts
-                .get(&AccountId::new(id.as_str()))
-                .is_some_and(|a| a.tracking == TrackingMode::Holdings)
-        })
-        .cloned()
-        .collect();
-    // Holdings-mode accounts never fold: their facts are observed snapshots.
-    for id in holdings_mode {
-        if let Some(day) = plan.refold.remove(&id) {
-            lower(&mut plan.revalue, &id, day);
-        }
+    let impact = engine::impact(facts, &resolved.surfaces, &changes);
+    let targets: BTreeSet<&str> = targets.iter().map(String::as_str).collect();
+    let of_targets = |days: BTreeMap<AccountId, NaiveDate>| -> BTreeMap<String, NaiveDate> {
+        days.into_iter()
+            .filter(|(id, _)| targets.contains(id.as_str()))
+            .map(|(id, day)| (id.as_str().to_string(), day))
+            .collect()
+    };
+    Plan {
+        refold: of_targets(impact.refold),
+        revalue: of_targets(impact.revalue),
     }
-    // A refold rewrites valuations too.
-    let covered: Vec<(String, NaiveDate)> = plan
-        .revalue
-        .iter()
-        .filter(|(id, _)| plan.refold.contains_key(*id))
-        .map(|(id, day)| (id.clone(), *day))
-        .collect();
-    for (id, day) in covered {
-        plan.revalue.remove(&id);
-        lower(&mut plan.refold, &id, day);
+}
+
+/// The change of facts a marker records.
+fn fact_change(
+    marker: &ProjectionMarker,
+    fx_pairs: &BTreeMap<String, (String, String)>,
+) -> FactChange {
+    let day = marker.dirty_from;
+    match &marker.scope {
+        MarkerScope::All => FactChange::Policy,
+        MarkerScope::Account(id) => FactChange::Account {
+            account: AccountId::new(id.as_str()),
+            from: day,
+        },
+        MarkerScope::Asset(asset) => FactChange::Asset {
+            asset: AssetId::new(asset.as_str()),
+        },
+        MarkerScope::Prices(asset) => FactChange::Prices {
+            asset: AssetId::new(asset.as_str()),
+            from: day,
+        },
+        // An FX asset's pair comes from its rates. One left with none (its
+        // last rate deleted) may have moved any conversion.
+        MarkerScope::Fx(asset) => match fx_pairs.get(asset) {
+            Some((from, to)) => FactChange::FxRate {
+                from: from.clone(),
+                to: to.clone(),
+                day,
+            },
+            None => FactChange::Policy,
+        },
     }
-    plan
 }
 
 pub(super) struct RunContext {

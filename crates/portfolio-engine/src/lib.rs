@@ -17,6 +17,7 @@ mod compile;
 mod diagnostics;
 mod engine;
 mod error;
+mod impact;
 mod measure;
 pub mod model;
 mod normalize;
@@ -29,6 +30,7 @@ pub use compile::{compile, CompiledLedger};
 pub use diagnostics::{Diagnostic, DiagnosticCode, Severity};
 pub use engine::Engine;
 pub use error::EngineError;
+pub use impact::{impact, FactChange, Impact, BEGINNING};
 pub use measure::{
     measure_account, measure_price_series, measure_scope, MeasureInputs, MeasureProfile,
 };
