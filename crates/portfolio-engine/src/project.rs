@@ -907,50 +907,22 @@ impl Projector<'_> {
         let mut cash_quantity = quantity;
 
         if info.allows_negative_lots && (!info.requires_explicit_short_intent || close_only) {
-            let short_quantity = negative_effective_abs(position);
-            let close_quantity = quantity.min(short_quantity);
-            let open_quantity = quantity - close_quantity;
+            let closed = self.close_then_open(
+                Side::Buy,
+                event,
+                &account_id,
+                asset,
+                position,
+                quantity,
+                (price, fee, tax, fx_used),
+                !close_only,
+                Some(&book),
+                account_currency.as_str(),
+                effects,
+                run,
+            )?;
             if info.requires_explicit_short_intent {
-                cash_quantity = close_quantity;
-            }
-            if close_quantity > Decimal::ZERO {
-                let close_fee = proportional(fee, close_quantity, quantity)?;
-                let close_tax = proportional(tax, close_quantity, quantity)?;
-                let close_cost = checked(arith::mul(close_quantity, price), "cover cost")?
-                    + close_fee
-                    + close_tax;
-                let reduction = reduce_negative_lots_fifo(position, close_quantity)?;
-                self.record_reduction(
-                    &account_id,
-                    asset,
-                    event,
-                    &reduction,
-                    close_cost,
-                    &position_currency,
-                    effects,
-                    run,
-                )?;
-            }
-            if open_quantity > Decimal::ZERO && !close_only {
-                let open_fee = proportional(fee, open_quantity, quantity)?;
-                let open_tax = proportional(tax, open_quantity, quantity)?;
-                let lot_id = if close_quantity > Decimal::ZERO {
-                    format!("{}:open", event.id)
-                } else {
-                    event.id.as_str().to_string()
-                };
-                open_lot_signed(
-                    position,
-                    lot_id,
-                    open_quantity,
-                    price,
-                    open_fee,
-                    open_tax,
-                    event,
-                    fx_used,
-                    &book,
-                    true,
-                )?;
+                cash_quantity = closed;
             }
         } else {
             add_lot(
@@ -1051,7 +1023,7 @@ impl Projector<'_> {
                 .unwrap_or(Decimal::ZERO);
             let lot_unit_price =
                 effective_unit_price(quantity, gross_abs, unit_price, info.contract_multiplier)?;
-            let (price, fee, tax, fx_used) = self.to_position_currency(
+            let priced = self.to_position_currency(
                 lot_unit_price,
                 event.charges.fee,
                 event.charges.tax,
@@ -1059,54 +1031,20 @@ impl Projector<'_> {
                 position_currency.as_str(),
                 account_currency.as_str(),
             )?;
-            let long_quantity = positive_effective(position);
-            let close_quantity = quantity.min(long_quantity);
-            let open_quantity = quantity - close_quantity;
-            if close_quantity > Decimal::ZERO {
-                let close_fee = proportional(fee, close_quantity, quantity)?;
-                let close_tax = proportional(tax, close_quantity, quantity)?;
-                let close_proceeds = checked(arith::mul(close_quantity, price), "sale proceeds")?
-                    - close_fee
-                    - close_tax;
-                let reduction = reduce_positive_lots_fifo(position, close_quantity)?;
-                self.record_reduction(
-                    &account_id,
-                    asset,
-                    event,
-                    &reduction,
-                    close_proceeds,
-                    &position_currency,
-                    effects,
-                    run,
-                )?;
-            }
-            if open_quantity > Decimal::ZERO && !close_only {
-                let open_fee = proportional(fee, open_quantity, quantity)?;
-                let open_tax = proportional(tax, open_quantity, quantity)?;
-                let lot_id = if close_quantity > Decimal::ZERO {
-                    format!("{}:open", event.id)
-                } else {
-                    event.id.as_str().to_string()
-                };
-                let book = self.lot_book_basis(
-                    event,
-                    position_currency.as_str(),
-                    account_currency.as_str(),
-                    run,
-                );
-                open_lot_signed(
-                    position,
-                    lot_id,
-                    -open_quantity,
-                    price,
-                    open_fee,
-                    open_tax,
-                    event,
-                    fx_used,
-                    &book,
-                    true,
-                )?;
-            }
+            self.close_then_open(
+                Side::Sell,
+                event,
+                &account_id,
+                asset,
+                position,
+                quantity,
+                priced,
+                !close_only,
+                None,
+                account_currency.as_str(),
+                effects,
+                run,
+            )?;
             return Ok(());
         }
 
@@ -1149,6 +1087,96 @@ impl Projector<'_> {
             ));
         }
         Ok(())
+    }
+
+    /// The part of a trade that closes the other side, then the part that
+    /// opens its own: a BUY covers shorts then opens long, a SELL closes
+    /// longs then opens short, the charges split between the two by
+    /// quantity. `book` is the lot basis when the caller has it; otherwise it
+    /// is worked out only if a lot opens. Returns the quantity closed.
+    #[allow(clippy::too_many_arguments)]
+    fn close_then_open(
+        &self,
+        side: Side,
+        event: &EconomicEvent,
+        account_id: &AccountId,
+        asset: &AssetId,
+        position: &mut Position,
+        quantity: Decimal,
+        (price, fee, tax, fx_used): (Decimal, Decimal, Decimal, Option<Decimal>),
+        open: bool,
+        book: Option<&BookBasis>,
+        account_currency: &str,
+        effects: &mut SideEffects,
+        run: &mut RunLog,
+    ) -> Result<Decimal, String> {
+        let position_currency = position.currency.clone();
+        let other_side = match side {
+            Side::Buy => negative_effective_abs(position),
+            Side::Sell => positive_effective(position),
+        };
+        let close_quantity = quantity.min(other_side);
+        let open_quantity = quantity - close_quantity;
+        if close_quantity > Decimal::ZERO {
+            let close_fee = proportional(fee, close_quantity, quantity)?;
+            let close_tax = proportional(tax, close_quantity, quantity)?;
+            // Covering costs the price plus charges; selling brings it in
+            // less them.
+            let (amount, reduction) = match side {
+                Side::Buy => (
+                    checked(arith::mul(close_quantity, price), "cover cost")?
+                        + close_fee
+                        + close_tax,
+                    reduce_negative_lots_fifo(position, close_quantity)?,
+                ),
+                Side::Sell => (
+                    checked(arith::mul(close_quantity, price), "sale proceeds")?
+                        - close_fee
+                        - close_tax,
+                    reduce_positive_lots_fifo(position, close_quantity)?,
+                ),
+            };
+            self.record_reduction(
+                account_id,
+                asset,
+                event,
+                &reduction,
+                amount,
+                &position_currency,
+                effects,
+                run,
+            )?;
+        }
+        if open_quantity > Decimal::ZERO && open {
+            let open_fee = proportional(fee, open_quantity, quantity)?;
+            let open_tax = proportional(tax, open_quantity, quantity)?;
+            let lot_id = if close_quantity > Decimal::ZERO {
+                format!("{}:open", event.id)
+            } else {
+                event.id.as_str().to_string()
+            };
+            let computed;
+            let book = match book {
+                Some(book) => book,
+                None => {
+                    computed = self.lot_book_basis(
+                        event,
+                        position_currency.as_str(),
+                        account_currency,
+                        run,
+                    );
+                    &computed
+                }
+            };
+            let signed = match side {
+                Side::Buy => open_quantity,
+                Side::Sell => -open_quantity,
+            };
+            open_lot_signed(
+                position, lot_id, signed, price, open_fee, open_tax, event, fx_used, book, true,
+            )?;
+        }
+        Ok(close_quantity)
     }
 
     // ------------------------------------------------------------ transfers
