@@ -1139,6 +1139,29 @@ fn priced_events(
         .filter(|a| a.external_transfer == Some(true))
         .map(|a| a.id.as_str())
         .collect();
+    // Transfers that move a short position (both legs of a pair): a short
+    // is a liability, so sending it out is an inflow and receiving it an
+    // outflow. The outgoing leg's disposals carry the sign of what moved.
+    let mut moves_short: BTreeSet<&ActivityId> = BTreeSet::new();
+    for event in &resolved.ledger.events {
+        let Action::SecurityTransfer {
+            direction: Direction::Out,
+            ..
+        } = event.action
+        else {
+            continue;
+        };
+        let mut moved = disposals
+            .iter()
+            .filter(|d| d.event == event.id && !d.quantity.is_zero())
+            .peekable();
+        if moved.peek().is_some() && moved.all(|d| d.quantity.is_sign_negative()) {
+            moves_short.insert(&event.source);
+            if let Some(pair) = facts.transfer_pairs.pair_for(&event.source) {
+                moves_short.insert(&pair.transfer_in);
+            }
+        }
+    }
     let mut valuer = Valuer::new(resolved, disposals, &AccountId::new("effects"), &base);
     let mut diagnostics: BTreeMap<AccountId, Vec<Diagnostic>> = BTreeMap::new();
     let mut events = Vec::with_capacity(resolved.ledger.events.len());
@@ -1172,15 +1195,17 @@ fn priced_events(
                     .cash
                     .as_ref()
                     .is_some_and(|c| c.amount < Decimal::ZERO);
-                let security_direction = match &event.action {
-                    Action::SecurityTransfer { direction, .. } => Some(*direction),
+                let security_outflow = match &event.action {
+                    Action::SecurityTransfer { direction, .. } => {
+                        Some((*direction == Direction::Out) != moves_short.contains(&event.source))
+                    }
                     _ => None,
                 };
                 Some(PricedFlow {
                     amount,
                     source,
-                    outflow: match security_direction {
-                        Some(direction) => direction == Direction::Out,
+                    outflow: match security_outflow {
+                        Some(outflow) => outflow,
                         None => {
                             negative_cash
                                 && matches!(event.flow.value, FlowValue::Cash(_))
@@ -1190,10 +1215,7 @@ fn priced_events(
                     },
                     // A security transfer's direction decides the leg; its
                     // cash leg is only the fee, so the sign must not.
-                    leg_outflow: match security_direction {
-                        Some(direction) => direction == Direction::Out,
-                        None => negative_cash,
-                    },
+                    leg_outflow: security_outflow.unwrap_or(negative_cash),
                 })
             }
         };
