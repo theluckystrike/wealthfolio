@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
+use wealthfolio_portfolio_engine as engine;
 use wealthfolio_portfolio_engine::model::{
     Currency, Policy, RawAccount, RawActivity, RawAsset, RawFacts, RawFxConversion, RawFxRate,
     RawObservedPosition, RawObservedSnapshot, RawQuote,
@@ -164,6 +165,20 @@ impl FactSources {
                 .collect(),
             observed_snapshots: Vec::new(),
         })
+    }
+
+    /// The FX pairs whose two directions disagree in the stored rates.
+    pub fn fx_conflicts(&self) -> Result<Vec<engine::FxConflict>> {
+        let rates = self
+            .fx_rates
+            .get_historical_exchange_rates()?
+            .iter()
+            .map(raw_fx_rate)
+            .collect();
+        Ok(engine::fx_conflicts(&engine::normalize_fx_rates(
+            rates,
+            &mut Vec::new(),
+        )))
     }
 }
 

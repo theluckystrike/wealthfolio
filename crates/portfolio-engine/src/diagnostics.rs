@@ -62,6 +62,9 @@ pub enum DiagnosticCode {
     /// Sell, transfer-out or expiry of more units than held: the held units
     /// were disposed and the excess has no lot.
     InsufficientQuantity,
+    /// A pair observed in both directions on the same days with rates that
+    /// disagree: each direction converts at its own observation.
+    ConflictingFxRates,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 //! Kernel projection persistence: the markers triggers record (see the
 //! `projection_state` migration), windowed row writes, and the end-of-run
-//! commit of lot books, rejections and consumed markers.
+//! commit of lot books, activity issues and consumed markers.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -12,8 +12,8 @@ use diesel::sql_types::{BigInt, Nullable, Text};
 use diesel::sqlite::SqliteConnection;
 use wealthfolio_core::errors::Result;
 use wealthfolio_core::portfolio::projection::{
-    MarkerScope, ProjectionMarker, ProjectionStoreTrait, RejectedActivity, RunCompletion,
-    WindowRows, GENESIS,
+    ActivityIssue, MarkerScope, ProjectionMarker, ProjectionStoreTrait, RunCompletion, WindowRows,
+    GENESIS,
 };
 use wealthfolio_core::portfolio::snapshot::Position;
 
@@ -216,7 +216,7 @@ impl ProjectionStoreTrait for ProjectionStore {
             .collect())
     }
 
-    fn rejections(&self, account_ids: &[String]) -> Result<Vec<RejectedActivity>> {
+    fn activity_issues(&self, account_ids: &[String]) -> Result<Vec<ActivityIssue>> {
         use crate::schema::projection_state::dsl as ps;
         if account_ids.is_empty() {
             return Ok(Vec::new());
@@ -224,12 +224,12 @@ impl ProjectionStoreTrait for ProjectionStore {
         let mut conn = get_connection(&self.pool)?;
         let rows: Vec<String> = ps::projection_state
             .filter(ps::scope.eq_any(account_ids))
-            .select(ps::rejections)
+            .select(ps::activity_issues)
             .load(&mut conn)
             .map_err(StorageError::from)?;
         Ok(rows
             .iter()
-            .flat_map(|row| serde_json::from_str::<Vec<RejectedActivity>>(row).unwrap_or_default())
+            .flat_map(|row| serde_json::from_str::<Vec<ActivityIssue>>(row).unwrap_or_default())
             .collect())
     }
 
@@ -286,13 +286,13 @@ impl ProjectionStoreTrait for ProjectionStore {
                 )
             })
             .collect();
-        let rejections: Vec<(String, String)> = completion
-            .rejections
+        let activity_issues: Vec<(String, String)> = completion
+            .activity_issues
             .iter()
-            .map(|(account, rejected)| {
+            .map(|(account, issues)| {
                 (
                     account.clone(),
-                    serde_json::to_string(rejected).unwrap_or_else(|_| "[]".to_string()),
+                    serde_json::to_string(issues).unwrap_or_else(|_| "[]".to_string()),
                 )
             })
             .collect();
@@ -356,14 +356,14 @@ impl ProjectionStoreTrait for ProjectionStore {
                             .map_err(StorageError::from)?;
                     }
                 }
-                for (account, rejected) in rejections {
+                for (account, issues) in activity_issues {
                     diesel::sql_query(
-                        "INSERT INTO projection_state (scope, dirty_from, version, rejections) \
+                        "INSERT INTO projection_state (scope, dirty_from, version, activity_issues) \
                          VALUES (?, NULL, 0, ?) \
-                         ON CONFLICT (scope) DO UPDATE SET rejections = excluded.rejections",
+                         ON CONFLICT (scope) DO UPDATE SET activity_issues = excluded.activity_issues",
                     )
                     .bind::<Text, _>(&account)
-                    .bind::<Text, _>(&rejected)
+                    .bind::<Text, _>(&issues)
                     .execute(conn)
                     .map_err(StorageError::from)?;
                 }
@@ -414,7 +414,7 @@ mod tests {
     use tempfile::tempdir;
     use wealthfolio_core::lots::{LotDisposal, LotRecord, LotRepositoryTrait};
     use wealthfolio_core::portfolio::economic_events::BasisStatus;
-    use wealthfolio_core::portfolio::projection::LotBook;
+    use wealthfolio_core::portfolio::projection::{ActivityIssueKind, LotBook};
     use wealthfolio_core::portfolio::snapshot::{AccountStateSnapshot, Position, SnapshotSource};
     use wealthfolio_core::portfolio::valuation::{
         DailyAccountValuation, ExternalFlowSource, ValuationRepositoryTrait, ValuationStatus,
@@ -1002,11 +1002,12 @@ mod tests {
                     lots: vec![closed, lot("lot-open")],
                     disposals: vec![early],
                 }],
-                rejections: vec![(
+                activity_issues: vec![(
                     "acc1".to_string(),
-                    vec![RejectedActivity {
+                    vec![ActivityIssue {
                         activity_id: "sell-1".to_string(),
-                        message: "rejected".to_string(),
+                        kind: ActivityIssueKind::Oversold,
+                        message: "oversold".to_string(),
                     }],
                 )],
                 consumed: seen.clone(),
@@ -1015,10 +1016,11 @@ mod tests {
             .unwrap();
         assert!(store.pending_markers().unwrap().is_empty());
         assert_eq!(
-            store.rejections(&["acc1".to_string()]).unwrap(),
-            vec![RejectedActivity {
+            store.activity_issues(&["acc1".to_string()]).unwrap(),
+            vec![ActivityIssue {
                 activity_id: "sell-1".to_string(),
-                message: "rejected".to_string(),
+                kind: ActivityIssueKind::Oversold,
+                message: "oversold".to_string(),
             }]
         );
 
@@ -1040,7 +1042,7 @@ mod tests {
                     lots: vec![lot("lot-open")],
                     disposals: vec![late, orphan],
                 }],
-                rejections: vec![("acc1".to_string(), Vec::new())],
+                activity_issues: vec![("acc1".to_string(), Vec::new())],
                 consumed: stale,
             })
             .await
@@ -1063,7 +1065,10 @@ mod tests {
             .collect();
         disposal_ids.sort();
         assert_eq!(disposal_ids, vec!["d-early", "d-late"]);
-        assert!(store.rejections(&["acc1".to_string()]).unwrap().is_empty());
+        assert!(store
+            .activity_issues(&["acc1".to_string()])
+            .unwrap()
+            .is_empty());
         assert_eq!(
             dirty(&db, "acc1").as_deref(),
             Some("2025-01-04"),

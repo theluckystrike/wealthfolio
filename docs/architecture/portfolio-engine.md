@@ -124,8 +124,8 @@ facts is kernel.
 days); valuations are dense daily rows. The kernel emits the dense series and
 the shell keeps the existing cadence. Lots and disposals are read models derived
 from the same projection state. Rows are written one window at a time (§3.3);
-the lot book, the rejections and the cleared markers are committed together at
-the end of a run.
+the lot book, the activity issues and the cleared markers are committed together
+at the end of a run.
 
 ### 3.3 Recalculation lifecycle
 
@@ -189,9 +189,10 @@ windowed run equal to one run over the range.
 
 **Completion.** After the last window a run commits, in one transaction, the lot
 books of the refolded accounts (open lots and lots closed since the stale day),
-their disposals, the activities the fold rejected, and clears the markers it
-read, each only if its version is unchanged: a fact written during the run keeps
-its marker for the next one. A failed run clears nothing.
+their disposals, what the fold decided about their activities (rejected,
+oversold, posted without an amount), and clears the markers it read, each only
+if its version is unchanged: a fact written during the run keeps its marker for
+the next one. A failed run clears nothing.
 
 **Job discipline.** Jobs run one at a time and are never skipped, so a later
 request always sees the markers left by the facts it was raised for. In-process
@@ -610,6 +611,26 @@ product shows when the inputs are imperfect.
   or below zero are dropped at normalise with a diagnostic instead of being
   used, so a glitch cannot value a position at nothing or a bucket at zero while
   the day reads complete.
+- **Ambiguous data is decided one way, and shown.** Where the facts admit more
+  than one reading, the kernel applies one rule and reports it, and the health
+  center lists what it affected:
+
+  | Ambiguity                                          | Rule                                                         | Reported as                                  | Health center                     |
+  | -------------------------------------------------- | ------------------------------------------------------------ | -------------------------------------------- | --------------------------------- |
+  | Both directions of a pair recorded, disagreeing    | each direction converts at its own rate (a direct rate wins) | `ConflictingFxRates` (beyond 1%)             | `fx_conflicting_rates`            |
+  | A sell, transfer-out or expiry beyond the position | the held units are disposed with their share of the proceeds | `InsufficientQuantity`, `NoPositionToReduce` | `data_oversold_activity`          |
+  | A posted row without a final amount                | no cash is booked                                            | `MissingFinalCash`                           | `data_missing_activity_amount`    |
+  | An activity that cannot apply as recorded          | it contributes nothing, in the fold and in performance       | `ActivityRejected`                           | `data_rejected_activity`          |
+  | A transfer without a valid pair                    | its flow's boundary is unknown and gates returns             | `UnknownTransferBoundary`                    | `transfer_incomplete`             |
+  | A book cost no rate converts                       | left out; the day's basis is partially unknown               | `FxUnavailable`                              | `data_incomplete_valuation_basis` |
+  | Activities at the same instant                     | fold by `created_at`, then id                                | —                                            | —                                 |
+
+  The fold's decisions about activities are stored per account with the
+  projection and replaced on every refold; FX conflicts are read from the stored
+  rates when the health check runs. Same-instant ordering is deterministic but
+  not surfaced: imports routinely share an instant, and the order only matters
+  when a row reduces what another adds, which the oversell rule then reports.
+
 - **Unsupported settings fail loudly.** An account configured for a cost-basis
   method the kernel does not implement fails with a per-account error instead of
   being computed as FIFO and labelled FIFO.

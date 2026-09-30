@@ -14,6 +14,7 @@ use wealthfolio_portfolio_engine::model::{
 
 use crate::lots::{LotDisposal, LotRecord};
 use crate::portfolio::economic_events::BasisStatus;
+use crate::portfolio::projection::ActivityIssueKind;
 use crate::portfolio::valuation::{DailyAccountValuation, ExternalFlowSource, ValuationStatus};
 
 fn decimal(raw: &str) -> Decimal {
@@ -177,8 +178,9 @@ pub fn stored_rejections(
         .collect();
     Ok(sources
         .projections
-        .rejections(&accounts)?
+        .activity_issues(&accounts)?
         .into_iter()
+        .filter(|issue| issue.kind == ActivityIssueKind::Rejected)
         .map(|rejected| wealthfolio_portfolio_engine::model::ActivityId::new(rejected.activity_id))
         .collect())
 }

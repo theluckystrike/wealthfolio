@@ -106,62 +106,22 @@ pub fn normalize(raw: RawFacts) -> Result<Normalized, EngineError> {
 
     let quotes = normalize_quotes(raw.quotes, &assets, &mut diagnostics);
 
-    let mut fx_rates = Vec::with_capacity(raw.fx_rates.len());
-    for rate in raw.fx_rates {
-        match (Currency::parse(&rate.from), Currency::parse(&rate.to)) {
-            // A zero or negative rate would convert every bucket to nothing
-            // (or its inverse to infinity) while reporting Complete.
-            (Some(from), Some(to)) if from != to && rate.rate <= Decimal::ZERO => {
-                diagnostics.push(Diagnostic::warning(
-                    DiagnosticCode::InvalidFxRate,
-                    format!("fx {}/{}@{}", rate.from, rate.to, rate.day),
-                    format!("FX rate {} is not positive; ignored", rate.rate),
-                ));
-            }
-            (Some(from), Some(to))
-                if from != to && (rate.rate < MIN_RATE || rate.rate > MAX_MAGNITUDE) =>
-            {
-                diagnostics.push(Diagnostic::warning(
-                    DiagnosticCode::ValueOutOfRange,
-                    format!("fx {}/{}@{}", rate.from, rate.to, rate.day),
-                    format!("FX rate {} is outside the kernel range; ignored", rate.rate),
-                ));
-            }
-            (Some(from), Some(to)) if from != to => fx_rates.push((
-                source_rank(&rate.source),
-                rate.source,
-                FxObservation {
-                    from,
-                    to,
-                    day: rate.day,
-                    rate: rate.rate,
-                },
-            )),
-            _ => diagnostics.push(Diagnostic::warning(
-                DiagnosticCode::MissingCurrency,
-                format!("fx {}/{}@{}", rate.from, rate.to, rate.day),
-                "FX observation with an empty or identical currency pair; ignored",
-            )),
-        }
+    let fx_rates = normalize_fx_rates(raw.fx_rates, &mut diagnostics);
+    for conflict in fx_conflicts(&fx_rates) {
+        diagnostics.push(Diagnostic::warning(
+            DiagnosticCode::ConflictingFxRates,
+            format!("fx {}/{}", conflict.from, conflict.to),
+            format!(
+                "{from}/{to} and {to}/{from} disagree on {days} day(s) from {first} to {last}; \
+                 each direction converts at its own rate",
+                from = conflict.from,
+                to = conflict.to,
+                days = conflict.days,
+                first = conflict.first_day,
+                last = conflict.last_day,
+            ),
+        ));
     }
-    // One observation per pair and day, chosen like quotes: source rank,
-    // then source name, then value, never by input order.
-    fx_rates.sort_by(|(a_rank, a_source, a), (b_rank, b_source, b)| {
-        a.from
-            .cmp(&b.from)
-            .then_with(|| a.to.cmp(&b.to))
-            .then_with(|| a.day.cmp(&b.day))
-            .then_with(|| a_rank.cmp(b_rank))
-            .then_with(|| a_source.cmp(b_source))
-            .then_with(|| a.rate.cmp(&b.rate))
-    });
-    let mut fx_rates: Vec<FxObservation> = fx_rates
-        .into_iter()
-        .map(|(_, _, observation)| observation)
-        .collect();
-    fx_rates.dedup_by(|later, earlier| {
-        later.from == earlier.from && later.to == earlier.to && later.day == earlier.day
-    });
 
     let mut observed_snapshots = Vec::new();
     for snapshot in raw.observed_snapshots {
@@ -248,6 +208,129 @@ pub fn normalize(raw: RawFacts) -> Result<Normalized, EngineError> {
         },
         diagnostics,
     })
+}
+
+/// FX rows as the surface reads them: pairs of two valid, distinct
+/// currencies with a positive rate in range, one observation per pair and
+/// day (source rank, then source name, then value). Anything else is
+/// reported and ignored.
+pub fn normalize_fx_rates(
+    raw: Vec<RawFxRate>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<FxObservation> {
+    let mut fx_rates = Vec::with_capacity(raw.len());
+    for rate in raw {
+        match (Currency::parse(&rate.from), Currency::parse(&rate.to)) {
+            // A zero or negative rate would convert every bucket to nothing
+            // (or its inverse to infinity) while reporting Complete.
+            (Some(from), Some(to)) if from != to && rate.rate <= Decimal::ZERO => {
+                diagnostics.push(Diagnostic::warning(
+                    DiagnosticCode::InvalidFxRate,
+                    format!("fx {}/{}@{}", rate.from, rate.to, rate.day),
+                    format!("FX rate {} is not positive; ignored", rate.rate),
+                ));
+            }
+            (Some(from), Some(to))
+                if from != to && (rate.rate < MIN_RATE || rate.rate > MAX_MAGNITUDE) =>
+            {
+                diagnostics.push(Diagnostic::warning(
+                    DiagnosticCode::ValueOutOfRange,
+                    format!("fx {}/{}@{}", rate.from, rate.to, rate.day),
+                    format!("FX rate {} is outside the kernel range; ignored", rate.rate),
+                ));
+            }
+            (Some(from), Some(to)) if from != to => fx_rates.push((
+                source_rank(&rate.source),
+                rate.source,
+                FxObservation {
+                    from,
+                    to,
+                    day: rate.day,
+                    rate: rate.rate,
+                },
+            )),
+            _ => diagnostics.push(Diagnostic::warning(
+                DiagnosticCode::MissingCurrency,
+                format!("fx {}/{}@{}", rate.from, rate.to, rate.day),
+                "FX observation with an empty or identical currency pair; ignored",
+            )),
+        }
+    }
+    // One observation per pair and day, chosen like quotes: source rank,
+    // then source name, then value, never by input order.
+    fx_rates.sort_by(|(a_rank, a_source, a), (b_rank, b_source, b)| {
+        a.from
+            .cmp(&b.from)
+            .then_with(|| a.to.cmp(&b.to))
+            .then_with(|| a.day.cmp(&b.day))
+            .then_with(|| a_rank.cmp(b_rank))
+            .then_with(|| a_source.cmp(b_source))
+            .then_with(|| a.rate.cmp(&b.rate))
+    });
+    let mut fx_rates: Vec<FxObservation> = fx_rates
+        .into_iter()
+        .map(|(_, _, observation)| observation)
+        .collect();
+    fx_rates.dedup_by(|later, earlier| {
+        later.from == earlier.from && later.to == earlier.to && later.day == earlier.day
+    });
+    fx_rates
+}
+
+/// Relative gap between a rate and the inverse of the opposite direction's
+/// rate on the same day above which the two disagree (provider timing
+/// differences stay well below it).
+pub const FX_CONFLICT_TOLERANCE: Decimal = Decimal::from_parts(1, 0, 0, false, 2);
+
+/// A pair observed in both directions on `days` days whose rates disagree
+/// beyond [`FX_CONFLICT_TOLERANCE`]. The surface converts each direction at
+/// its own observation (a direct rate is never replaced by the inverse of
+/// the other), so conversions one way and back do not round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FxConflict {
+    /// The pair, its currencies in code order.
+    pub from: Currency,
+    pub to: Currency,
+    pub days: usize,
+    pub first_day: NaiveDate,
+    pub last_day: NaiveDate,
+}
+
+/// The pairs whose two directions disagree, from normalised observations.
+pub fn fx_conflicts(observations: &[FxObservation]) -> Vec<FxConflict> {
+    let rates: BTreeMap<(&str, &str, NaiveDate), Decimal> = observations
+        .iter()
+        .map(|o| ((o.from.as_str(), o.to.as_str(), o.day), o.rate))
+        .collect();
+    let mut conflicts: BTreeMap<(&str, &str), FxConflict> = BTreeMap::new();
+    for observation in observations {
+        let (from, to) = (observation.from.as_str(), observation.to.as_str());
+        if from > to {
+            continue;
+        }
+        let Some(opposite) = rates.get(&(to, from, observation.day)) else {
+            continue;
+        };
+        let round_trip = crate::arith::mul(observation.rate, *opposite);
+        if round_trip.is_some_and(|r| (r - Decimal::ONE).abs() <= FX_CONFLICT_TOLERANCE) {
+            continue;
+        }
+        conflicts
+            .entry((from, to))
+            .and_modify(|c| {
+                c.days += 1;
+                c.first_day = c.first_day.min(observation.day);
+                c.last_day = c.last_day.max(observation.day);
+            })
+            .or_insert_with(|| FxConflict {
+                from: observation.from.clone(),
+                to: observation.to.clone(),
+                days: 1,
+                first_day: observation.day,
+                last_day: observation.day,
+            });
+    }
+    conflicts.into_values().collect()
 }
 
 fn is_posted(status: &str) -> bool {

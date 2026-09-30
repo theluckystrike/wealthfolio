@@ -1730,8 +1730,8 @@ fn _assert_instrument_type_in_scope(_: Option<InstrumentType>) {}
 // ------------------------------------------------------------ projections
 
 use crate::portfolio::projection::{
-    MarkerScope, ProjectionMarker, ProjectionStoreTrait, RejectedActivity, RunCompletion,
-    WindowRows, GENESIS,
+    ActivityIssue, MarkerScope, ProjectionMarker, ProjectionStoreTrait, RunCompletion, WindowRows,
+    GENESIS,
 };
 use std::sync::Arc;
 
@@ -1739,7 +1739,7 @@ use std::sync::Arc;
 struct MarkerRow {
     dirty_from: Option<NaiveDate>,
     version: i64,
-    rejections: Vec<RejectedActivity>,
+    activity_issues: Vec<ActivityIssue>,
 }
 
 /// Projection store over the other doubles (not transactional; tests only).
@@ -1844,12 +1844,12 @@ impl ProjectionStoreTrait for InMemoryProjectionStore {
         Ok(days)
     }
 
-    fn rejections(&self, account_ids: &[String]) -> Result<Vec<RejectedActivity>> {
+    fn activity_issues(&self, account_ids: &[String]) -> Result<Vec<ActivityIssue>> {
         let markers = self.markers.read().unwrap_or_else(|p| p.into_inner());
         Ok(account_ids
             .iter()
             .filter_map(|id| markers.get(id))
-            .flat_map(|row| row.rejections.clone())
+            .flat_map(|row| row.activity_issues.clone())
             .collect())
     }
 
@@ -1925,8 +1925,8 @@ impl ProjectionStoreTrait for InMemoryProjectionStore {
                 .await?;
         }
         let mut markers = self.markers.write().unwrap_or_else(|p| p.into_inner());
-        for (account, rejected) in completion.rejections {
-            markers.entry(account).or_default().rejections = rejected;
+        for (account, issues) in completion.activity_issues {
+            markers.entry(account).or_default().activity_issues = issues;
         }
         for marker in completion.consumed {
             let key = marker.scope.key();

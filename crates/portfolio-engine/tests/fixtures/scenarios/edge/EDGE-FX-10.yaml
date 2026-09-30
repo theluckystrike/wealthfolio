@@ -26,4 +26,6 @@ fx_rates:
   - { from: USD, to: CAD, day: 2025-01-03, rate: 1.25 }
 expected_notes: >
   Total value 1000 CAD both days; 01-02 fx_rate_to_base 0.7, base 700;
-  01-03 fx_rate_to_base 0.8, base 800. Complete, no diagnostics.
+  01-03 fx_rate_to_base 0.8, base 800. Complete. The 01-02 directions
+  disagree (0.70 x 1.30 = 0.91), so one ConflictingFxRates warning names the
+  pair and that day.

@@ -34,7 +34,10 @@ pub use impact::{impact, FactChange, Impact, BEGINNING};
 pub use measure::{
     measure_account, measure_price_series, measure_scope, MeasureInputs, MeasureProfile,
 };
-pub use normalize::{normalize, normalize_quotes, Normalized};
+pub use normalize::{
+    fx_conflicts, normalize, normalize_fx_rates, normalize_quotes, FxConflict, Normalized,
+    FX_CONFLICT_TOLERANCE,
+};
 pub use project::lot_records;
 pub use project::{project, project_accounts};
 pub use resolve::{

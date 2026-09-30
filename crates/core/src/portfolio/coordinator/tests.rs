@@ -10,7 +10,7 @@ use crate::activities::{Activity, ActivityRepositoryTrait};
 use crate::assets::AssetRepositoryTrait;
 use crate::fx::{FxRepositoryTrait, FxService};
 use crate::lots::LotRepositoryTrait;
-use crate::portfolio::projection::GENESIS;
+use crate::portfolio::projection::{ActivityIssueKind, GENESIS};
 use crate::portfolio::snapshot::{
     AccountStateSnapshot, SnapshotRepositoryTrait, SnapshotService, SnapshotSource,
 };
@@ -1172,12 +1172,61 @@ async fn rejected_activities_are_stored_for_the_read_path() {
         .await
         .unwrap();
     assert!(report.failures.is_empty(), "{:?}", report.failures);
-    let rejected = harness
+    let rejected: Vec<_> = harness
         .projections
-        .rejections(std::slice::from_ref(&account))
-        .unwrap();
+        .activity_issues(std::slice::from_ref(&account))
+        .unwrap()
+        .into_iter()
+        .filter(|issue| issue.kind == ActivityIssueKind::Rejected)
+        .collect();
     assert_eq!(rejected.len(), 1, "{rejected:?}");
     assert_eq!(rejected[0].activity_id, "drip-1");
+}
+
+/// The health check reads what the fold decided: an oversell (EDGE-POS-04),
+/// a row without an amount (NOM-CASH-04), and the FX directions that
+/// disagree (EDGE-FX-10).
+#[tokio::test]
+async fn the_health_view_reports_the_engine_decisions() {
+    use crate::portfolio::coordinator::ProjectionFreshnessTrait;
+    let kinds = |id: &str| {
+        let id = id.to_string();
+        async move {
+            let harness = harness(scenario(&id).facts()).await;
+            let report = harness
+                .coordinator
+                .run_job(request(), &SilentObserver)
+                .await
+                .unwrap();
+            assert!(report.failures.is_empty(), "{:?}", report.failures);
+            let mut kinds: Vec<(String, ActivityIssueKind)> = harness
+                .coordinator
+                .activity_issues()
+                .unwrap()
+                .into_iter()
+                .map(|issue| (issue.activity_id, issue.kind))
+                .collect();
+            kinds.sort_by(|a, b| a.0.cmp(&b.0));
+            (kinds, harness.coordinator.fx_conflicts().unwrap())
+        }
+    };
+    let (oversold, _) = kinds("EDGE-POS-04").await;
+    assert!(
+        oversold
+            .iter()
+            .any(|(_, kind)| *kind == ActivityIssueKind::Oversold),
+        "{oversold:?}"
+    );
+    let (no_amount, _) = kinds("NOM-CASH-04").await;
+    assert!(
+        no_amount
+            .iter()
+            .any(|(_, kind)| *kind == ActivityIssueKind::MissingAmount),
+        "{no_amount:?}"
+    );
+    let (_, conflicts) = kinds("EDGE-FX-10").await;
+    assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+    assert_eq!(conflicts[0].days, 1);
 }
 
 fn manual_snapshot(account_id: &str, date: chrono::NaiveDate) -> AccountStateSnapshot {

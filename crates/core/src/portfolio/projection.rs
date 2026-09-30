@@ -72,12 +72,29 @@ pub struct ProjectionMarker {
     pub version: i64,
 }
 
-/// An activity the last run rejected: it contributed nothing to the stored
-/// rows, and performance leaves it out too.
+/// What the last fold of an account had to decide about one of its
+/// activities (architecture §4.5), kept for the read path and the health
+/// center.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ActivityIssueKind {
+    /// Rejected: it contributed nothing to the stored rows, and performance
+    /// leaves it out too.
+    #[default]
+    Rejected,
+    /// Reduced more units than were held: the held units were disposed and
+    /// the rest has no lot.
+    Oversold,
+    /// Posted without a final amount: it booked no cash.
+    MissingAmount,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RejectedActivity {
+pub struct ActivityIssue {
     pub activity_id: String,
+    #[serde(default)]
+    pub kind: ActivityIssueKind,
     pub message: String,
 }
 
@@ -108,8 +125,8 @@ pub struct LotBook {
 #[derive(Debug, Clone, Default)]
 pub struct RunCompletion {
     pub lot_books: Vec<LotBook>,
-    /// Refolded accounts' rejections, replacing the stored list.
-    pub rejections: Vec<(String, Vec<RejectedActivity>)>,
+    /// Refolded accounts' activity issues, replacing the stored list.
+    pub activity_issues: Vec<(String, Vec<ActivityIssue>)>,
     /// Markers the run consumed; each clears only if its version is unchanged.
     pub consumed: Vec<ProjectionMarker>,
 }
@@ -122,13 +139,14 @@ pub trait ProjectionStoreTrait: Send + Sync {
     /// The latest stored valuation day of every account that has one.
     fn last_valued_days(&self) -> Result<HashMap<String, NaiveDate>>;
 
-    /// Stored rejections of the accounts.
-    fn rejections(&self, account_ids: &[String]) -> Result<Vec<RejectedActivity>>;
+    /// Stored activity issues of the accounts.
+    fn activity_issues(&self, account_ids: &[String]) -> Result<Vec<ActivityIssue>>;
 
     /// Replaces the rows of one window, every account in one transaction.
     async fn write_window(&self, rows: Vec<WindowRows>) -> Result<()>;
 
-    /// Writes the lot books and rejections and clears the consumed markers.
+    /// Writes the lot books and activity issues and clears the consumed
+    /// markers.
     async fn complete_run(&self, completion: RunCompletion) -> Result<()>;
 
     /// Marks `scope` stale from `from` (a forced rebuild, synced facts).

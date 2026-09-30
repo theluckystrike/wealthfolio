@@ -29,9 +29,9 @@ use wealthfolio_core::{
     },
     health::{
         checks::{
-            AssetHoldingInfo, ConsistencyIssueInfo, FxPairInfo, InvalidTransferGroupInfo,
-            LegacyMigrationInfo, QuoteSyncErrorInfo, UnclassifiedAssetInfo,
-            UnconfiguredAccountInfo,
+            AssetHoldingInfo, ConsistencyIssueInfo, FxConflictInfo, FxPairInfo,
+            InvalidTransferGroupInfo, LegacyMigrationInfo, QuoteSyncErrorInfo,
+            UnclassifiedAssetInfo, UnconfiguredAccountInfo,
         },
         FixAction, HealthConfig, HealthServiceTrait, HealthStatus,
     },
@@ -1755,6 +1755,7 @@ impl HealthServiceTrait for MockHealthService {
         _latest_quote_times: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
         _quote_sync_errors: &[QuoteSyncErrorInfo],
         _fx_pairs: &[FxPairInfo],
+        _fx_conflicts: &[FxConflictInfo],
         _unclassified_assets: &[UnclassifiedAssetInfo],
         _consistency_issues: &[ConsistencyIssueInfo],
         _legacy_migration_info: &Option<LegacyMigrationInfo>,

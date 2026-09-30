@@ -110,7 +110,8 @@ baseline:
           total_value: "1000"
           total_value_base: "800"
           value_status: complete
-  diagnostics: []
+  diagnostics:
+    - "normalize/fx CAD/USD: Warning ConflictingFxRates: CAD/USD and USD/CAD disagree on 1 day(s) from 2025-01-02 to 2025-01-02; each direction converts at its own rate"
   portfolio:
     all_time:
       attribution:

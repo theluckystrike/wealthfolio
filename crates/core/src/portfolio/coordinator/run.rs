@@ -19,8 +19,8 @@ use super::{blocking, facts, AccountPlan, FactSources, RebuildPlan};
 use crate::errors::Result;
 use crate::lots::{LotDisposal, LotRepositoryTrait};
 use crate::portfolio::projection::{
-    LotBook, MarkerScope, ProjectionMarker, ProjectionStoreTrait, RejectedActivity, RunCompletion,
-    WindowRows, GENESIS,
+    ActivityIssue, ActivityIssueKind, LotBook, MarkerScope, ProjectionMarker, ProjectionStoreTrait,
+    RunCompletion, WindowRows, GENESIS,
 };
 use crate::portfolio::snapshot::SnapshotSource;
 
@@ -190,11 +190,30 @@ pub(super) async fn execute(context: &RunContext, plan: &Plan) -> Result<RunComp
         .iter()
         .map(|a| (a.id.as_str().to_string(), a.account.as_str().to_string()))
         .collect();
-    let mut rejections: BTreeMap<String, Vec<RejectedActivity>> = plan
+    let mut activity_issues: BTreeMap<String, Vec<ActivityIssue>> = plan
         .refold
         .keys()
         .map(|account| (account.clone(), Vec::new()))
         .collect();
+    let mut record = |diagnostic: &Diagnostic| {
+        let Some(kind) = issue_kind(diagnostic.code) else {
+            return;
+        };
+        let Some(account) = owner.get(&diagnostic.source) else {
+            return;
+        };
+        if let Some(list) = activity_issues.get_mut(account) {
+            list.push(ActivityIssue {
+                activity_id: diagnostic.source.clone(),
+                kind,
+                message: diagnostic.message.clone(),
+            });
+        }
+    };
+    // Compiling decides the cash of rows without a final amount.
+    for diagnostic in &resolved.ledger.diagnostics {
+        record(diagnostic);
+    }
     let mut disposals: BTreeMap<String, Vec<KernelDisposal>> = BTreeMap::new();
     let mut closures: Vec<LotClosure> = Vec::new();
     let mut state: Option<ProjectionState> = None;
@@ -238,16 +257,8 @@ pub(super) async fn execute(context: &RunContext, plan: &Plan) -> Result<RunComp
         let Some(folded) = output.folded else {
             continue;
         };
-        for diagnostic in folded.rejections {
-            let Some(account) = owner.get(&diagnostic.source) else {
-                continue;
-            };
-            if let Some(list) = rejections.get_mut(account) {
-                list.push(RejectedActivity {
-                    activity_id: diagnostic.source,
-                    message: diagnostic.message,
-                });
-            }
+        for diagnostic in &folded.issues {
+            record(diagnostic);
         }
         for disposal in folded.disposals {
             if plan
@@ -311,7 +322,7 @@ pub(super) async fn execute(context: &RunContext, plan: &Plan) -> Result<RunComp
             disposals: persist::disposal_rows(&resolved, &own, account),
         });
     }
-    completion.rejections = rejections.into_iter().collect();
+    completion.activity_issues = activity_issues.into_iter().collect();
     Ok(completion)
 }
 
@@ -420,8 +431,9 @@ async fn stored_inputs(
         disposals: super::rows::stored_disposals(&stored_disposals),
         rejected: context
             .projections
-            .rejections(&ids)?
+            .activity_issues(&ids)?
             .into_iter()
+            .filter(|issue| issue.kind == ActivityIssueKind::Rejected)
             .map(|r| Diagnostic::error(DiagnosticCode::ActivityRejected, r.activity_id, r.message))
             .collect(),
     })
@@ -437,7 +449,20 @@ struct Folded {
     keyframed: Vec<AccountId>,
     disposals: Vec<KernelDisposal>,
     closures: Vec<LotClosure>,
-    rejections: Vec<Diagnostic>,
+    /// The fold's diagnostics about activities (see [`issue_kind`]).
+    issues: Vec<Diagnostic>,
+}
+
+/// The activity issue a kernel diagnostic records, if it is one.
+fn issue_kind(code: DiagnosticCode) -> Option<ActivityIssueKind> {
+    match code {
+        DiagnosticCode::ActivityRejected => Some(ActivityIssueKind::Rejected),
+        DiagnosticCode::InsufficientQuantity | DiagnosticCode::NoPositionToReduce => {
+            Some(ActivityIssueKind::Oversold)
+        }
+        DiagnosticCode::MissingFinalCash => Some(ActivityIssueKind::MissingAmount),
+        _ => None,
+    }
 }
 
 impl Folded {
@@ -449,10 +474,10 @@ impl Folded {
                 .filter(|(_, frames)| !frames.is_empty())
                 .map(|(id, _)| id.clone())
                 .collect(),
-            rejections: bundle
+            issues: bundle
                 .diagnostics
                 .iter()
-                .filter(|d| d.code == DiagnosticCode::ActivityRejected)
+                .filter(|d| issue_kind(d.code).is_some())
                 .cloned()
                 .collect(),
             final_state: bundle.final_state,

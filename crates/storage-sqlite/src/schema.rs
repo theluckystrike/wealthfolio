@@ -297,7 +297,7 @@ diesel::table! {
         scope -> Text,
         dirty_from -> Nullable<Text>,
         version -> BigInt,
-        rejections -> Text,
+        activity_issues -> Text,
     }
 }
 

@@ -25,7 +25,9 @@ use wealthfolio_portfolio_engine as engine;
 use crate::errors::{Error, Result};
 use crate::fx::FxServiceTrait;
 use crate::lots::LotRepositoryTrait;
-use crate::portfolio::projection::{MarkerScope, ProjectionStoreTrait, GENESIS};
+use crate::portfolio::projection::{
+    ActivityIssue, ActivityIssueKind, MarkerScope, ProjectionStoreTrait, GENESIS,
+};
 use crate::portfolio::snapshot::{
     reconcile_quote_sync_from_latest_account_snapshots, SnapshotServiceTrait,
 };
@@ -150,10 +152,18 @@ pub enum StaleReason {
     DayAdvanced,
 }
 
-/// Read-only freshness view for the health check.
+/// Read-only view of the projection for the health check: freshness, and
+/// what the engine had to decide about ambiguous data.
 #[async_trait]
 pub trait ProjectionFreshnessTrait: Send + Sync {
     fn stale_accounts(&self) -> Result<Vec<StaleAccount>>;
+
+    /// What the last folds decided about activities of the non-archived
+    /// accounts (rejected, oversold, posted without an amount).
+    fn activity_issues(&self) -> Result<Vec<ActivityIssue>>;
+
+    /// FX pairs whose two directions disagree in the stored rates.
+    fn fx_conflicts(&self) -> Result<Vec<engine::FxConflict>>;
 }
 
 pub struct CoordinatorDeps {
@@ -440,11 +450,14 @@ impl PortfolioCoordinator {
         };
         match run::execute(&context, &plan).await {
             Ok(completion) => {
-                for (account, rejected) in &completion.rejections {
-                    for activity in rejected {
+                for (account, issues) in &completion.activity_issues {
+                    for issue in issues
+                        .iter()
+                        .filter(|i| i.kind == ActivityIssueKind::Rejected)
+                    {
                         warn!(
                             "Portfolio engine rejected activity {} of account {account}",
-                            activity.activity_id
+                            issue.activity_id
                         );
                     }
                 }
@@ -622,6 +635,16 @@ fn failures_for(account_ids: &[String], code: &str, message: &str) -> Vec<Accoun
 impl ProjectionFreshnessTrait for PortfolioCoordinator {
     fn stale_accounts(&self) -> Result<Vec<StaleAccount>> {
         PortfolioCoordinator::stale_accounts(self)
+    }
+
+    fn activity_issues(&self) -> Result<Vec<ActivityIssue>> {
+        self.deps
+            .projections
+            .activity_issues(&self.non_archived_account_ids()?)
+    }
+
+    fn fx_conflicts(&self) -> Result<Vec<engine::FxConflict>> {
+        self.deps.sources.fx_conflicts()
     }
 }
 

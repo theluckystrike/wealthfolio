@@ -10,12 +10,13 @@
 --             '@all': policy changed, refold every account
 -- dirty_from  first local day to recompute; NULL once the projection is clean
 -- version     bumped by every write, so a job only clears what it has seen
--- rejections  account rows: activities the last run rejected (JSON)
+-- activity_issues  account rows: what the last fold decided about activities
+--             (rejected, oversold, missing amount; JSON)
 CREATE TABLE projection_state (
     scope TEXT PRIMARY KEY NOT NULL,
     dirty_from TEXT,
     version INTEGER NOT NULL DEFAULT 0,
-    rejections TEXT NOT NULL DEFAULT '[]'
+    activity_issues TEXT NOT NULL DEFAULT '[]'
 );
 
 -- Nothing is projected yet: the first run rebuilds every account.
