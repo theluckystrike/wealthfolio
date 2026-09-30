@@ -178,17 +178,6 @@ pub async fn recalculate_portfolio(handle: AppHandle, state: ProfileAccess) -> R
     Ok(())
 }
 
-/// Cold-start consistency pass, requested by the frontend once its event
-/// listeners are live: market sync plus a rebuild of whatever is stale.
-#[tauri::command]
-pub async fn ensure_portfolio_consistent(
-    handle: AppHandle,
-    state: ProfileAccess,
-) -> Result<(), String> {
-    crate::listeners::request_consistency_pass(handle, state.context()?);
-    Ok(())
-}
-
 #[tauri::command]
 pub async fn update_portfolio(handle: AppHandle, state: ProfileAccess) -> Result<(), String> {
     let context = state.context()?;

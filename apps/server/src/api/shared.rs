@@ -16,7 +16,7 @@ use wealthfolio_core::{
     accounts::{account_supports_portfolio_scope, AccountPurpose, AccountServiceTrait},
     health::HealthServiceTrait,
     portfolio::coordinator::{
-        run_periodic_consistency, AccountFailure, JobObserver, PortfolioJobRequest, RetryPolicy,
+        run_periodic_update, AccountFailure, JobObserver, PortfolioJobRequest, RetryPolicy,
     },
     quotes::{MarketSyncMode, SyncResult},
 };
@@ -241,24 +241,24 @@ pub async fn process_portfolio_job(
     Ok(())
 }
 
-/// One consistency pass (architecture §3.3): sync market data, then rebuild whatever
-/// the check finds stale. Requested at server start, by each web client
-/// once its event stream is live, and by the periodic scheduler.
-pub fn enqueue_consistency_pass(state: Arc<AppState>) {
+/// Portfolio update at server start (architecture §3.3): sync market data,
+/// then bring whatever is stale up to date, so a web client finds it current.
+pub fn spawn_portfolio_update(state: Arc<AppState>) {
     tokio::spawn(async move {
         let observer = ServerJobObserver::new(&state);
         state
             .portfolio_coordinator
-            .ensure_consistent_or_report(MarketSyncMode::Incremental { asset_ids: None }, &observer)
+            .update_all(MarketSyncMode::Incremental { asset_ids: None }, &observer)
             .await;
     });
 }
 
-/// Periodic market sync plus consistency pass (6h, after a 2min delay). The
-/// handle joins the profile's workers so the loop stops with its profile.
-pub fn spawn_periodic_consistency(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+/// The app's periodic market sync plus portfolio update (6h, after a 2min
+/// delay). The handle joins the profile's workers so the loop stops with its
+/// profile.
+pub fn spawn_periodic_update(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     let observer: Arc<dyn JobObserver> = Arc::new(ServerJobObserver::new(&state));
-    tokio::spawn(run_periodic_consistency(
+    tokio::spawn(run_periodic_update(
         state.portfolio_coordinator.clone(),
         observer,
         std::time::Duration::from_secs(120),

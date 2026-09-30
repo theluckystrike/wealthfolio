@@ -101,7 +101,7 @@ lifecycle:                  # LIFE family: mutate facts, rerun legacy recalc mod
     recalc: { snapshots: SINCE_DATE, valuations: SINCE_DATE, since: 2025-01-15 }
                             # legacy recalculation modes, kept as documentation of the
                             # oracle's run; the coordinator runner applies the step's
-                            # facts and runs the consistency pass (every run rebuilds
+                            # facts and runs the portfolio update (every run rebuilds
                             # from genesis), then compares with a fresh full run.
 expected_notes: >
   Human-readable economics the golden must show. Reviewed, not machine-checked.

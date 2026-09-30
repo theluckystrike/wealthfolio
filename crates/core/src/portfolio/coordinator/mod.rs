@@ -531,10 +531,8 @@ impl PortfolioCoordinator {
         Ok(stale)
     }
 
-    /// Consistency pass (architecture §3.3), run at start-up, on resume and
-    /// after every periodic market sync: sync if asked, then bring every
-    /// stale account up to date. Nothing stale costs two small reads.
-    pub async fn ensure_consistent(
+    /// [`Self::update_all`], returning the failure of the job itself.
+    async fn try_update_all(
         &self,
         market_sync: MarketSyncMode,
         observer: &dyn JobObserver,
@@ -564,17 +562,20 @@ pub(crate) async fn blocking<T: Send + 'static>(
 }
 
 impl PortfolioCoordinator {
-    /// `ensure_consistent` for hosts: a failure of the pass itself reaches
-    /// the observer as a `JOB_FAILED` failure instead of only a log line.
-    pub async fn ensure_consistent_or_report(
+    /// Portfolio update (architecture §3.3), run at start-up, on resume and
+    /// by the periodic market sync: sync if asked, then bring every stale
+    /// account up to date; nothing stale costs two small reads. A failure of
+    /// the job itself reaches the observer as a `JOB_FAILED` failure instead
+    /// of only a log line, so hosts get a report either way.
+    pub async fn update_all(
         &self,
         market_sync: MarketSyncMode,
         observer: &dyn JobObserver,
     ) -> PortfolioJobReport {
-        match self.ensure_consistent(market_sync, observer).await {
+        match self.try_update_all(market_sync, observer).await {
             Ok(report) => report,
             Err(err) => {
-                error!("Portfolio consistency pass failed: {err}");
+                error!("Portfolio update failed: {err}");
                 let failure = AccountFailure {
                     account_id: String::new(),
                     code: "JOB_FAILED".to_string(),
@@ -590,10 +591,10 @@ impl PortfolioCoordinator {
     }
 }
 
-/// Periodic market sync plus consistency pass, shared by both hosts: after
+/// The app's periodic market sync, shared by both hosts: after
 /// `initial_delay`, every `interval` the quotes are synced incrementally and
-/// whatever became stale (new quotes, a new day) is rebuilt. Never panics.
-pub async fn run_periodic_consistency(
+/// the portfolio is updated (new quotes, a new day). Never panics.
+pub async fn run_periodic_update(
     coordinator: Arc<PortfolioCoordinator>,
     observer: Arc<dyn JobObserver>,
     initial_delay: std::time::Duration,
@@ -601,18 +602,18 @@ pub async fn run_periodic_consistency(
 ) {
     tokio::time::sleep(initial_delay).await;
     info!(
-        "Periodic portfolio consistency pass started (interval: {}h)",
+        "Periodic portfolio update started (interval: {}h)",
         interval.as_secs() / 3600
     );
     loop {
         let report = coordinator
-            .ensure_consistent_or_report(
+            .update_all(
                 MarketSyncMode::Incremental { asset_ids: None },
                 observer.as_ref(),
             )
             .await;
         info!(
-            "Periodic consistency pass: {} account(s) rebuilt, {} failure(s)",
+            "Periodic portfolio update: {} account(s) rebuilt, {} failure(s)",
             report.account_ids.len(),
             report.failures.len()
         );

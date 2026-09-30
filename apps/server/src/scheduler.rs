@@ -181,9 +181,9 @@ pub fn start_background_workers(state: Arc<AppState>) {
     // Start background broker sync scheduler (4-hour interval)
     start_broker_sync_scheduler(state.clone());
 
-    // Periodic market data sync plus consistency pass (6h interval, 2min
+    // Periodic market data sync plus portfolio update (6h interval, 2min
     // initial delay): the coordinator rebuilds whatever the sync made stale.
-    let worker = crate::api::shared::spawn_periodic_consistency(state.clone());
+    let worker = crate::api::shared::spawn_periodic_update(state.clone());
     state.workers.lock().unwrap().push(worker);
 }
 

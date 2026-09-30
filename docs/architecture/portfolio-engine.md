@@ -200,10 +200,11 @@ failures (storage, engine) retry with backoff; per-account validation failures
 are final and reported individually. Event batches debounce with a bounded
 maximum wait, so a sustained event stream cannot postpone work indefinitely.
 
-**Entry points.** One idempotent consistency pass serves cold start, the
-frontend's return to the foreground, the periodic market-data sync, and
-device-sync apply. Stale accounts (pending markers, or valuations ending before
-today) also surface in the health check with a repair action.
+**Entry points.** One idempotent portfolio update (a market sync, then every
+stale account brought up to date) serves cold start, the frontend's return to
+the foreground, the periodic market-data sync, and device-sync apply. Stale
+accounts (pending markers, or valuations ending before today) also surface in
+the health check with a repair action.
 
 **Scoping.** Facts load by account and transfer group, transitively: a job reads
 its scope's transfer closure, never the whole activity table. Archived accounts

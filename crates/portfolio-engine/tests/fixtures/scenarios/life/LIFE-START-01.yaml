@@ -12,10 +12,10 @@ intent: >
   acc-b is either rebuilt once, twice, or valued from an
   IncrementalFromLast run that found no keyframe and started from its
   earliest activity. The coordinator replaces both with one idempotent
-  `ensure_consistent()` driven by the facts fingerprint versus the
-  projection watermark. Expected: after startup both accounts equal a
-  one-shot Full rebuild of these facts, exactly one job ran per scope, and
-  a second `ensure_consistent()` is a no-op. No legacy golden: the startup
+  portfolio update (`update_all`) driven by the stale markers and the last
+  valued day. Expected: after startup both accounts equal a one-shot Full
+  rebuild of these facts, exactly one job ran per scope, and a second
+  update is a no-op. No legacy golden: the startup
   wiring lives in the hosts, not in the calculation chain.
 policy:
   base_currency: USD

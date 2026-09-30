@@ -1,6 +1,5 @@
 // useGlobalEventListener.ts
 import {
-  ensurePortfolioConsistent,
   isDesktop,
   listenAssetClassificationsChanged,
   listenBrokerSyncComplete,
@@ -13,6 +12,7 @@ import {
   listenPortfolioUpdateError,
   listenPortfolioUpdateStart,
   logger,
+  updatePortfolio,
 } from "@/adapters";
 import { usePortfolioSyncOptional } from "@/context/portfolio-sync-context";
 import { useIsMobileViewport } from "@/hooks/use-platform";
@@ -433,11 +433,11 @@ const useGlobalEventListener = () => {
         Array.from(POST_LOGIN_REQUIRED_LISTENERS).every((name) => readyListeners.has(name)),
       );
 
-      // Listeners are live: request the backend's cold-start consistency pass
-      // (market sync plus a rebuild of whatever is stale). Its progress arrives
-      // through the events registered above, so nothing is missed.
-      ensurePortfolioConsistent().catch((error) => {
-        logger.error("Failed to request the portfolio consistency check: " + String(error));
+      // Listeners are live: request the start-up portfolio update (market sync
+      // plus a rebuild of whatever is stale). Its progress arrives through the
+      // events registered above, so nothing is missed.
+      updatePortfolio().catch((error) => {
+        logger.error("Failed to request the portfolio update: " + String(error));
       });
       // Note: Update check is handled by useCheckUpdateOnStartup query in UpdateDialog
     };
@@ -457,7 +457,7 @@ const useGlobalEventListener = () => {
 };
 
 /** Hidden this long (a suspended phone, a laptop lid) means market data and
- *  the day may have moved: ask the backend for a consistency pass on return. */
+ *  the day may have moved: ask the backend for a portfolio update on return. */
 const RESUME_CHECK_AFTER_MS = 5 * 60 * 1000;
 
 export function usePortfolioResumeCheck() {
@@ -471,8 +471,8 @@ export function usePortfolioResumeCheck() {
       const hiddenFor = hiddenAt === null ? 0 : Date.now() - hiddenAt;
       hiddenAt = null;
       if (hiddenFor >= RESUME_CHECK_AFTER_MS) {
-        ensurePortfolioConsistent().catch((error) => {
-          logger.error("Failed to request the portfolio consistency check: " + String(error));
+        updatePortfolio().catch((error) => {
+          logger.error("Failed to request the portfolio update: " + String(error));
         });
       }
     };

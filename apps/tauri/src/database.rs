@@ -1213,8 +1213,8 @@ fn start_workers(
             crate::mcp::start_if_enabled(&mcp_handle, &mcp_context).await;
         }));
 
-        // Periodic market data sync plus consistency pass (6h, 2min delay).
-        workers.push(crate::portfolio_jobs::spawn_periodic_consistency(
+        // Periodic market data sync plus portfolio update (6h, 2min delay).
+        workers.push(crate::portfolio_jobs::spawn_periodic_update(
             handle.clone(),
             Arc::clone(context),
         ));

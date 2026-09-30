@@ -9,10 +9,10 @@ use tauri::async_runtime::JoinHandle;
 use tauri::AppHandle;
 use wealthfolio_core::health::HealthServiceTrait;
 use wealthfolio_core::portfolio::coordinator::{
-    run_periodic_consistency, AccountFailure, JobObserver, PortfolioJobReport, PortfolioJobRequest,
+    run_periodic_update, AccountFailure, JobObserver, PortfolioJobReport, PortfolioJobRequest,
     RetryPolicy,
 };
-use wealthfolio_core::quotes::{MarketSyncMode, SyncResult};
+use wealthfolio_core::quotes::SyncResult;
 
 use crate::context::ServiceContext;
 use crate::events::{
@@ -121,26 +121,14 @@ pub async fn run_portfolio_request(
     }
 }
 
-/// One consistency pass (architecture §3.3): sync market data, then rebuild whatever
-/// the check finds stale. The frontend requests it once its event listeners
-/// are live (so no progress event is lost), and the periodic scheduler
-/// repeats it.
-pub async fn ensure_consistent(app_handle: AppHandle, context: Arc<ServiceContext>) {
-    let observer = TauriJobObserver::new(app_handle, Arc::clone(&context));
-    context
-        .portfolio_coordinator()
-        .ensure_consistent_or_report(MarketSyncMode::Incremental { asset_ids: None }, &observer)
-        .await;
-}
-
-/// Periodic market sync plus consistency pass (6h, after a 2min delay).
-pub fn spawn_periodic_consistency(
+/// The app's periodic market sync plus portfolio update (6h, after a 2min delay).
+pub fn spawn_periodic_update(
     app_handle: AppHandle,
     context: Arc<ServiceContext>,
 ) -> JoinHandle<()> {
     let observer: Arc<dyn JobObserver> =
         Arc::new(TauriJobObserver::new(app_handle, Arc::clone(&context)));
-    tauri::async_runtime::spawn(run_periodic_consistency(
+    tauri::async_runtime::spawn(run_periodic_update(
         context.portfolio_coordinator(),
         observer,
         Duration::from_secs(120),

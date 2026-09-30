@@ -151,19 +151,6 @@ async fn run_guarded<T>(operation: impl Future<Output = T>) -> Result<T, &'stati
         .map_err(|_| "Portfolio update stopped unexpectedly")
 }
 
-/// Cold-start consistency pass (market sync plus a rebuild of whatever is
-/// stale), run as profile portfolio work so locking the profile joins it.
-pub(crate) fn request_consistency_pass(handle: AppHandle, context: Arc<ServiceContext>) {
-    if !context.is_active() {
-        return;
-    }
-    let task_context = Arc::clone(&context);
-    context.portfolio_tasks.spawn(false, async move {
-        crate::portfolio_jobs::ensure_consistent(handle, task_context).await;
-        false
-    });
-}
-
 /// Handles the common logic for both portfolio update and recalculation requests.
 pub(crate) fn handle_portfolio_request(
     handle: AppHandle,

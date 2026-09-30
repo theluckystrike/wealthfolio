@@ -555,7 +555,7 @@ async fn lifecycle_steps_match_a_fresh_rebuild() {
 
             let report = live
                 .coordinator
-                .ensure_consistent(MarketSyncMode::None, &SilentObserver)
+                .try_update_all(MarketSyncMode::None, &SilentObserver)
                 .await
                 .unwrap();
             assert!(report.failures.is_empty(), "{label}: {:?}", report.failures);
@@ -676,7 +676,7 @@ async fn a_price_change_revalues_from_its_day_only() {
     live.add_quotes(vec![late.clone()]);
     let report = live
         .coordinator
-        .ensure_consistent(MarketSyncMode::None, &SilentObserver)
+        .try_update_all(MarketSyncMode::None, &SilentObserver)
         .await
         .unwrap();
     assert_eq!(
@@ -732,7 +732,7 @@ async fn a_new_day_revalues_only_the_new_day() {
 
     let report = harness
         .coordinator
-        .ensure_consistent(MarketSyncMode::None, &SilentObserver)
+        .try_update_all(MarketSyncMode::None, &SilentObserver)
         .await
         .unwrap();
     assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -803,7 +803,7 @@ async fn a_split_edit_revalues_its_holders_from_the_beginning() {
     live.change_activities(Vec::new(), vec![split], &[], &facts.activities);
     let report = live
         .coordinator
-        .ensure_consistent(MarketSyncMode::None, &SilentObserver)
+        .try_update_all(MarketSyncMode::None, &SilentObserver)
         .await
         .unwrap();
     assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -836,7 +836,7 @@ async fn a_future_activity_is_folded_when_its_day_comes() {
     crate::utils::clock::set_frozen(as_of_instant(later.as_of, &later.timezone));
     let report = live
         .coordinator
-        .ensure_consistent(MarketSyncMode::None, &SilentObserver)
+        .try_update_all(MarketSyncMode::None, &SilentObserver)
         .await
         .unwrap();
     assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -876,7 +876,7 @@ async fn a_backdated_edit_rewrites_from_its_day_only() {
     live.change_activities(Vec::new(), vec![edited.clone()], &[], &facts.activities);
     let report = live
         .coordinator
-        .ensure_consistent(MarketSyncMode::None, &SilentObserver)
+        .try_update_all(MarketSyncMode::None, &SilentObserver)
         .await
         .unwrap();
     assert_eq!(
@@ -948,7 +948,7 @@ async fn a_deletion_refolds_from_the_deleted_day() {
     );
     let report = harness
         .coordinator
-        .ensure_consistent(MarketSyncMode::None, &SilentObserver)
+        .try_update_all(MarketSyncMode::None, &SilentObserver)
         .await
         .unwrap();
     assert_eq!(
