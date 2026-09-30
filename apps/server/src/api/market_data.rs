@@ -13,7 +13,6 @@ use axum::{
     Json, Router,
 };
 use wealthfolio_core::assets::InstrumentType;
-use wealthfolio_core::portfolio::{snapshot::SnapshotRecalcMode, valuation::ValuationRecalcMode};
 use wealthfolio_core::quotes::{
     FetchDividendsParams, LatestQuoteSnapshot, MarketSyncMode, ProviderInfo, Quote, QuoteImport,
     SymbolSearchResult,
@@ -176,9 +175,8 @@ async fn update_quote(
         PortfolioJobConfig {
             account_ids: None,
             market_sync_mode: MarketSyncMode::None,
-            snapshot_mode: SnapshotRecalcMode::Full,
-            valuation_mode: ValuationRecalcMode::Full,
-            since_date: None,
+            force_full: false,
+            earliest_change_at: None,
         },
     );
     Ok(StatusCode::NO_CONTENT)
@@ -196,9 +194,8 @@ async fn delete_quote(
         PortfolioJobConfig {
             account_ids: None,
             market_sync_mode: MarketSyncMode::None,
-            snapshot_mode: SnapshotRecalcMode::Full,
-            valuation_mode: ValuationRecalcMode::Full,
-            since_date: None,
+            force_full: false,
+            earliest_change_at: None,
         },
     );
     Ok(StatusCode::NO_CONTENT)
@@ -267,9 +264,8 @@ async fn import_quotes_csv(
         PortfolioJobConfig {
             account_ids: None,
             market_sync_mode: MarketSyncMode::None,
-            snapshot_mode: SnapshotRecalcMode::Full,
-            valuation_mode: ValuationRecalcMode::Full,
-            since_date: None,
+            force_full: false,
+            earliest_change_at: None,
         },
     );
 
@@ -312,9 +308,7 @@ async fn sync_market_data(
         PortfolioJobConfig {
             account_ids: None,
             market_sync_mode,
-            snapshot_mode: SnapshotRecalcMode::IncrementalFromLast,
-            valuation_mode: ValuationRecalcMode::IncrementalFromLast,
-            since_date: None,
+            ..PortfolioJobConfig::default()
         },
     );
     Ok(StatusCode::NO_CONTENT)

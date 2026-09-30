@@ -198,6 +198,7 @@ export {
   getSnapshots,
   importHoldingsCsv,
   performanceSummaryScopeKey,
+  ensurePortfolioConsistent,
   recalculatePortfolio,
   saveManualHoldings,
   updatePortfolio,
