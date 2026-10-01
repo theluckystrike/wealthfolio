@@ -564,6 +564,36 @@ fn normalize_payload_fields(
     Ok(normalized_fields)
 }
 
+/// A quote's day is its timestamp's UTC date (engine rules R3.2): the
+/// portfolio engine reads the timestamp, repositories and change tracking the
+/// day, and local writes keep them equal. A synced row takes its day from its
+/// timestamp, whatever day it carries.
+fn set_synced_quote_day(fields: &mut Vec<(String, serde_json::Value)>) {
+    let Some(day) = fields
+        .iter()
+        .find(|(column, _)| column == "timestamp")
+        .and_then(|(_, value)| value.as_str())
+        .and_then(utc_date)
+    else {
+        return;
+    };
+    let day = serde_json::Value::String(day);
+    match fields.iter_mut().find(|(column, _)| column == "day") {
+        Some((_, value)) => *value = day,
+        None => fields.push(("day".to_string(), day)),
+    }
+}
+
+/// The UTC date of an RFC 3339 instant, or of a naive one read as UTC.
+fn utc_date(timestamp: &str) -> Option<String> {
+    let instant = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|instant| instant.naive_utc())
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S%.f"))
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S%.f"))
+        .ok()?;
+    Some(instant.format("%Y-%m-%d").to_string())
+}
+
 fn synced_snapshot_payload_is_safe(fields: &[(String, serde_json::Value)]) -> bool {
     let source = fields
         .iter()
@@ -2081,6 +2111,9 @@ fn apply_remote_event_lww_tx(
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
                     let mut fields = normalize_payload_fields(conn, table_name, fields)?;
+                    if entity == SyncEntity::Quote {
+                        set_synced_quote_day(&mut fields);
+                    }
                     if entity == SyncEntity::Snapshot && !synced_snapshot_payload_is_safe(&fields) {
                         log::warn!(
                             "Skipping synced snapshot '{}' with an unsupported source or malformed date",
@@ -6507,6 +6540,49 @@ mod tests {
                 table_name
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_synced_quote_takes_its_day_from_its_timestamp() {
+        #[derive(QueryableByName)]
+        struct DayRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            day: String,
+        }
+        let (pool, writer) = setup_db();
+        let mut conn = get_connection(&pool).expect("conn");
+        diesel::sql_query(
+            "INSERT INTO assets (id, kind, is_active, quote_mode, quote_ccy, created_at, updated_at) \
+             VALUES ('asset-day', 'INVESTMENT', 1, 'MARKET', 'USD', datetime('now'), datetime('now'))",
+        )
+        .execute(&mut conn)
+        .expect("insert asset");
+        let repo = AppSyncRepository::new(pool.clone(), writer);
+        repo.apply_remote_event_lww(
+            SyncEntity::Quote,
+            "quote-day".to_string(),
+            SyncOperation::Create,
+            "evt-quote-day".to_string(),
+            "2026-02-12T00:00:00Z".to_string(),
+            1,
+            serde_json::json!({
+                "id": "quote-day",
+                "asset_id": "asset-day",
+                "day": "2025-01-03",
+                "source": "MANUAL",
+                "close": "100",
+                "currency": "USD",
+                "created_at": "2025-01-03T00:00:00Z",
+                "timestamp": "2024-12-01T22:00:00-05:00"
+            }),
+        )
+        .await
+        .expect("apply quote");
+        let row: DayRow = diesel::sql_query("SELECT day FROM quotes WHERE id = 'quote-day'")
+            .get_result(&mut conn)
+            .expect("read quote");
+        // 22:00 at UTC-5 is 03:00 UTC the next day.
+        assert_eq!(row.day, "2024-12-02");
     }
 
     #[tokio::test]
