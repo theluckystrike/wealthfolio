@@ -436,10 +436,9 @@ pub fn value(inputs: &ValueInputs<'_>) -> BTreeMap<AccountId, ValuationSeries>;
 /// account's profile. What aggregation and measurement need from the facts.
 pub fn effects(resolved: &Resolved<'_>, disposals: &[LotDisposal]) -> Effects;
 
-/// Scope aggregation: per-day sums in base currency with internal transfers
-/// (both legs in scope) netted out. On a day with activity flows those flows
-/// replace the summed rows, except a holdings account's own row flow (inferred
-/// at its snapshots), which is always kept.
+/// Scope aggregation: per-day sums in base currency. Each account adds its
+/// own flows less its legs of internal transfers (both legs in scope); an
+/// account opening inside the scope adds the money that opened it.
 pub fn aggregate_scope(
     effects: &Effects,
     series: &BTreeMap<AccountId, ValuationSeries>,
@@ -655,7 +654,7 @@ Testable contract; the property suite (§5) encodes each one.
 | **I6**  | **Split invariance.** A split changes lot split ratios only, for lots acquired before its local date: never value at the split instant, never cost-basis totals, never flows, never cash.                                                                                                                                                                           |
 | **I7**  | **Transfer scope.** A matched internal transfer is equal and opposite at account scope and zero at portfolio scope when both accounts are in scope; paired security transfers preserve acquisition dates and basis. A same-account FX conversion moves no contribution when the import linker recorded it; an unrecorded one keeps the legacy per-leg contribution. |
 | **I8**  | **Valuation reconciliation.** Day over day, `Δvalue = flows + event effects + market and FX movement + unreconciled`, where the residual is an explicit diagnostic term, never silently absorbed.                                                                                                                                                                   |
-| **I9**  | **Aggregation.** Portfolio valuation = Σ account valuations for the same day and policy; portfolio flows = account flows net of internal transfers; statuses and provenance combine by their absorption laws.                                                                                                                                                       |
+| **I9**  | **Aggregation.** Portfolio valuation = Σ account valuations for the same day and policy; portfolio flows = account flows net of internal transfers, each account adding its own (one account's flows never change another's), plus the money that opens an account inside the scope; statuses and provenance combine by their absorption laws.                      |
 | **I10** | **Degradation honesty.** Every carried, missing, estimated or fallback input is visible in a status or a diagnostic. No silent zeros, no silent `rate = 1`, no silent currency default, no silent fills.                                                                                                                                                            |
 | **I11** | **Impact soundness.** After a change of facts, a full run differs from the one before only where `impact` says: nothing in an account it does not name, nothing before an account's stale day, and no keyframe, lot or disposal of an account it only revalues (P-IMPACT).                                                                                          |
 

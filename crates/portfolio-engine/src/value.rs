@@ -183,9 +183,12 @@ fn value_series(
 
         // Flows: activity map for this account's scope, then fallbacks, then
         // holdings-transition inference (authoritative on observed rows).
-        let own = std::slice::from_ref(account_id);
-        let flows = scope_flows(&effects, own, own, Window::default());
-        stamp_flows(&mut days, &flows, false);
+        let flows = scope_flows(
+            &effects,
+            std::slice::from_ref(account_id),
+            Window::default(),
+        );
+        stamp_flows(&mut days, &flows);
         valuer.infer_holdings_flows(&mut days, &keyframes);
         if seed.is_some() {
             // The seed day only carries the state into the window.
@@ -212,9 +215,9 @@ fn value_series(
 }
 
 /// The scoped read performance consumes (legacy
-/// `get_historical_valuations_for_accounts`): per-day sums in base currency,
-/// scope-aware activity flows, then internal-transfer netting for pairs whose
-/// accounts are both in scope.
+/// `get_historical_valuations_for_accounts`): per-day sums in base currency
+/// of the accounts' stored rows, flows included, less the legs of transfer
+/// pairs whose accounts are both in scope.
 pub fn aggregate_scope(
     effects: &Effects,
     series: &BTreeMap<AccountId, ValuationSeries>,
@@ -248,9 +251,38 @@ pub fn aggregate_scope(
         .collect();
     validate_completeness(scope, &histories)?;
 
+    // Each account adds its own row's flows (its activities', a fallback, or
+    // those inferred at its snapshots) less its legs of transfer pairs inside
+    // the scope, so another account's flow on the same day never changes an
+    // account's share. Each account nets only its own legs, at most what it
+    // adds.
+    let adjustments = internal_adjustments(effects, scope, window);
+    let scope_start = histories
+        .iter()
+        .filter_map(|history| history.days.first())
+        .map(|day| day.date)
+        .min();
+    let mut netted: BTreeMap<NaiveDate, (Decimal, Decimal)> = BTreeMap::new();
     let mut by_date: BTreeMap<NaiveDate, DailyValuation> = BTreeMap::new();
     for history in &histories {
+        let inception = series
+            .get(&history.account)
+            .and_then(|own| own.days.first())
+            .map(|day| day.date);
         for day in &history.days {
+            let flow = if day.flow.source == FlowSource::NoFlow
+                && Some(day.date) == inception
+                && Some(day.date) != scope_start
+            {
+                opening_flow(effects, &history.account, day, window)
+            } else {
+                day.flow
+            };
+            if let Some((inflow, outflow)) = adjustments.get(&(&history.account, day.date)) {
+                let entry = netted.entry(day.date).or_default();
+                entry.0 += flow.inflow_base.min(*inflow);
+                entry.1 += flow.outflow_base.min(*outflow);
+            }
             let entry = by_date.entry(day.date).or_insert_with(|| DailyValuation {
                 date: day.date,
                 fx_rate_to_base: Decimal::ONE,
@@ -283,9 +315,9 @@ pub fn aggregate_scope(
             entry.cost_basis_base += day.cost_basis_base;
             entry.book_basis_base += day.book_basis_base;
             entry.net_contribution_base += day.net_contribution_base;
-            entry.flow.inflow_base += day.flow.inflow_base;
-            entry.flow.outflow_base += day.flow.outflow_base;
-            entry.flow.source = entry.flow.source.combine(day.flow.source);
+            entry.flow.inflow_base += flow.inflow_base;
+            entry.flow.outflow_base += flow.outflow_base;
+            entry.flow.source = entry.flow.source.combine(flow.source);
             entry.performance_eligible_value_base += day.performance_eligible_value_base;
             entry.value_status = entry.value_status.combine(day.value_status);
             entry.basis_status = entry.basis_status.combine(day.basis_status);
@@ -293,64 +325,15 @@ pub fn aggregate_scope(
     }
     let mut days: Vec<DailyValuation> = by_date.into_values().collect();
 
-    // A holdings account's rows are its flows (snapshot inference replaces
-    // its activities' on its own snapshot days), so only the other accounts'
-    // activities replace a day's sum, and the holdings rows join them there.
-    let holdings: BTreeSet<&AccountId> = scope
-        .iter()
-        .filter(|id| {
-            effects
-                .account(id)
-                .is_some_and(|a| a.tracking == TrackingMode::Holdings)
-        })
-        .collect();
-    let transacting: Vec<AccountId> = scope
-        .iter()
-        .filter(|id| !holdings.contains(id))
-        .cloned()
-        .collect();
-    let mut holdings_flows: BTreeMap<NaiveDate, Vec<(&AccountId, DailyFlow)>> = BTreeMap::new();
-    for history in histories.iter().filter(|h| holdings.contains(&h.account)) {
-        for row in &history.days {
-            holdings_flows
-                .entry(row.date)
-                .or_default()
-                .push((&history.account, row.flow));
-        }
+    // The first day opens the scope and carries no flow.
+    if let Some(first) = days.first_mut() {
+        first.flow = DailyFlow::default();
     }
-
-    let flows = scope_flows(effects, &transacting, scope, window);
-    let authoritative: BTreeSet<NaiveDate> = flows.keys().copied().collect();
-    stamp_flows(&mut days, &flows, true);
-    let adjustments = internal_adjustments(effects, scope, window);
-    let mut netted: BTreeMap<NaiveDate, (Decimal, Decimal)> = BTreeMap::new();
-    for ((_, date), (inflow, outflow)) in &adjustments {
-        let entry = netted.entry(*date).or_default();
-        entry.0 += inflow;
-        entry.1 += outflow;
-    }
-    for (index, day) in days.iter_mut().enumerate() {
-        if authoritative.contains(&day.date) {
-            // The first day opens the scope and carries no flow.
-            if index == 0 {
-                continue;
-            }
-            for (account, flow) in holdings_flows.get(&day.date).into_iter().flatten() {
-                let (inflow, outflow) = adjustments
-                    .get(&(*account, day.date))
-                    .copied()
-                    .unwrap_or_default();
-                day.flow.inflow_base += (flow.inflow_base - inflow).max(Decimal::ZERO);
-                day.flow.outflow_base += (flow.outflow_base - outflow).max(Decimal::ZERO);
-                day.flow.source = day.flow.source.combine(flow.source);
-            }
-            continue;
+    for day in days.iter_mut().skip(1) {
+        if let Some((inflow, outflow)) = netted.get(&day.date) {
+            day.flow.inflow_base -= inflow;
+            day.flow.outflow_base -= outflow;
         }
-        let Some((inflow, outflow)) = netted.get(&day.date) else {
-            continue;
-        };
-        day.flow.inflow_base = (day.flow.inflow_base - inflow).max(Decimal::ZERO);
-        day.flow.outflow_base = (day.flow.outflow_base - outflow).max(Decimal::ZERO);
         // Netting removes scope-internal legs; it adds no differently valued
         // flow, so the day keeps the provenance of the flows that survive.
     }
@@ -367,6 +350,31 @@ pub fn aggregate_scope(
         days,
         diagnostics: Vec::new(),
     })
+}
+
+/// What an account's first day adds to a scope that already exists. Its row
+/// has no flow (the money that opens an account is its starting value), but
+/// at the scope that money arrives: what its activities brought in that day,
+/// else its net contribution (an account opened without a recorded flow,
+/// such as a holdings account's first snapshot).
+fn opening_flow(
+    effects: &Effects,
+    account: &AccountId,
+    day: &DailyValuation,
+    window: Window,
+) -> DailyFlow {
+    if let Some(flow) = scope_flows(effects, std::slice::from_ref(account), window).get(&day.date) {
+        return *flow;
+    }
+    if day.net_contribution_base.is_zero() {
+        return DailyFlow::default();
+    }
+    let (inflow_base, outflow_base) = split_flow(day.net_contribution_base);
+    DailyFlow {
+        inflow_base,
+        outflow_base,
+        source: FlowSource::NetContributionFallback,
+    }
 }
 
 /// An optional date window on a read (`None` bounds are open).
@@ -1477,11 +1485,10 @@ fn priced_events(
     (effects, diagnostics)
 }
 
-/// Legacy `external_flows_from_scoped_inputs` for `scope`: the priced flow
-/// of each event of `accounts` where it crosses the scope's boundary.
+/// Legacy `external_flows_from_scoped_inputs` for `scope`: each event's
+/// priced flow where it crosses the scope's boundary.
 fn scope_flows(
     effects: &Effects,
-    accounts: &[AccountId],
     scope: &[AccountId],
     window: Window,
 ) -> BTreeMap<NaiveDate, DailyFlow> {
@@ -1489,7 +1496,7 @@ fn scope_flows(
     for event in effects
         .events
         .iter()
-        .filter(|event| accounts.contains(&event.account) && window.contains(event.date))
+        .filter(|event| scope.contains(&event.account) && window.contains(event.date))
     {
         let Some(flow) = event.flow else {
             continue;
@@ -1653,11 +1660,7 @@ fn add_flow(
 }
 
 /// Legacy `set_external_flows_from_activity_map_or_net_contribution_base`.
-fn stamp_flows(
-    days: &mut [DailyValuation],
-    flows: &BTreeMap<NaiveDate, DailyFlow>,
-    preserve_unavailable: bool,
-) {
+fn stamp_flows(days: &mut [DailyValuation], flows: &BTreeMap<NaiveDate, DailyFlow>) {
     let Some(first) = days.first_mut() else {
         return;
     };
@@ -1672,9 +1675,6 @@ fn stamp_flows(
             continue;
         }
         let current = days[index].flow;
-        if preserve_unavailable && current.source == FlowSource::UnpricedHoldingsTransition {
-            continue;
-        }
         let stored = !current.inflow_base.is_zero()
             || !current.outflow_base.is_zero()
             || (current.source.is_explicit_gross() && delta.is_zero());

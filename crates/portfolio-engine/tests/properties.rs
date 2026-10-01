@@ -936,6 +936,113 @@ fn p_agg_scope_aggregation_is_exact() {
     assert!(pair_days > 0, "the corpus has no internal transfer days");
 }
 
+fn portfolio_days(pipeline: &Pipeline) -> Option<Vec<DailyValuation>> {
+    let effects = pipeline.effects(
+        &pipeline.bundle.disposals,
+        &pipeline.lots(),
+        &pipeline.bundle.rejected_activities(),
+    );
+    aggregate_scope(
+        &effects,
+        &pipeline.series,
+        &pipeline.portfolio_scope(),
+        Window::default(),
+    )
+    .ok()
+    .map(|scoped| scoped.days)
+}
+
+/// P-AGG-ADD (I9): a scope's flow on a day is what each of its accounts
+/// adds, so what one account records never changes another's share. A
+/// deposit of 1 into an extra account on every day something happens adds
+/// exactly 1 to each of those days and changes no other: a transfer's
+/// shortfall, a flow estimated from a net-contribution change, a holdings
+/// snapshot and an account opening inside the scope keep their flows on a
+/// busy day.
+#[test]
+fn p_agg_add_an_unrelated_deposit_adds_only_itself() {
+    let mut checked = 0usize;
+    for scenario in corpus() {
+        let pipeline = Pipeline::from_scenario(&scenario);
+        let Some(reference) = portfolio_days(&pipeline) else {
+            continue;
+        };
+        let Some(start) = reference.first().map(|day| day.date) else {
+            continue;
+        };
+        let scope = pipeline.portfolio_scope();
+        let days: BTreeSet<NaiveDate> = reference.iter().map(|day| day.date).collect();
+        let mut targets: BTreeSet<NaiveDate> = pipeline
+            .facts()
+            .activities()
+            .iter()
+            .filter(|activity| scope.contains(&activity.account))
+            .map(|activity| activity.date)
+            .collect();
+        targets.extend(
+            scenario
+                .observed_snapshots
+                .iter()
+                .filter(|snapshot| scope.iter().any(|id| id.as_str() == snapshot.account))
+                .map(|snapshot| snapshot.date),
+        );
+        targets.retain(|day| *day > start && days.contains(day));
+        if targets.is_empty() {
+            continue;
+        }
+
+        let tz: chrono_tz::Tz = scenario.policy.timezone.parse().expect("timezone");
+        let mut busy = scenario.clone();
+        busy.accounts.push(
+            serde_yaml::from_str(&format!(
+                "{{ id: zz-extra, currency: {} }}",
+                scenario.policy.base_currency
+            ))
+            .unwrap(),
+        );
+        for (index, day) in targets.iter().enumerate() {
+            let noon = day
+                .and_hms_opt(12, 0, 0)
+                .and_then(|noon| noon.and_local_timezone(tz).single())
+                .expect("local noon")
+                .with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%SZ");
+            busy.activities.push(
+                serde_yaml::from_str(&format!(
+                    "{{ id: zz-dep-{index}, account: zz-extra, type: DEPOSIT, date: \"{noon}\", amount: 1 }}"
+                ))
+                .unwrap(),
+            );
+        }
+        let changed = portfolio_days(&Pipeline::from_scenario(&busy))
+            .unwrap_or_else(|| panic!("{}: the busy portfolio does not aggregate", scenario.id));
+        let changed: BTreeMap<NaiveDate, &DailyValuation> =
+            changed.iter().map(|day| (day.date, day)).collect();
+        for day in &reference {
+            let id = format!("{}: {}", scenario.id, day.date);
+            let after = changed
+                .get(&day.date)
+                .unwrap_or_else(|| panic!("{id}: missing from the busy portfolio"));
+            let added = if targets.contains(&day.date) {
+                Decimal::ONE
+            } else {
+                Decimal::ZERO
+            };
+            assert_eq!(
+                after.flow.inflow_base,
+                day.flow.inflow_base + added,
+                "{id}: inflow"
+            );
+            assert_eq!(
+                after.flow.outflow_base, day.flow.outflow_base,
+                "{id}: outflow"
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked > 50, "only {checked} portfolios made busy");
+}
+
 /// P-DIAG (I10): every degraded day and every silent-fallback input is
 /// reported.
 #[test]
