@@ -230,6 +230,24 @@ pub trait ActivityRepositoryTrait: Send + Sync {
             "Activity repository does not support archived-account activity reads".to_string(),
         ))
     }
+    /// SPLIT activities (effective type) of the given assets in every account,
+    /// archived ones included: a split belongs to the asset, so it tells how
+    /// every holder's quotes read, whichever account recorded it.
+    fn get_split_activities_by_asset_ids(&self, asset_ids: &[String]) -> Result<Vec<Activity>> {
+        if asset_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requested: HashSet<&str> = asset_ids.iter().map(String::as_str).collect();
+        let mut activities = self.get_activities_including_archived_accounts()?;
+        activities.retain(|activity| {
+            activity.effective_type() == "SPLIT"
+                && activity
+                    .asset_id
+                    .as_deref()
+                    .is_some_and(|asset| requested.contains(asset))
+        });
+        Ok(activities)
+    }
     async fn update_activities_for_final_cash_migration(
         &self,
         updates: Vec<ActivityFinalCashMigrationUpdate>,

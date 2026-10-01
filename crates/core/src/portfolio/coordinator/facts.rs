@@ -137,26 +137,48 @@ impl FactSources {
             .collect();
         requests.sort();
         requests.dedup();
-        let quote_rows = if requests.is_empty() {
-            Vec::new()
-        } else {
-            self.quotes
-                .get_sparse_asset_market_facts(&requests)?
-                .quotes_by_request
-                .into_values()
-                .collect()
-        };
+        // Real observations (the market-facts read stamps a carried close
+        // with the requested day, which a split's detection would take for
+        // a close of its own), one read per day.
+        let mut days: BTreeMap<NaiveDate, Vec<String>> = BTreeMap::new();
+        for (asset, day) in requests {
+            days.entry(day).or_default().push(asset);
+        }
+        let mut quotes: Vec<RawQuote> = Vec::new();
+        for (day, assets) in days {
+            quotes.extend(window_quotes(self, &assets, day, day)?);
+        }
+
+        // Splits decide how every transfer price reads: those recorded
+        // elsewhere too, with the closes that tell whether each was adjusted.
+        let foreign = foreign_splits(self, &asset_ids, &closure_activities)?;
+        quotes.extend(split_evidence(
+            self,
+            activities
+                .iter()
+                .copied()
+                .filter(|a| a.effective_type() == "SPLIT")
+                .chain(&foreign),
+            timezone_tz,
+            as_of,
+        )?);
+        let mut accounts: Vec<RawAccount> = all_accounts
+            .iter()
+            .filter(|a| closure.contains(&a.id))
+            .map(raw_account)
+            .collect();
+        accounts.extend(split_accounts(&all_accounts, &closure, &foreign));
 
         Ok(RawFacts {
             policy: policy(base_currency, timezone, as_of)?,
-            accounts: all_accounts
-                .iter()
-                .filter(|a| closure.contains(&a.id))
-                .map(raw_account)
-                .collect(),
+            accounts,
             assets: asset_rows.iter().map(raw_asset).collect(),
-            activities: activities.into_iter().map(raw_activity).collect(),
-            quotes: quote_rows.iter().map(raw_quote).collect(),
+            activities: activities
+                .into_iter()
+                .chain(&foreign)
+                .map(raw_activity)
+                .collect(),
+            quotes,
             fx_rates: self
                 .fx_rates
                 .get_historical_exchange_rates()?
@@ -191,7 +213,7 @@ fn policy(base_currency: &str, timezone: &str, as_of: NaiveDate) -> Result<Polic
     ))
 }
 
-fn raw_account(a: &crate::accounts::Account) -> RawAccount {
+pub(super) fn raw_account(a: &crate::accounts::Account) -> RawAccount {
     RawAccount {
         id: a.id.clone(),
         currency: a.currency.clone(),
@@ -201,7 +223,7 @@ fn raw_account(a: &crate::accounts::Account) -> RawAccount {
     }
 }
 
-fn raw_asset(a: &crate::assets::Asset) -> RawAsset {
+pub(super) fn raw_asset(a: &crate::assets::Asset) -> RawAsset {
     RawAsset {
         id: a.id.clone(),
         quote_currency: a.quote_ccy.clone(),
@@ -214,7 +236,7 @@ fn raw_asset(a: &crate::assets::Asset) -> RawAsset {
     }
 }
 
-fn raw_activity(a: &Activity) -> RawActivity {
+pub(super) fn raw_activity(a: &Activity) -> RawActivity {
     RawActivity {
         id: a.id.clone(),
         account_id: a.account_id.clone(),
@@ -265,7 +287,7 @@ fn raw_fx_conversion(a: &Activity) -> Option<RawFxConversion> {
     })
 }
 
-fn raw_quote(q: &crate::quotes::Quote) -> RawQuote {
+pub(super) fn raw_quote(q: &crate::quotes::Quote) -> RawQuote {
     RawQuote {
         asset_id: q.asset_id.clone(),
         day: q.timestamp.date_naive(),
@@ -275,7 +297,7 @@ fn raw_quote(q: &crate::quotes::Quote) -> RawQuote {
     }
 }
 
-fn raw_fx_rate(r: &crate::fx::ExchangeRate) -> RawFxRate {
+pub(super) fn raw_fx_rate(r: &crate::fx::ExchangeRate) -> RawFxRate {
     RawFxRate {
         from: r.from_currency.clone(),
         to: r.to_currency.clone(),
@@ -285,14 +307,57 @@ fn raw_fx_rate(r: &crate::fx::ExchangeRate) -> RawFxRate {
     }
 }
 
-/// Days of closes loaded before and after a split date to tell whether the
-/// provider already adjusted the series.
-const SPLIT_QUOTES_BEFORE_DAYS: i64 = 10;
-const SPLIT_QUOTES_AFTER_DAYS: i64 = 31;
+/// An observed (holdings) snapshot as the kernel reads it. Positions and cash
+/// come out of hash maps: they are sorted so the loaded facts (and the
+/// fingerprint computed over them) do not depend on map iteration order,
+/// which differs per load.
+pub(super) fn raw_observed_snapshot(
+    snapshot: &crate::portfolio::snapshot::AccountStateSnapshot,
+) -> RawObservedSnapshot {
+    let mut positions: Vec<RawObservedPosition> = snapshot
+        .positions
+        .values()
+        .map(|p| RawObservedPosition {
+            asset_id: p.asset_id.clone(),
+            currency: p.currency.clone(),
+            quantity: p.quantity,
+            average_cost: p.average_cost,
+            total_cost_basis: p.total_cost_basis,
+            cost_basis_account: p.cost_basis_account,
+            cost_basis_base: p.cost_basis_base,
+        })
+        .collect();
+    positions.sort_by(|a, b| a.asset_id.cmp(&b.asset_id));
+    let mut cash: Vec<(String, Decimal)> = snapshot
+        .cash_balances
+        .iter()
+        .map(|(c, a)| (c.clone(), *a))
+        .collect();
+    cash.sort_by(|a, b| a.0.cmp(&b.0));
+    RawObservedSnapshot {
+        account_id: snapshot.account_id.clone(),
+        date: snapshot.snapshot_date,
+        positions,
+        cash,
+        cost_basis: snapshot.cost_basis,
+        net_contribution: snapshot.net_contribution,
+        net_contribution_base: snapshot.net_contribution_base,
+        cash_total_account_currency: snapshot.cash_total_account_currency,
+        cash_total_base_currency: snapshot.cash_total_base_currency,
+    }
+}
+
+/// Whether the kernel can use a close: one it would drop at normalize (not
+/// positive, outside its range, without a currency) leaves a window that
+/// starts from it without the price a run over the whole range carries.
+fn usable(quote: &RawQuote) -> bool {
+    !engine::normalize_quotes(vec![quote.clone()], &BTreeMap::new(), &mut Vec::new()).is_empty()
+}
 
 /// Quotes of one window: every observation from `start` through `end`, plus
-/// each asset's last observation before `start` (the sparse read's seed), so a
-/// price carries into the window exactly as it would through the whole range.
+/// each asset's last usable observation before `start` (the sparse read's
+/// seed, stepping back past any close the kernel would drop), so a price
+/// carries into the window exactly as it would through the whole range.
 pub fn window_quotes(
     deps: &FactSources,
     asset_ids: &[String],
@@ -303,12 +368,115 @@ pub fn window_quotes(
         return Ok(Vec::new());
     }
     let symbols: HashSet<String> = asset_ids.iter().cloned().collect();
-    Ok(deps
+    let mut quotes: Vec<RawQuote> = deps
         .quotes
         .get_sparse_quotes_in_range(&symbols, start, end)?
         .iter()
         .map(raw_quote)
+        .collect();
+    for asset in asset_ids {
+        let mut seed = quotes
+            .iter()
+            .filter(|q| q.asset_id == *asset && q.day < start)
+            .max_by_key(|q| q.day)
+            .cloned();
+        while let Some(unusable) = seed.filter(|q| !usable(q)) {
+            let earlier: Vec<RawQuote> = deps
+                .quotes
+                .get_sparse_quotes_in_range(
+                    &HashSet::from([asset.clone()]),
+                    unusable.day,
+                    unusable.day,
+                )?
+                .iter()
+                .map(raw_quote)
+                .filter(|q| q.day < unusable.day)
+                .collect();
+            seed = earlier.iter().max_by_key(|q| q.day).cloned();
+            quotes.extend(earlier);
+        }
+    }
+    Ok(quotes)
+}
+
+/// SPLIT rows of `assets` recorded outside `activities` (any account,
+/// archived included): a split belongs to the asset, so it decides how every
+/// holder's quotes read, whichever account recorded it (3.9.1 read them by
+/// asset too).
+fn foreign_splits(
+    deps: &FactSources,
+    assets: &BTreeSet<String>,
+    activities: &[Activity],
+) -> Result<Vec<Activity>> {
+    let known: HashSet<&str> = activities.iter().map(|a| a.id.as_str()).collect();
+    let assets: Vec<String> = assets.iter().cloned().collect();
+    Ok(deps
+        .activities
+        .get_split_activities_by_asset_ids(&assets)?
+        .into_iter()
+        .filter(|a| !known.contains(a.id.as_str()))
         .collect())
+}
+
+/// The accounts that recorded `splits` outside the run, as archived: only
+/// their split rows are loaded, so the kernel must not project them.
+fn split_accounts(
+    all_accounts: &[crate::accounts::Account],
+    known: &BTreeSet<String>,
+    splits: &[Activity],
+) -> Vec<RawAccount> {
+    let recorders: BTreeSet<&str> = splits.iter().map(|a| a.account_id.as_str()).collect();
+    all_accounts
+        .iter()
+        .filter(|a| recorders.contains(a.id.as_str()) && !known.contains(&a.id))
+        .map(|a| RawAccount {
+            is_archived: true,
+            ..raw_account(a)
+        })
+        .collect()
+}
+
+/// The closes that tell whether the provider already adjusted each split:
+/// its asset's last usable close before the split day and its first usable
+/// close on or after it, however far away either is (sparse, manually
+/// entered history included).
+fn split_evidence<'a>(
+    deps: &FactSources,
+    splits: impl IntoIterator<Item = &'a Activity>,
+    timezone: chrono_tz::Tz,
+    as_of: NaiveDate,
+) -> Result<Vec<RawQuote>> {
+    let days: BTreeSet<(String, NaiveDate)> = splits
+        .into_iter()
+        .filter_map(|a| {
+            a.asset_id.clone().map(|asset| {
+                (
+                    asset,
+                    crate::utils::time_utils::activity_date_in_tz(a.activity_date, timezone),
+                )
+            })
+        })
+        .filter(|(_, day)| *day <= as_of)
+        .collect();
+    let mut quotes = Vec::new();
+    for (asset, day) in days {
+        let asset = std::slice::from_ref(&asset);
+        quotes.extend(window_quotes(deps, asset, day, day)?);
+        let mut from = day;
+        let mut span = 31;
+        while from <= as_of {
+            let to = (from + chrono::Duration::days(span)).min(as_of);
+            let found = window_quotes(deps, asset, from, to)?;
+            let after = found.iter().any(|q| q.day >= day && usable(q));
+            quotes.extend(found);
+            if after {
+                break;
+            }
+            from = to + chrono::Duration::days(1);
+            span *= 4;
+        }
+    }
+    Ok(quotes)
 }
 
 pub struct LoadedFacts {
@@ -372,7 +540,7 @@ pub fn load(
     let (closure, closure_activities) =
         deps.closure_activities(&scope.iter().cloned().collect::<BTreeSet<String>>())?;
 
-    let accounts: Vec<RawAccount> = all_accounts
+    let mut accounts: Vec<RawAccount> = all_accounts
         .iter()
         .filter(|a| closure.contains(&a.id))
         .map(|a| RawAccount {
@@ -404,40 +572,7 @@ pub fn load(
                 invalid_snapshot_dates.push((account.id.clone(), snapshot.snapshot_date));
                 continue;
             }
-            // Positions and cash come out of hash maps: sort them so the
-            // loaded facts (and the fingerprint computed over them) do not
-            // depend on map iteration order, which differs per load.
-            let mut positions: Vec<RawObservedPosition> = snapshot
-                .positions
-                .values()
-                .map(|p| RawObservedPosition {
-                    asset_id: p.asset_id.clone(),
-                    currency: p.currency.clone(),
-                    quantity: p.quantity,
-                    average_cost: p.average_cost,
-                    total_cost_basis: p.total_cost_basis,
-                    cost_basis_account: p.cost_basis_account,
-                    cost_basis_base: p.cost_basis_base,
-                })
-                .collect();
-            positions.sort_by(|a, b| a.asset_id.cmp(&b.asset_id));
-            let mut cash: Vec<(String, Decimal)> = snapshot
-                .cash_balances
-                .iter()
-                .map(|(c, a)| (c.clone(), *a))
-                .collect();
-            cash.sort_by(|a, b| a.0.cmp(&b.0));
-            observed_snapshots.push(RawObservedSnapshot {
-                account_id: snapshot.account_id.clone(),
-                date: snapshot.snapshot_date,
-                positions,
-                cash,
-                cost_basis: snapshot.cost_basis,
-                net_contribution: snapshot.net_contribution,
-                net_contribution_base: snapshot.net_contribution_base,
-                cash_total_account_currency: snapshot.cash_total_account_currency,
-                cash_total_base_currency: snapshot.cash_total_base_currency,
-            });
+            observed_snapshots.push(raw_observed_snapshot(&snapshot));
         }
     }
 
@@ -470,21 +605,21 @@ pub fn load(
         })
         .collect();
 
-    // Split detection looks at the closes around each split, over the whole
-    // range; every other quote is read per window.
-    let mut quotes = Vec::new();
-    for activity in activities.iter().filter(|a| a.effective_type() == "SPLIT") {
-        let Some(asset) = &activity.asset_id else {
-            continue;
-        };
-        let day = activity.activity_date.date_naive();
-        quotes.extend(window_quotes(
-            deps,
-            std::slice::from_ref(asset),
-            day - chrono::Duration::days(SPLIT_QUOTES_BEFORE_DAYS),
-            (day + chrono::Duration::days(SPLIT_QUOTES_AFTER_DAYS)).min(as_of),
-        )?);
-    }
+    // Splits of these assets recorded elsewhere, and the closes around every
+    // split, over the whole range; every other quote is read per window.
+    let foreign = foreign_splits(deps, &asset_ids, &closure_activities)?;
+    accounts.extend(split_accounts(&all_accounts, &closure, &foreign));
+    let tz: chrono_tz::Tz = timezone.parse().unwrap_or(chrono_tz::Tz::UTC);
+    let quotes = split_evidence(
+        deps,
+        activities
+            .iter()
+            .copied()
+            .filter(|a| a.effective_type() == "SPLIT")
+            .chain(&foreign),
+        tz,
+        as_of,
+    )?;
 
     let fx_rows = deps.fx_rates.get_historical_exchange_rates()?;
     let fx_pairs: BTreeMap<String, (String, String)> = fx_rows
@@ -514,7 +649,12 @@ pub fn load(
         as_of,
     );
 
-    let raw_activities: Vec<RawActivity> = activities.iter().map(|a| raw_activity(a)).collect();
+    let raw_activities: Vec<RawActivity> = activities
+        .iter()
+        .copied()
+        .chain(&foreign)
+        .map(raw_activity)
+        .collect();
 
     Ok(LoadedFacts {
         scope,

@@ -1536,6 +1536,28 @@ impl ActivityRepositoryTrait for ActivityRepository {
         Ok(activities_db.into_iter().map(Activity::from).collect())
     }
 
+    fn get_split_activities_by_asset_ids(&self, asset_ids: &[String]) -> Result<Vec<Activity>> {
+        if asset_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = get_connection(&self.pool)?;
+        let mut results = Vec::new();
+        for chunk in chunk_for_sqlite(asset_ids) {
+            let activities_db = activities::table
+                .filter(activities::asset_id.eq_any(chunk))
+                .filter(diesel::dsl::sql::<Bool>(
+                    "COALESCE(activity_type_override, activity_type) = 'SPLIT'",
+                ))
+                .select(ActivityDB::as_select())
+                .order(activities::activity_date.asc())
+                .load::<ActivityDB>(&mut conn)
+                .map_err(StorageError::from)?;
+            results.extend(activities_db.into_iter().map(Activity::from));
+        }
+        results.sort_by_key(|activity| activity.activity_date);
+        Ok(results)
+    }
+
     fn get_activities_by_source_group_ids(&self, group_ids: &[String]) -> Result<Vec<Activity>> {
         if group_ids.is_empty() {
             return Ok(Vec::new());
@@ -4204,6 +4226,56 @@ mod tests {
             all_activity_ids,
             HashSet::from(["act-active".to_string(), "act-archived".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn split_activities_by_asset_cover_every_account_and_the_effective_type() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+        insert_account(&mut conn, "acc-active");
+        insert_account_with_archived(&mut conn, "acc-archived", true);
+        for asset in ["asset-aapl", "asset-msft"] {
+            diesel::insert_into(assets::table)
+                .values((
+                    assets::id.eq(asset),
+                    assets::kind.eq("INVESTMENT"),
+                    assets::is_active.eq(1),
+                    assets::quote_mode.eq("MARKET"),
+                    assets::quote_ccy.eq("USD"),
+                    assets::created_at.eq("2024-01-15T00:00:00+00:00"),
+                    assets::updated_at.eq("2024-01-15T00:00:00+00:00"),
+                ))
+                .execute(&mut conn)
+                .expect("insert asset");
+        }
+        let rows = [
+            ("split-archived", "acc-archived", "SPLIT", "asset-aapl"),
+            ("split-override", "acc-active", "ADJUSTMENT", "asset-aapl"),
+            ("buy", "acc-active", "BUY", "asset-aapl"),
+            ("split-other-asset", "acc-active", "SPLIT", "asset-msft"),
+        ];
+        for (id, account, kind, asset) in rows {
+            insert_activity_with_subtype(&mut conn, id, account, kind, Some(asset), None);
+        }
+        diesel::update(activities::table.filter(activities::id.eq("split-override")))
+            .set(activities::activity_type_override.eq(Some("SPLIT")))
+            .execute(&mut conn)
+            .expect("override");
+        drop(conn);
+
+        let mut ids: Vec<String> = repo
+            .get_split_activities_by_asset_ids(&["asset-aapl".to_string()])
+            .expect("splits")
+            .into_iter()
+            .map(|activity| activity.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["split-archived", "split-override"]);
+        assert!(repo
+            .get_split_activities_by_asset_ids(&[])
+            .expect("empty")
+            .is_empty());
     }
 
     #[tokio::test]
