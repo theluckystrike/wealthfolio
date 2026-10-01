@@ -620,7 +620,9 @@ fn p_split_is_basis_and_cash_neutral() {
 /// internal transfers has zero external flow at portfolio scope. The one
 /// deliberate exception is a same-account FX conversion the import linker
 /// did not record: it keeps the legacy per-leg contribution (#1655), which
-/// surfaces as a net-contribution fallback flow.
+/// surfaces as a net-contribution fallback flow. Days where something else
+/// brings money in (a transfer's shortfall, a holdings snapshot, an account
+/// opening) are P-AGG's: it states what each account adds.
 #[test]
 fn p_txf_internal_pairs_cancel_at_portfolio_scope() {
     for scenario in corpus() {
@@ -636,6 +638,9 @@ fn p_txf_internal_pairs_cancel_at_portfolio_scope() {
             &scope,
             Window::default(),
         ) else {
+            continue;
+        };
+        let Some(start) = portfolio.days.first().map(|d| d.date) else {
             continue;
         };
         let mut by_day: BTreeMap<NaiveDate, Vec<&EconomicEvent>> = BTreeMap::new();
@@ -690,7 +695,16 @@ fn p_txf_internal_pairs_cancel_at_portfolio_scope() {
                         })
                     })
             });
-            if !only_internal_pairs || holdings_flow {
+            // An account opening inside the portfolio brings money in.
+            let opening = *day != start
+                && scope.iter().any(|id| {
+                    pipeline
+                        .series
+                        .get(id)
+                        .and_then(|s| s.days.first())
+                        .is_some_and(|first| first.date == *day)
+                });
+            if !only_internal_pairs || holdings_flow || opening {
                 continue;
             }
             let Some(row) = portfolio.days.iter().find(|d| d.date == *day) else {
@@ -1596,10 +1610,11 @@ fn p_reject_a_rejected_activity_leaves_no_trace() {
 }
 
 /// P-TXF-LEGS: a security transfer moves lots, it does not make them. The
-/// incoming leg of a pair opens what the outgoing leg removed (units, cost in
-/// base and in the receiving currency, acquisition dates), and no lot is left
-/// behind in the transfer cache. A transfer valued at cost carries the cost
-/// the fold booked for it.
+/// incoming leg of a pair delivers what the outgoing leg removed (units, cost
+/// in base and in the receiving currency, acquisition dates), plus the units
+/// its sender lacked at the transfer's price, whether it opens lots or covers
+/// an opposite position; no lot is left behind in the transfer cache. A pair
+/// valued at cost flows the cost it moved, read from the sender.
 #[test]
 fn p_txf_legs_transfers_carry_their_lots() {
     let mut checked = 0usize;
@@ -1625,6 +1640,10 @@ fn p_txf_legs_transfers_carry_their_lots() {
                 })
                 .collect()
         };
+
+        let effects = pipeline.effects(&pipeline.bundle.disposals, &lots, &rejected);
+        let policy = pipeline.facts().policy();
+        let base = policy.base_currency.as_str();
 
         // Lots move only between accounts the fold projects.
         let projected = |id: &AccountId| {
@@ -1652,35 +1671,37 @@ fn p_txf_legs_transfers_carry_their_lots() {
             else {
                 continue;
             };
-            // Incoming lots that first cover a short are split (NOM-TXF-04),
-            // and a lot record's split ratio includes splits after the
-            // transfer: neither compares unit for unit.
-            let Action::SecurityTransfer { asset, .. } = &out.action else {
+            let Action::SecurityTransfer {
+                asset, quantity, ..
+            } = &incoming.action
+            else {
                 continue;
             };
+            // A lot record's split ratio includes splits after the transfer,
+            // so units compare only without one; costs and dates do not split.
             let split_since = pipeline.facts().activities().iter().any(|a| {
                 a.kind == ActivityKind::Split
                     && a.asset.as_ref() == Some(asset)
                     && a.date >= out.date
             });
-            let covered = pipeline
-                .bundle
-                .disposals
-                .iter()
-                .any(|d| d.event == incoming.id);
-            if split_since || covered {
-                continue;
-            }
             let removed: Vec<&LotDisposal> = pipeline
                 .bundle
                 .disposals
                 .iter()
                 .filter(|d| d.event == out.id)
                 .collect();
-            if removed.is_empty() {
-                continue;
-            }
             let added = opened_by(incoming);
+            // Units an incoming leg uses to cover an opposite position close
+            // lots instead of opening them (NOM-TXF-04): delivered all the
+            // same, at the cost the cover's proceeds record.
+            let covering: Vec<&LotDisposal> = pipeline
+                .bundle
+                .disposals
+                .iter()
+                .filter(|d| {
+                    d.event == incoming.id && d.account == incoming.account && !d.quantity.is_zero()
+                })
+                .collect();
             let id = format!("{}: P-TXF-LEGS {}", scenario.id, pair.group_id);
             let sent_units: Decimal = removed.iter().map(|d| d.quantity).sum();
             // Disposals count units after splits; a lot keeps its as-acquired
@@ -1688,38 +1709,103 @@ fn p_txf_legs_transfers_carry_their_lots() {
             let received_units: Decimal = added
                 .iter()
                 .map(|l| l.original_quantity * l.split_ratio)
-                .sum();
+                .sum::<Decimal>()
+                - covering.iter().map(|d| d.quantity).sum::<Decimal>();
             // The receiver books the units its own activity records; the
-            // sender gives what it held, so a shortfall (a history that
-            // starts after the units were acquired) arrives at the
-            // transfer's price and is the only difference.
-            let Action::SecurityTransfer { quantity, .. } = incoming.action else {
-                continue;
-            };
-            let topped_up = sent_units.abs() + DUST < quantity;
-            if sent_units.is_sign_positive() {
+            // sender gives what it held (nothing when it held none), so a
+            // shortfall (a history that starts after the units were acquired)
+            // arrives at the transfer's price and is the only difference.
+            let missing = *quantity - sent_units.abs();
+            let topped_up = missing > DUST;
+            if !split_since {
+                if sent_units.is_sign_positive() {
+                    assert!(
+                        (received_units - quantity).abs() <= DUST,
+                        "{id}: units {received_units} received, the activity records {quantity}"
+                    );
+                }
                 assert!(
-                    (received_units - quantity).abs() <= DUST,
-                    "{id}: units {received_units} received, the activity records {quantity}"
+                    topped_up || (received_units - sent_units).abs() <= DUST,
+                    "{id}: units {received_units} received, {sent_units} sent"
                 );
             }
-            assert!(
-                topped_up || (received_units - sent_units).abs() <= DUST,
-                "{id}: units {received_units} received, {sent_units} sent"
-            );
-            if topped_up {
-                checked += 1;
-                continue;
-            }
-            // A leg's fee is capitalised into the lots it delivers (§ the
-            // TRANSFER_IN row): costs compare only without one.
+
+            // Cost in base: what the sender removed, plus the units it lacked
+            // at the transfer's price. A leg's fee is capitalised into the
+            // lots it delivers (§ the TRANSFER_IN row): costs compare only
+            // without one; a short's shortfall is left to the goldens. Units
+            // that cover convert their cost at the transfer day's rate, as
+            // every disposal's proceeds do: across currencies they compare in
+            // their own currency below.
             let fees = !out.charges.fee.is_zero() || !incoming.charges.fee.is_zero();
+            let covers_across = covering.iter().any(|d| d.currency.as_str() != base);
             let sent_base: Decimal = removed.iter().map(|d| d.cost_basis_base).sum();
-            let received_base: Decimal = added.iter().map(|l| l.original_cost_basis_base).sum();
-            assert!(
-                fees || close(received_base, sent_base),
-                "{id}: cost in base {received_base} received, {sent_base} sent"
-            );
+            let topped_up_base = if topped_up {
+                pipeline
+                    .facts()
+                    .activities()
+                    .iter()
+                    .find(|a| a.id == pair.transfer_in)
+                    .and_then(|activity| {
+                        let (major, unit) = policy.normalize_currency(activity.currency.as_str());
+                        let multiplier = pipeline
+                            .facts()
+                            .assets()
+                            .get(asset)
+                            .map(|a| a.contract_multiplier)
+                            .unwrap_or(Decimal::ONE);
+                        fx.convert(
+                            missing * activity.unit_price * unit * multiplier,
+                            major,
+                            base,
+                            incoming.date,
+                        )
+                    })
+            } else {
+                Some(Decimal::ZERO)
+            };
+            let moved_base = topped_up_base
+                .filter(|_| {
+                    !fees && !covers_across && (!topped_up || !sent_units.is_sign_negative())
+                })
+                .map(|topped_up_base| sent_base + topped_up_base);
+            if let Some(moved_base) = moved_base {
+                let covered_base: Decimal = covering
+                    .iter()
+                    .map(|d| {
+                        if d.quantity.is_sign_negative() {
+                            d.proceeds_base.abs()
+                        } else {
+                            -d.proceeds_base.abs()
+                        }
+                    })
+                    .sum();
+                let received_base: Decimal = added
+                    .iter()
+                    .map(|l| l.original_cost_basis_base)
+                    .sum::<Decimal>()
+                    + covered_base;
+                assert!(
+                    close(received_base, moved_base),
+                    "{id}: cost in base {received_base} received, {moved_base} moved"
+                );
+                // Without a quote both legs flow at cost: the incoming one
+                // what the pair moved, read from the sender's records
+                // (EDGE-TXF-15), never from what the receiver booked.
+                let at_cost = effects
+                    .events
+                    .iter()
+                    .find(|e| e.source == pair.transfer_in && e.account == incoming.account)
+                    .and_then(|e| e.flow)
+                    .filter(|flow| flow.source == FlowSource::CostBasisFallback);
+                if let Some(flow) = at_cost {
+                    assert!(
+                        close(flow.amount, moved_base.abs()),
+                        "{id}: the incoming leg flows {} at cost, the pair moved {moved_base}",
+                        flow.amount
+                    );
+                }
+            }
 
             let sources: Option<Vec<&LotRecord>> = removed
                 .iter()
@@ -1732,11 +1818,31 @@ fn p_txf_legs_transfers_carry_their_lots() {
                 continue;
             };
             // As sets: a lot split by the sender's dust (a split's rounding)
-            // is one acquisition, and dust is not booked.
+            // is one acquisition, and dust is not booked. Units the sender
+            // lacked are acquired on the transfer's day; covering units open
+            // nothing.
             let sent_dates: BTreeSet<NaiveDate> = sources.iter().map(|l| l.open_date).collect();
             let received_dates: BTreeSet<NaiveDate> = added.iter().map(|l| l.open_date).collect();
-            assert_eq!(received_dates, sent_dates, "{id}: acquisition dates");
-            if let Some(receiving) = added.first().map(|l| l.currency.as_str()).filter(|_| !fees) {
+            let mut allowed = sent_dates.clone();
+            if topped_up {
+                allowed.insert(incoming.date);
+            }
+            assert!(
+                received_dates.is_subset(&allowed),
+                "{id}: acquisition dates {received_dates:?} received, {sent_dates:?} sent"
+            );
+            if covering.is_empty() {
+                assert!(
+                    sent_dates.is_subset(&received_dates),
+                    "{id}: acquisition dates {received_dates:?} received, {sent_dates:?} sent"
+                );
+            }
+            let plain = !fees && !topped_up;
+            let receiving = added
+                .first()
+                .map(|l| l.currency.as_str())
+                .or_else(|| covering.first().map(|d| d.currency.as_str()));
+            if let Some(receiving) = receiving.filter(|_| plain) {
                 let sent = removed
                     .iter()
                     .zip(&sources)
@@ -1745,7 +1851,18 @@ fn p_txf_legs_transfers_carry_their_lots() {
                     })
                     .sum::<Option<Decimal>>();
                 if let Some(sent) = sent {
-                    let received: Decimal = added.iter().map(|l| l.original_cost_basis).sum();
+                    let covered: Decimal = covering
+                        .iter()
+                        .map(|d| {
+                            if d.quantity.is_sign_negative() {
+                                d.proceeds.abs()
+                            } else {
+                                -d.proceeds.abs()
+                            }
+                        })
+                        .sum();
+                    let received: Decimal =
+                        added.iter().map(|l| l.original_cost_basis).sum::<Decimal>() + covered;
                     assert!(
                         close(received, sent),
                         "{id}: cost {received} {receiving} received, {sent} sent"
@@ -1772,12 +1889,18 @@ fn p_txf_legs_transfers_carry_their_lots() {
             );
         }
 
-        // A transfer valued at cost carries the cost the fold booked, less
-        // the charges capitalised into it (they are no flow, NOM-TXF-03).
-        let effects = pipeline.effects(&pipeline.bundle.disposals, &lots, &rejected);
+        // An unpaired transfer valued at cost carries the cost it booked,
+        // less the charges capitalised into it (they are no flow,
+        // NOM-TXF-03); a paired one is checked above against its sender.
         for effect in &effects.events {
             let Some(flow) = &effect.flow else { continue };
-            if flow.source != FlowSource::CostBasisFallback {
+            if flow.source != FlowSource::CostBasisFallback
+                || pipeline
+                    .facts()
+                    .transfer_pairs()
+                    .pair_for(&effect.source)
+                    .is_some()
+            {
                 continue;
             }
             let Some(event) = event_of(&effect.source) else {
@@ -1790,7 +1913,6 @@ fn p_txf_legs_transfers_carry_their_lots() {
             // The leg's own fee (capitalised; its tax is not), not the fees
             // its lots carried in from the sender's purchases (part of the
             // cost).
-            let base = pipeline.facts().policy().base_currency.as_str();
             let Some(charges) =
                 fx.convert(event.charges.fee, event.currency.as_str(), base, event.date)
             else {

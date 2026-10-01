@@ -254,17 +254,18 @@ pub fn aggregate_scope(
     // Each account adds its own row's flows (its activities', a fallback, or
     // those inferred at its snapshots) less its legs of transfer pairs inside
     // the scope, so another account's flow on the same day never changes an
-    // account's share. Each account nets only its own legs, at most what it
-    // adds.
+    // account's share.
     let adjustments = internal_adjustments(effects, scope, window);
     let scope_start = histories
         .iter()
         .filter_map(|history| history.days.first())
         .map(|day| day.date)
         .min();
-    let mut netted: BTreeMap<NaiveDate, (Decimal, Decimal)> = BTreeMap::new();
     let mut by_date: BTreeMap<NaiveDate, DailyValuation> = BTreeMap::new();
     for history in &histories {
+        let holdings = effects
+            .account(&history.account)
+            .is_some_and(|account| account.tracking == TrackingMode::Holdings);
         let inception = series
             .get(&history.account)
             .and_then(|own| own.days.first())
@@ -274,15 +275,14 @@ pub fn aggregate_scope(
                 && Some(day.date) == inception
                 && Some(day.date) != scope_start
             {
-                opening_flow(effects, &history.account, day, window)
+                opening_flow(effects, &history.account, day, holdings, window)
             } else {
                 day.flow
             };
-            if let Some((inflow, outflow)) = adjustments.get(&(&history.account, day.date)) {
-                let entry = netted.entry(day.date).or_default();
-                entry.0 += flow.inflow_base.min(*inflow);
-                entry.1 += flow.outflow_base.min(*outflow);
-            }
+            let flow = match adjustments.get(&(&history.account, day.date)) {
+                Some(legs) => net_internal(flow, *legs, holdings),
+                None => flow,
+            };
             let entry = by_date.entry(day.date).or_insert_with(|| DailyValuation {
                 date: day.date,
                 fx_rate_to_base: Decimal::ONE,
@@ -329,14 +329,6 @@ pub fn aggregate_scope(
     if let Some(first) = days.first_mut() {
         first.flow = DailyFlow::default();
     }
-    for day in days.iter_mut().skip(1) {
-        if let Some((inflow, outflow)) = netted.get(&day.date) {
-            day.flow.inflow_base -= inflow;
-            day.flow.outflow_base -= outflow;
-        }
-        // Netting removes scope-internal legs; it adds no differently valued
-        // flow, so the day keeps the provenance of the flows that survive.
-    }
 
     Ok(ValuationSeries {
         account: AccountId::new(
@@ -354,15 +346,35 @@ pub fn aggregate_scope(
 
 /// What an account's first day adds to a scope that already exists. Its row
 /// has no flow (the money that opens an account is its starting value), but
-/// at the scope that money arrives: what its activities brought in that day,
-/// else its net contribution (an account opened without a recorded flow,
-/// such as a holdings account's first snapshot).
+/// at the scope that money arrives. A holdings account brings its first
+/// snapshot's value, as a transition from nothing would (unknown when that
+/// snapshot is not fully priced); a transactions account what its activities
+/// brought in that day, else its net contribution.
 fn opening_flow(
     effects: &Effects,
     account: &AccountId,
     day: &DailyValuation,
+    holdings: bool,
     window: Window,
 ) -> DailyFlow {
+    if holdings {
+        if day.value_status != ValueStatus::Complete {
+            return DailyFlow {
+                inflow_base: Decimal::ZERO,
+                outflow_base: Decimal::ZERO,
+                source: FlowSource::UnpricedHoldingsTransition,
+            };
+        }
+        if day.total_value_base.is_zero() {
+            return DailyFlow::default();
+        }
+        let (inflow_base, outflow_base) = split_flow(day.total_value_base);
+        return DailyFlow {
+            inflow_base,
+            outflow_base,
+            source: FlowSource::QuoteDerivedMarketValue,
+        };
+    }
     if let Some(flow) = scope_flows(effects, std::slice::from_ref(account), window).get(&day.date) {
         return *flow;
     }
@@ -374,6 +386,36 @@ fn opening_flow(
         inflow_base,
         outflow_base,
         source: FlowSource::NetContributionFallback,
+    }
+}
+
+/// An account's flow less its legs of transfer pairs inside the scope. A
+/// transactions account's flows are its legs, each on its side, so each side
+/// loses its legs (at most what it holds). A holdings account's flow is one
+/// net movement inferred at its snapshots, so the legs come off that net and
+/// what remains is its external flow, whichever side it falls on; an
+/// undetermined one stays undetermined.
+fn net_internal(
+    flow: DailyFlow,
+    (inflow, outflow): (Decimal, Decimal),
+    holdings: bool,
+) -> DailyFlow {
+    let (inflow_base, outflow_base) = if !holdings {
+        (
+            flow.inflow_base - flow.inflow_base.min(inflow),
+            flow.outflow_base - flow.outflow_base.min(outflow),
+        )
+    } else if flow.source.has_known_amount() {
+        split_flow(flow.inflow_base - flow.outflow_base - (inflow - outflow))
+    } else {
+        return flow;
+    };
+    // Netting removes scope-internal legs; it adds no differently valued
+    // flow, so the day keeps the provenance of the flows that survive.
+    DailyFlow {
+        inflow_base,
+        outflow_base,
+        source: flow.source,
     }
 }
 
@@ -1263,7 +1305,8 @@ struct TransferRecords {
     /// that disposed only short lots, an incoming leg that opened short lots
     /// or, opening none, covered long ones.
     short: BTreeSet<ActivityId>,
-    /// Cost in base of the lots each incoming leg opened in its account.
+    /// Cost in base of the units each incoming leg delivered to its account:
+    /// the lots it opened and the opposite position it covered.
     booked: BTreeMap<(AccountId, ActivityId), Decimal>,
 }
 
@@ -1289,15 +1332,33 @@ fn transfer_records(
         }
     }
     let mut short = BTreeSet::new();
+    let mut covered: BTreeMap<(AccountId, ActivityId), Option<Decimal>> = BTreeMap::new();
     for event in &ledger.events {
         let Action::SecurityTransfer { direction, .. } = event.action else {
             continue;
         };
-        let disposed: Vec<Decimal> = disposals
+        let own: Vec<&LotDisposal> = disposals
             .iter()
             .filter(|d| d.event == event.id && d.account == event.account && !d.quantity.is_zero())
-            .map(|d| d.quantity)
             .collect();
+        let disposed: Vec<Decimal> = own.iter().map(|d| d.quantity).collect();
+        if matches!(direction, Direction::In) && !own.is_empty() {
+            // Units an incoming leg used to cover an opposite position were
+            // delivered too, at the cost the cover's proceeds record, signed
+            // like the units delivered (against the lots they closed).
+            let cost = covered
+                .entry((event.account.clone(), event.source.clone()))
+                .or_insert(Some(Decimal::ZERO));
+            for disposal in &own {
+                let known = !disposal.fx_rate_to_base.is_zero() || disposal.proceeds.is_zero();
+                let delivered = if disposal.quantity.is_sign_negative() {
+                    disposal.proceeds_base.abs()
+                } else {
+                    -disposal.proceeds_base.abs()
+                };
+                *cost = cost.filter(|_| known).map(|cost| cost + delivered);
+            }
+        }
         let moved_short = match direction {
             Direction::Out => !disposed.is_empty() && disposed.iter().all(|q| q.is_sign_negative()),
             Direction::In => match opened.get(&(event.account.clone(), event.source.clone())) {
@@ -1309,11 +1370,19 @@ fn transfer_records(
             short.insert(event.source.clone());
         }
     }
+    let mut booked: BTreeMap<(AccountId, ActivityId), Option<Decimal>> = opened
+        .into_iter()
+        .map(|(key, (_, cost))| (key, cost))
+        .collect();
+    for (key, cost) in covered {
+        let total = booked.entry(key).or_insert(Some(Decimal::ZERO));
+        *total = total.zip(cost).map(|(opened, covered)| opened + covered);
+    }
     TransferRecords {
         short,
-        booked: opened
+        booked: booked
             .into_iter()
-            .filter_map(|(key, (_, cost))| cost.map(|cost| (key, cost)))
+            .filter_map(|(key, cost)| cost.map(|cost| (key, cost)))
             .collect(),
     }
 }
@@ -1552,13 +1621,12 @@ fn internal_adjustments<'a>(
             && scope.contains(&pair.in_account)
             && scope.contains(&pair.out_account)
     }) {
+        // Both legs, wherever the window cuts: the share depends on the pair,
+        // and only the legs inside the window are netted.
         let leg = |source: &ActivityId| {
-            by_source.get(source.as_str()).and_then(|event| {
-                event
-                    .flow
-                    .filter(|_| window.contains(event.date))
-                    .map(|flow| (*event, flow))
-            })
+            by_source
+                .get(source.as_str())
+                .and_then(|event| event.flow.map(|flow| (*event, flow)))
         };
         let (incoming, outgoing) = (leg(&pair.transfer_in), leg(&pair.transfer_out));
         // A security pair whose sender held less than it sent books the
@@ -1582,6 +1650,7 @@ fn internal_adjustments<'a>(
         ]
         .into_iter()
         .flatten()
+        .filter(|(event, ..)| window.contains(event.date))
         {
             let Some(amount) = arith::mul(flow.amount, share) else {
                 continue;
