@@ -909,12 +909,13 @@ fn value_snapshot(
     Some(total)
 }
 
-/// P-HOLD: a holdings account's flows come only from its snapshots, which
-/// hold what it records. It has a flow only on a snapshot day after its
-/// first, and there the net flow is the new snapshot's value less the
-/// previous snapshot's holdings at that day's prices: a deposit it records
-/// adds no flow of its own (EDGE-MIX-04). Re-derived where the account
-/// currency is the base's, without splits.
+/// P-HOLD (rules R1.2): a holdings account's flows come only from its
+/// snapshots, which hold what it records. It has a flow only on a snapshot
+/// day after its first, and on every such day the net flow is the new
+/// snapshot's value less the previous snapshot's holdings at that day's
+/// prices, zero included: a deposit or transfer it records adds no flow of
+/// its own (EDGE-MIX-04, EDGE-MIX-05). Re-derived where the account currency
+/// is the base's, both snapshots are priced, and no asset split.
 #[test]
 fn p_hold_holdings_flows_come_from_snapshots() {
     let mut checked = 0usize;
@@ -943,16 +944,19 @@ fn p_hold_holdings_flows_come_from_snapshots() {
                 .collect();
             snapshots.sort_by_key(|s| s.date);
             for (index, row) in series.days.iter().enumerate() {
-                if row.flow == DailyFlow::default() {
-                    continue;
-                }
                 let id = format!("{}: P-HOLD {account} on {}", scenario.id, row.date);
+                let snapshot_day = snapshots.iter().any(|s| s.date == row.date);
                 assert!(
-                    index > 0 && snapshots.iter().any(|s| s.date == row.date),
+                    row.flow == DailyFlow::default() || (index > 0 && snapshot_day),
                     "{id}: a flow without a snapshot ({:?})",
                     row.flow
                 );
-                if row.flow.source != FlowSource::QuoteDerivedMarketValue
+                // Every snapshot after the first, with a flow or without one:
+                // a flow it should carry and does not fails here too.
+                if index == 0
+                    || !snapshot_day
+                    || !row.flow.source.has_known_amount()
+                    || row.value_status != ValueStatus::Complete
                     || policy.major_currency(facts.currency.as_str()) != base
                 {
                     continue;

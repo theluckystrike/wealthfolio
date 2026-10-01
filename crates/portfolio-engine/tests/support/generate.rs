@@ -1,6 +1,7 @@
 //! Generated scenarios: random combinations of the inputs the hand-written
-//! fixtures cover one at a time (archived and holdings accounts, accounts
-//! opening after the others, sparse, invalid and missing quotes, splits
+//! fixtures cover one at a time (archived and holdings accounts, activities
+//! and transfers recorded on holdings accounts, accounts opening after the
+//! others, sparse, invalid and missing quotes, splits
 //! adjusted or not by the provider, transfers across days and both ways,
 //! shorts, minor units, options, FX), written as YAML in
 //! the fixture schema. The engine's property laws and the app parity test
@@ -151,6 +152,9 @@ pub fn scenario_yaml(seed: u64) -> String {
     }
     let traders: Vec<usize> = (0..accounts.len())
         .filter(|i| !accounts[*i].holdings)
+        .collect();
+    let holders: Vec<usize> = (0..accounts.len())
+        .filter(|i| accounts[*i].holdings)
         .collect();
 
     let mut assets = Vec::new();
@@ -369,8 +373,79 @@ pub fn scenario_yaml(seed: u64) -> String {
                         }
                     }
                 }
+                8 if !holders.is_empty() => {
+                    // A transfer with a holdings account: the trading side
+                    // moves on its day, the holdings side shows only in its
+                    // snapshots (rules R2.3).
+                    let holding = &accounts[*rng.pick(&holders)];
+                    group += 1;
+                    let sends = rng.chance(60);
+                    let (from_id, to_id) = if sends {
+                        (&account.id, &holding.id)
+                    } else {
+                        (&holding.id, &account.id)
+                    };
+                    let quantity = if sends && units > 0 {
+                        1 + rng.below(units as u64)
+                    } else if !sends && !asset.option {
+                        1 + rng.below(10)
+                    } else {
+                        0
+                    };
+                    let body = if quantity > 0 && rng.chance(60) {
+                        let signed = quantity as i64;
+                        *held.entry((index, a)).or_default() +=
+                            if sends { -signed } else { signed };
+                        format!(
+                            "asset: {}, quantity: {quantity}, unit_price: {price}, source_group_id: g{group}",
+                            asset.id
+                        )
+                    } else {
+                        format!(
+                            "amount: {}, currency: {}, source_group_id: g{group}",
+                            10 + rng.below(200),
+                            account.currency
+                        )
+                    };
+                    ledger.row(day, from_id, &format!("type: TRANSFER_OUT, {body}"));
+                    ledger.row(day, to_id, &format!("type: TRANSFER_IN, {body}"));
+                }
                 _ => {}
             }
+        }
+        // Holdings accounts record activities too; their numbers come only
+        // from their snapshots (rules R1.2), so what they record moves
+        // nothing but the income, fees and taxes reports.
+        for &index in &holders {
+            if !rng.chance(6) {
+                continue;
+            }
+            let account = &accounts[index];
+            let kind = *rng.pick(&[
+                "DEPOSIT",
+                "WITHDRAWAL",
+                "DIVIDEND",
+                "INTEREST",
+                "FEE",
+                "TAX",
+            ]);
+            let asset_field = if kind == "DIVIDEND" {
+                format!(
+                    ", asset: {}",
+                    assets[rng.below(assets.len() as u64) as usize].id
+                )
+            } else {
+                String::new()
+            };
+            ledger.row(
+                day,
+                &account.id,
+                &format!(
+                    "type: {kind}{asset_field}, amount: {}, currency: {}",
+                    1 + rng.below(80),
+                    account.currency
+                ),
+            );
         }
     }
 
