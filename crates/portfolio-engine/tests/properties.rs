@@ -841,6 +841,11 @@ fn p_agg_scope_aggregation_is_exact() {
                     "{id}: {} outflow",
                     row.date
                 );
+                assert_eq!(
+                    scoped.flow.source, row.flow.source,
+                    "{id}: {} flow source",
+                    row.date
+                );
             }
         }
         let Ok(portfolio) = aggregate_scope(&effects, &pipeline.series, &scope, Window::default())

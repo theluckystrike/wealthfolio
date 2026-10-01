@@ -437,7 +437,9 @@ pub fn value(inputs: &ValueInputs<'_>) -> BTreeMap<AccountId, ValuationSeries>;
 pub fn effects(resolved: &Resolved<'_>, disposals: &[LotDisposal]) -> Effects;
 
 /// Scope aggregation: per-day sums in base currency with internal transfers
-/// (both legs in scope) netted out.
+/// (both legs in scope) netted out. On a day with activity flows those flows
+/// replace the summed rows, except a holdings account's own row flow (inferred
+/// at its snapshots), which is always kept.
 pub fn aggregate_scope(
     effects: &Effects,
     series: &BTreeMap<AccountId, ValuationSeries>,
