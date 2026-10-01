@@ -1378,15 +1378,6 @@ fn p_flow_flows_account_for_the_value_they_move() {
     assert!(checked > 20, "only {checked} flow days checked");
 }
 
-/// State at the end of `day` (the last keyframe on or before it).
-fn state_on(frames: Option<&Vec<Keyframe>>, day: NaiveDate) -> Option<&AccountState> {
-    frames?
-        .iter()
-        .rev()
-        .find(|k| k.date <= day)
-        .map(|k| &k.state)
-}
-
 /// P-REJECT: a rejected activity is as if it had never been entered. Folding
 /// without it leaves every account in the same state on every day, and the
 /// fold reports nothing about the attempt but the rejection.
@@ -1406,16 +1397,30 @@ fn p_reject_a_rejected_activity_leaves_no_trace() {
         let other = Pipeline::from_scenario(&without);
         for (account, frames) in &pipeline.bundle.keyframes {
             for frame in frames {
-                let expected = state_on(other.bundle.keyframes.get(account), frame.date)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        AccountState::empty(account.clone(), frame.state.currency.clone())
-                    });
+                let other_frame = other
+                    .bundle
+                    .keyframes
+                    .get(account)
+                    .and_then(|f| f.iter().rev().find(|k| k.date <= frame.date));
+                let expected = other_frame.map(|k| k.state.clone()).unwrap_or_else(|| {
+                    AccountState::empty(account.clone(), frame.state.currency.clone())
+                });
+                let mut left = serde_json::to_value(&frame.state).unwrap();
+                let mut right = serde_json::to_value(&expected).unwrap();
+                // Totals at the day's rates are recomputed only on event
+                // days: without the rejected activity the day may have none.
+                if other_frame.is_none_or(|k| k.date != frame.date) {
+                    for state in [&mut left, &mut right] {
+                        for key in ["cash_total_account", "cash_total_base", "cost_basis"] {
+                            state[key] = Value::Null;
+                        }
+                    }
+                }
                 assert_same(
                     &scenario.id,
                     &format!("P-REJECT ({account} on {})", frame.date),
-                    &serde_json::to_value(&frame.state).unwrap(),
-                    &serde_json::to_value(&expected).unwrap(),
+                    &left,
+                    &right,
                 );
             }
         }
@@ -1473,13 +1478,25 @@ fn p_txf_legs_transfers_carry_their_lots() {
                 .collect()
         };
 
+        // Lots move only between accounts the fold projects.
+        let projected = |id: &AccountId| {
+            pipeline
+                .facts()
+                .accounts()
+                .get(id)
+                .is_some_and(|a| !a.archived && a.tracking != TrackingMode::Holdings)
+        };
         for pair in pipeline
             .facts()
             .transfer_pairs()
             .iter()
             .filter(|p| p.security)
         {
-            if rejected.contains(&pair.transfer_out) || rejected.contains(&pair.transfer_in) {
+            if rejected.contains(&pair.transfer_out)
+                || rejected.contains(&pair.transfer_in)
+                || !projected(&pair.out_account)
+                || !projected(&pair.in_account)
+            {
                 continue;
             }
             let (Some(out), Some(incoming)) =
@@ -1487,13 +1504,23 @@ fn p_txf_legs_transfers_carry_their_lots() {
             else {
                 continue;
             };
-            // Incoming lots that first cover a short are split (NOM-TXF-04).
-            if pipeline
+            // Incoming lots that first cover a short are split (NOM-TXF-04),
+            // and a lot record's split ratio includes splits after the
+            // transfer: neither compares unit for unit.
+            let Action::SecurityTransfer { asset, .. } = &out.action else {
+                continue;
+            };
+            let split_since = pipeline.facts().activities().iter().any(|a| {
+                a.kind == ActivityKind::Split
+                    && a.asset.as_ref() == Some(asset)
+                    && a.date >= out.date
+            });
+            let covered = pipeline
                 .bundle
                 .disposals
                 .iter()
-                .any(|d| d.event == incoming.id)
-            {
+                .any(|d| d.event == incoming.id);
+            if split_since || covered {
                 continue;
             }
             let removed: Vec<&LotDisposal> = pipeline
@@ -1508,7 +1535,12 @@ fn p_txf_legs_transfers_carry_their_lots() {
             let added = opened_by(incoming);
             let id = format!("{}: P-TXF-LEGS {}", scenario.id, pair.group_id);
             let sent_units: Decimal = removed.iter().map(|d| d.quantity).sum();
-            let received_units: Decimal = added.iter().map(|l| l.original_quantity).sum();
+            // Disposals count units after splits; a lot keeps its as-acquired
+            // units and its ratio.
+            let received_units: Decimal = added
+                .iter()
+                .map(|l| l.original_quantity * l.split_ratio)
+                .sum();
             assert_eq!(received_units, sent_units, "{id}: units");
             // A leg's fee is capitalised into the lots it delivers (§ the
             // TRANSFER_IN row): costs compare only without one.

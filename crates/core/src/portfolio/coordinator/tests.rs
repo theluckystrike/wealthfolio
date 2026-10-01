@@ -2024,3 +2024,24 @@ async fn the_app_matches_one_kernel_run_on_every_scenario() {
     );
     assert!(compared > 100, "only {compared} scenarios compared");
 }
+
+#[tokio::test]
+async fn the_app_matches_one_kernel_run_on_generated_scenarios() {
+    use crate::test_support::generate::{generated_count, scenario_yaml};
+    let mut found = Vec::new();
+    for seed in 0..generated_count() {
+        let yaml = scenario_yaml(seed);
+        let scenario: Scenario =
+            serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        scenario
+            .validate()
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        found.extend(app_differences(&scenario.facts(), &scenario.id).await);
+    }
+    assert!(
+        found.is_empty(),
+        "{} differences:\n{}",
+        found.len(),
+        found.join("\n")
+    );
+}

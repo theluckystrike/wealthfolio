@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+pub mod generate;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -424,6 +426,16 @@ pub fn scenario_selected(id: &str) -> bool {
             .any(|prefix| !prefix.is_empty() && id.starts_with(prefix)),
         _ => true,
     }
+}
+
+/// The generated scenarios (`generate`), parsed like the fixtures.
+pub fn generated_scenarios() -> Vec<Scenario> {
+    (0..generate::generated_count())
+        .map(|seed| {
+            let yaml = generate::scenario_yaml(seed);
+            serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("seed {seed}: {e}\n{yaml}"))
+        })
+        .collect()
 }
 
 pub fn load_all_scenarios() -> Vec<Scenario> {
