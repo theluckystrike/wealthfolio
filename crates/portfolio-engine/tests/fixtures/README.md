@@ -11,7 +11,7 @@ sign-off (architecture §4.5); this repository's history keeps them.
 ```bash
 # kernel goldens (regenerate with INSTA_UPDATE=always after reviewing the diff)
 cargo test -p wealthfolio-portfolio-engine --test goldens
-# property laws
+# property laws, over the fixtures and generated scenarios (GEN-*)
 cargo test -p wealthfolio-portfolio-engine --test properties
 # impact soundness (P-IMPACT)
 cargo test -p wealthfolio-portfolio-engine --test impact

@@ -722,15 +722,15 @@ Testable contract; the property suite (§5) encodes each one.
 The kernel is verified by fixtures rather than mocks: every test is facts in,
 values out.
 
-| Harness           | What it checks                                                                                                                                                                                            |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Scenario fixtures | One YAML file per scenario: facts, intent, and expected notes in prose. Nominal, edge, regression, performance and lifecycle families.                                                                    |
-| Kernel goldens    | Reviewed snapshots of full engine output per scenario: keyframes, lots, disposals, valuations with statuses, flows, performance windows.                                                                  |
-| Property laws     | The invariants of §4.6 over the whole corpus: determinism, chunk equivalence, conservation, split neutrality, transfer cancellation, honesty.                                                             |
-| Coordinator tests | The shell path: real fact loading, row mapping, persistence, freshness verdicts, plan selection, and lifecycle steps equal to a fresh rebuild.                                                            |
-| App parity        | Every scenario through the app equals one kernel run over all its facts: stored rows at one-day, two-day and yearly windows, each account rebuilt alone, and the performance reads.                       |
-| Generated corpus  | Deterministic random scenarios (`tests/support/generate.rs`) mixing archived and holdings accounts, sparse and invalid quotes, splits, transfers, shorts and minor units, run through the app parity law. |
-| Scale benchmark   | The six stages over a generated 20k-activity portfolio.                                                                                                                                                   |
+| Harness           | What it checks                                                                                                                                                                                                                  |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Scenario fixtures | One YAML file per scenario: facts, intent, and expected notes in prose. Nominal, edge, regression, performance and lifecycle families.                                                                                          |
+| Kernel goldens    | Reviewed snapshots of full engine output per scenario: keyframes, lots, disposals, valuations with statuses, flows, performance windows.                                                                                        |
+| Property laws     | The invariants of §4.6 over the whole corpus: determinism, chunk equivalence, conservation, split neutrality, transfer cancellation, honesty.                                                                                   |
+| Coordinator tests | The shell path: real fact loading, row mapping, persistence, freshness verdicts, plan selection, and lifecycle steps equal to a fresh rebuild.                                                                                  |
+| App parity        | Every scenario through the app equals one kernel run over all its facts: stored rows at one-day, two-day and yearly windows, each account rebuilt alone, and the performance reads.                                             |
+| Generated corpus  | Deterministic random scenarios (`tests/support/generate.rs`) mixing archived and holdings accounts, sparse and invalid quotes, splits, transfers, shorts and minor units, run through the property laws and the app parity law. |
+| Scale benchmark   | The six stages over a generated 20k-activity portfolio.                                                                                                                                                                         |
 
 `crates/portfolio-engine/tests/fixtures/README.md` documents the fixture schema,
 the golden format, the harnesses and how to verify a fixture by hand.

@@ -17,9 +17,11 @@ use wealthfolio_portfolio_engine::{
 
 const DUST: Decimal = Decimal::from_parts(1, 0, 0, false, 8);
 
+/// The fixtures (but shell-level ones) and the generated scenarios.
 fn corpus() -> Vec<Scenario> {
     load_all_scenarios()
         .into_iter()
+        .chain(generated_scenarios())
         .filter(|s| !s.markers.iter().any(|m| m == "S") && scenario_selected(&s.id))
         .collect()
 }
