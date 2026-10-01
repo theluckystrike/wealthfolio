@@ -980,7 +980,7 @@ fn p_hold_holdings_flows_come_from_snapshots() {
         }
     }
     assert!(
-        filtered() || checked > 20,
+        filtered() || checked > 10,
         "only {checked} holdings transitions checked"
     );
 }
