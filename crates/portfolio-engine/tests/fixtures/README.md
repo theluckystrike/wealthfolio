@@ -19,6 +19,9 @@ cargo test -p wealthfolio-portfolio-engine --test impact
 cargo test -p wealthfolio-core coordinator
 # one family or id-prefix list only (engine harnesses)
 SCENARIO_FILTER=NOM-,EDGE-CCY cargo test -p wealthfolio-portfolio-engine
+# the app against one kernel run, over the fixtures and generated scenarios
+# (tests/support/generate.rs; GENERATED_SCENARIOS sets how many, 100 by default)
+GENERATED_SCENARIOS=500 cargo test -p wealthfolio-core the_app_matches
 ```
 
 ## Schema

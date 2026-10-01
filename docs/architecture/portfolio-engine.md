@@ -179,13 +179,16 @@ and needs no checkpoint table. Accounts that only revalue are not folded.
 at each day an account starts rewriting. The fold carries its state from window
 to window in memory; before the first rewritten day it only folds. From then on
 each window loads once the quotes of the assets its accounts reference (plus
-each asset's last quote before the window), values the refolded accounts from
-the fold and the revalued ones from their stored keyframes against those quotes,
-and writes their rows together before the next window is read, so memory holds
-one window plus the running state however long the history. Activities, FX rates
-and observed snapshots load whole; the provider-adjusted splits are resolved
-once from the quotes around each split. Window invariance (P-WIN) makes a
-windowed run equal to one run over the range.
+each asset's last usable quote before the window), values the refolded accounts
+from the fold and the revalued ones from their stored keyframes against those
+quotes, and writes their rows together before the next window is read, so memory
+holds one window plus the running state however long the history. Activities, FX
+rates and observed snapshots load whole; the provider-adjusted splits are
+resolved once, from every split of the run's assets (whichever account recorded
+it, archived ones included) and each split's last usable close before it and
+first after it, however far away. Window invariance (P-WIN) makes a windowed run
+equal to one run over the range, and the app parity law (§5) holds the
+coordinator and the read path to the same answer.
 
 **Completion.** After the last window a run commits, in one transaction, the lot
 books of the refolded accounts (open lots and lots closed since the stale day),
@@ -703,6 +706,11 @@ Testable contract; the property suite (§5) encodes each one.
   account's activities and its assets' observations plus the transfer-pair
   closure. A chunked run loads observations covering the chunk plus the nearest
   observation on each side of its boundaries, bounded without loading history.
+- **Locality.** An account's results depend only on its own facts, the state
+  carried from window to window, and the shared surfaces (prices, FX, splits).
+  Nothing a path computes may need another account's records: a transfer's
+  direction, for one, is read from each leg's own lots and disposals, which
+  every path has (the fold, a revalue, a read).
 - **Parallelism granularity.** `value` and `measure` are per account and
   parallelise freely. `project` folds a transfer-closure group: accounts
   connected by transfers must fold together, unconnected groups are independent.
@@ -712,13 +720,15 @@ Testable contract; the property suite (§5) encodes each one.
 The kernel is verified by fixtures rather than mocks: every test is facts in,
 values out.
 
-| Harness           | What it checks                                                                                                                                 |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| Scenario fixtures | One YAML file per scenario: facts, intent, and expected notes in prose. Nominal, edge, regression, performance and lifecycle families.         |
-| Kernel goldens    | Reviewed snapshots of full engine output per scenario: keyframes, lots, disposals, valuations with statuses, flows, performance windows.       |
-| Property laws     | The invariants of §4.6 over the whole corpus: determinism, chunk equivalence, conservation, split neutrality, transfer cancellation, honesty.  |
-| Coordinator tests | The shell path: real fact loading, row mapping, persistence, freshness verdicts, plan selection, and lifecycle steps equal to a fresh rebuild. |
-| Scale benchmark   | The six stages over a generated 20k-activity portfolio.                                                                                        |
+| Harness           | What it checks                                                                                                                                                                                            |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Scenario fixtures | One YAML file per scenario: facts, intent, and expected notes in prose. Nominal, edge, regression, performance and lifecycle families.                                                                    |
+| Kernel goldens    | Reviewed snapshots of full engine output per scenario: keyframes, lots, disposals, valuations with statuses, flows, performance windows.                                                                  |
+| Property laws     | The invariants of §4.6 over the whole corpus: determinism, chunk equivalence, conservation, split neutrality, transfer cancellation, honesty.                                                             |
+| Coordinator tests | The shell path: real fact loading, row mapping, persistence, freshness verdicts, plan selection, and lifecycle steps equal to a fresh rebuild.                                                            |
+| App parity        | Every scenario through the app equals one kernel run over all its facts: stored rows at one-day, two-day and yearly windows, each account rebuilt alone, and the performance reads.                       |
+| Generated corpus  | Deterministic random scenarios (`tests/support/generate.rs`) mixing archived and holdings accounts, sparse and invalid quotes, splits, transfers, shorts and minor units, run through the app parity law. |
+| Scale benchmark   | The six stages over a generated 20k-activity portfolio.                                                                                                                                                   |
 
 `crates/portfolio-engine/tests/fixtures/README.md` documents the fixture schema,
 the golden format, the harnesses and how to verify a fixture by hand.
