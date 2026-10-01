@@ -19,7 +19,7 @@ use crate::compile::CompiledLedger;
 use crate::diagnostics::{Diagnostic, DiagnosticCode};
 use crate::error::EngineError;
 use crate::model::*;
-use crate::project::position_book_cost;
+use crate::project::{lot_records, position_book_cost};
 use crate::resolve::{FxResolver, ResolvedSurfaces};
 
 /// A quote or FX rate carried at least this many days is reported once per
@@ -119,17 +119,21 @@ fn value_series(
 ) -> BTreeMap<AccountId, ValuationSeries> {
     let resolved = &inputs.resolved;
     let rejected = inputs.bundle.rejected_activities();
-    let opened = match inputs.lots {
-        Some(lots) => lots_opened(lots),
-        None => bundle_lots_opened(inputs.bundle, resolved.ledger),
+    let projected;
+    let lots = match inputs.lots {
+        Some(lots) => lots,
+        None => {
+            projected = lot_records(inputs.bundle, resolved.facts, &resolved.fx());
+            &projected
+        }
     };
-    let short = short_transfers(resolved.ledger, &opened, &inputs.bundle.disposals);
+    let transfers = transfer_records(resolved.ledger, lots, &inputs.bundle.disposals);
     // Valuation reads only the flows of the accounts it values, inside the
     // range: pricing anything else would be thrown away.
     let (effects, mut pricing_diagnostics) = priced_events(
         resolved,
         &inputs.bundle.disposals,
-        &short,
+        &transfers,
         &rejected,
         Some(EventSelection {
             range: resolved.range,
@@ -525,6 +529,9 @@ struct Valuer<'a> {
     carried: BTreeMap<AssetId, (i64, NaiveDate, NaiveDate)>,
     /// Longest distance seen per FX pair: (days, valued day).
     carried_fx: BTreeMap<(String, String), (i64, NaiveDate)>,
+    /// Cost in base of the lots each incoming transfer booked, when pricing
+    /// flows (`TransferRecords::booked`).
+    booked: Option<&'a BTreeMap<(AccountId, ActivityId), Decimal>>,
 }
 
 impl<'a> Valuer<'a> {
@@ -548,6 +555,7 @@ impl<'a> Valuer<'a> {
             reported: BTreeSet::new(),
             carried: BTreeMap::new(),
             carried_fx: BTreeMap::new(),
+            booked: None,
         }
     }
 
@@ -870,6 +878,37 @@ impl<'a> Valuer<'a> {
         (total, converted)
     }
 
+    /// Whether the fold projects the event's account (not archived, not
+    /// holdings-tracked).
+    fn projected(&self, event: &EconomicEvent) -> bool {
+        self.resolved
+            .facts
+            .accounts
+            .get(&event.account)
+            .is_some_and(|a| !a.archived && a.tracking != TrackingMode::Holdings)
+    }
+
+    /// The units a security transfer moves. An outgoing leg moves what its
+    /// account held: units its history lacks (it starts after they were
+    /// acquired) leave nothing. An incoming leg receives what its activity
+    /// records.
+    fn transfer_units(
+        &self,
+        event: &EconomicEvent,
+        direction: Direction,
+        recorded: Decimal,
+    ) -> Decimal {
+        if direction == Direction::Out && self.projected(event) {
+            self.disposals
+                .iter()
+                .filter(|d| d.event == event.id && d.account == event.account)
+                .map(|d| d.quantity.abs())
+                .sum()
+        } else {
+            recorded
+        }
+    }
+
     /// Legacy transfer-flow ladder + removed-lot-basis substitution.
     fn price_flow(
         &mut self,
@@ -919,6 +958,17 @@ impl<'a> Valuer<'a> {
                     .get(asset)
                     .map(|a| a.contract_multiplier)
                     .unwrap_or(Decimal::ONE);
+                let quantity = self.transfer_units(event, direction, *quantity);
+                if quantity.is_zero() && direction == Direction::Out && self.projected(event) {
+                    return (
+                        Decimal::ZERO,
+                        if unknown {
+                            FlowSource::UnknownBoundaryTransfer
+                        } else {
+                            FlowSource::NoFlow
+                        },
+                    );
+                }
                 if let Some(quote) = self
                     .resolved
                     .surfaces
@@ -935,7 +985,7 @@ impl<'a> Valuer<'a> {
                         .split_price_factor(asset, event.date)
                         .and_then(|split_factor| {
                             arith::product(&[
-                                *quantity,
+                                quantity,
                                 quote.close,
                                 factor,
                                 split_factor,
@@ -997,15 +1047,38 @@ impl<'a> Valuer<'a> {
                         )
                     };
                 }
+                let uses_legacy_amount = unit_price.is_zero() && legacy_amount.is_some();
+                let source = if unknown {
+                    FlowSource::UnknownBoundaryTransfer
+                } else if uses_legacy_amount {
+                    FlowSource::LegacyActivityAmountFallback
+                } else {
+                    FlowSource::CostBasisFallback
+                };
+                // A paired leg receives the sender's lots at their cost, not
+                // at the activity's price: it flows the cost it booked (less
+                // its own fee, capitalised into those lots), as the outgoing
+                // leg flows the cost it removed.
+                let paired = self
+                    .resolved
+                    .facts
+                    .transfer_pairs
+                    .pair_for(&event.source)
+                    .is_some();
+                let booked = self
+                    .booked
+                    .and_then(|b| b.get(&(event.account.clone(), event.source.clone())))
+                    .copied();
+                if let (true, Some(booked)) = (paired, booked) {
+                    if let Some(fee) =
+                        self.flow_to_base(event.charges.fee, event.currency.as_str(), event)
+                    {
+                        // A short's cost is negative; its direction is the
+                        // leg's (`TransferRecords::short`).
+                        return ((booked - fee).abs(), source);
+                    }
+                }
                 if let Some(basis) = book_basis {
-                    let uses_legacy_amount = unit_price.is_zero() && legacy_amount.is_some();
-                    let source = if unknown {
-                        FlowSource::UnknownBoundaryTransfer
-                    } else if uses_legacy_amount {
-                        FlowSource::LegacyActivityAmountFallback
-                    } else {
-                        FlowSource::CostBasisFallback
-                    };
                     return self.priced(basis.abs(), event.currency.as_str(), event, source);
                 }
                 if let Some(amount) = legacy_amount {
@@ -1127,64 +1200,44 @@ pub fn effects(
     lots: &[LotRecord],
     rejected: &BTreeSet<ActivityId>,
 ) -> Effects {
-    let short = short_transfers(resolved.ledger, &lots_opened(lots), disposals);
-    priced_events(resolved, disposals, &short, rejected, None).0
+    let transfers = transfer_records(resolved.ledger, lots, disposals);
+    priced_events(resolved, disposals, &transfers, rejected, None).0
 }
 
-/// Signed units each activity opened in each account, from lot records.
-fn lots_opened(lots: &[LotRecord]) -> BTreeMap<(AccountId, ActivityId), Decimal> {
-    let mut opened = BTreeMap::new();
+/// What each security transfer leg's own account recorded, so no path needs
+/// the partner's records (a window, a revalue and a read each have only
+/// their own accounts').
+struct TransferRecords {
+    /// Transfers that moved a short position. A short is a liability:
+    /// sending it out is an inflow, receiving it an outflow. An outgoing leg
+    /// that disposed only short lots, an incoming leg that opened short lots
+    /// or, opening none, covered long ones.
+    short: BTreeSet<ActivityId>,
+    /// Cost in base of the lots each incoming leg opened in its account.
+    booked: BTreeMap<(AccountId, ActivityId), Decimal>,
+}
+
+fn transfer_records(
+    ledger: &CompiledLedger,
+    lots: &[LotRecord],
+    disposals: &[LotDisposal],
+) -> TransferRecords {
+    // Signed units and base cost each activity opened in each account; the
+    // cost is unknown (`None`) when a lot has no rate to the base.
+    let mut opened: BTreeMap<(AccountId, ActivityId), (Decimal, Option<Decimal>)> = BTreeMap::new();
     for lot in lots {
         if let Some(activity) = &lot.open_activity {
-            *opened
+            let entry = opened
                 .entry((lot.account.clone(), activity.clone()))
-                .or_insert(Decimal::ZERO) += lot.original_quantity;
+                .or_insert((Decimal::ZERO, Some(Decimal::ZERO)));
+            entry.0 += lot.original_quantity;
+            let known = !lot.fx_rate_to_base.is_zero() || lot.original_cost_basis.is_zero();
+            entry.1 = entry
+                .1
+                .filter(|_| known)
+                .map(|cost| cost + lot.original_cost_basis_base);
         }
     }
-    opened
-}
-
-/// Signed units each activity opened in each account, from a projection:
-/// its open lots and the lots it closed.
-fn bundle_lots_opened(
-    bundle: &ProjectionBundle,
-    ledger: &CompiledLedger,
-) -> BTreeMap<(AccountId, ActivityId), Decimal> {
-    let source: BTreeMap<&EventId, &ActivityId> =
-        ledger.events.iter().map(|e| (&e.id, &e.source)).collect();
-    let mut opened = BTreeMap::new();
-    let mut add = |account: &AccountId, event: Option<&EventId>, quantity: Decimal| {
-        if let Some(activity) = event.and_then(|e| source.get(e)) {
-            *opened
-                .entry((account.clone(), (*activity).clone()))
-                .or_insert(Decimal::ZERO) += quantity;
-        }
-    };
-    for (account, state) in &bundle.final_state.accounts {
-        for lot in state.positions.values().flat_map(|p| p.lots.iter()) {
-            add(account, lot.source_event.as_ref(), lot.original_quantity);
-        }
-    }
-    for closure in &bundle.closures {
-        add(
-            &closure.account,
-            closure.open_event.as_ref(),
-            closure.original_quantity,
-        );
-    }
-    opened
-}
-
-/// Security transfers that moved a short position. A short is a liability:
-/// sending it out is an inflow, receiving it an outflow. Each leg reads its
-/// own account's records, so no path needs the partner's: an outgoing leg
-/// that disposed only short lots, an incoming leg that opened short lots or,
-/// opening none, covered long ones.
-fn short_transfers(
-    ledger: &CompiledLedger,
-    opened: &BTreeMap<(AccountId, ActivityId), Decimal>,
-    disposals: &[LotDisposal],
-) -> BTreeSet<ActivityId> {
     let mut short = BTreeSet::new();
     for event in &ledger.events {
         let Action::SecurityTransfer { direction, .. } = event.action else {
@@ -1198,7 +1251,7 @@ fn short_transfers(
         let moved_short = match direction {
             Direction::Out => !disposed.is_empty() && disposed.iter().all(|q| q.is_sign_negative()),
             Direction::In => match opened.get(&(event.account.clone(), event.source.clone())) {
-                Some(quantity) if !quantity.is_zero() => quantity.is_sign_negative(),
+                Some((units, _)) if !units.is_zero() => units.is_sign_negative(),
                 _ => !disposed.is_empty() && disposed.iter().all(|q| q.is_sign_positive()),
             },
         };
@@ -1206,7 +1259,13 @@ fn short_transfers(
             short.insert(event.source.clone());
         }
     }
-    short
+    TransferRecords {
+        short,
+        booked: opened
+            .into_iter()
+            .filter_map(|(key, (_, cost))| cost.map(|cost| (key, cost)))
+            .collect(),
+    }
 }
 
 /// The events a valuation prices: those inside `range`, of `accounts` when
@@ -1220,7 +1279,7 @@ struct EventSelection<'a> {
 fn priced_events(
     resolved: &Resolved<'_>,
     disposals: &[LotDisposal],
-    short: &BTreeSet<ActivityId>,
+    transfers: &TransferRecords,
     rejected: &BTreeSet<ActivityId>,
     selection: Option<EventSelection<'_>>,
 ) -> (Effects, BTreeMap<AccountId, Vec<Diagnostic>>) {
@@ -1241,6 +1300,7 @@ fn priced_events(
         .map(|a| a.id.as_str())
         .collect();
     let mut valuer = Valuer::new(resolved, disposals, &AccountId::new("effects"), &base);
+    valuer.booked = Some(&transfers.booked);
     let mut diagnostics: BTreeMap<AccountId, Vec<Diagnostic>> = BTreeMap::new();
     let mut events = Vec::with_capacity(resolved.ledger.events.len());
     for event in resolved.ledger.events.iter().filter(|event| {
@@ -1274,10 +1334,18 @@ fn priced_events(
                     .as_ref()
                     .is_some_and(|c| c.amount < Decimal::ZERO);
                 let security_outflow = match &event.action {
-                    Action::SecurityTransfer { direction, .. } => {
-                        Some((*direction == Direction::Out) != short.contains(&event.source))
-                    }
+                    Action::SecurityTransfer { direction, .. } => Some(
+                        (*direction == Direction::Out) != transfers.short.contains(&event.source),
+                    ),
                     _ => None,
+                };
+                let units = match &event.action {
+                    Action::SecurityTransfer {
+                        direction,
+                        quantity,
+                        ..
+                    } => valuer.transfer_units(event, *direction, *quantity),
+                    _ => Decimal::ZERO,
                 };
                 Some(PricedFlow {
                     amount,
@@ -1294,6 +1362,7 @@ fn priced_events(
                     // A security transfer's direction decides the leg; its
                     // cash leg is only the fee, so the sign must not.
                     leg_outflow: security_outflow.unwrap_or(negative_cash),
+                    units,
                 })
             }
         };
@@ -1359,6 +1428,7 @@ fn priced_events(
                 transfer_out: pair.transfer_out.clone(),
                 in_account: pair.in_account.clone(),
                 out_account: pair.out_account.clone(),
+                security: pair.security,
             })
             .collect(),
     };
@@ -1431,23 +1501,50 @@ fn internal_adjustments(
             && scope.contains(&pair.in_account)
             && scope.contains(&pair.out_account)
     }) {
-        for leg in [&pair.transfer_in, &pair.transfer_out] {
-            let Some(event) = by_source.get(leg.as_str()) else {
+        let leg = |source: &ActivityId| {
+            by_source.get(source.as_str()).and_then(|event| {
+                event
+                    .flow
+                    .filter(|_| window.contains(event.date))
+                    .map(|flow| (*event, flow))
+            })
+        };
+        let (incoming, outgoing) = (leg(&pair.transfer_in), leg(&pair.transfer_out));
+        // A security pair whose sender held less than it sent books the
+        // difference in the receiver (a history that starts after those
+        // units were acquired): only the units the sender gave are internal,
+        // so the incoming leg nets in that share and the rest entered the
+        // scope. Each leg nets at its own day's price, so a price move
+        // between them stays a return. A cash pair nets whole: a rate
+        // difference between its legs is a gain, not a flow (#1655).
+        let incoming_share = match (incoming, outgoing) {
+            (Some((_, inflow)), Some((_, outflow)))
+                if pair.security && inflow.units > outflow.units =>
+            {
+                arith::div(outflow.units, inflow.units).unwrap_or(Decimal::ONE)
+            }
+            _ => Decimal::ONE,
+        };
+        for (event, flow, share) in [
+            incoming.map(|(event, flow)| (event, flow, incoming_share)),
+            outgoing.map(|(event, flow)| (event, flow, Decimal::ONE)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let Some(amount) = arith::mul(flow.amount, share) else {
                 continue;
             };
-            let Some(flow) = event.flow.filter(|_| window.contains(event.date)) else {
-                continue;
-            };
-            if flow.amount.is_zero() {
+            if amount.is_zero() {
                 continue;
             }
             let entry = by_account
                 .entry((&event.account, event.date))
                 .or_insert((Decimal::ZERO, Decimal::ZERO));
             if flow.leg_outflow {
-                entry.1 += flow.amount;
+                entry.1 += amount;
             } else {
-                entry.0 += flow.amount;
+                entry.0 += amount;
             }
         }
     }

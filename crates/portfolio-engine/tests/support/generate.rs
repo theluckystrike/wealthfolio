@@ -8,7 +8,10 @@
 //!
 //! Histories are coherent: a small simulation tracks what every account
 //! holds, so an account sells or sends only what it has, covers a short
-//! with an explicit intent, and every holder records a split.
+//! with an explicit intent, and every holder records a split. A quarter of
+//! the scenarios then lose their first purchases, as a history that starts
+//! after the units were bought does: their later sales and transfers move
+//! more than the account holds.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -103,10 +106,16 @@ struct Ledger {
     rows: String,
     minute: u64,
     id: u64,
+    /// Purchases still to leave out (an incomplete history).
+    skip_buys: u64,
 }
 
 impl Ledger {
     fn row(&mut self, day: u64, account: &str, body: &str) {
+        if self.skip_buys > 0 && body.starts_with("type: BUY") {
+            self.skip_buys -= 1;
+            return;
+        }
         self.minute += 1;
         self.id += 1;
         let _ = writeln!(
@@ -168,6 +177,7 @@ pub fn scenario_yaml(seed: u64) -> String {
         rows: String::new(),
         minute: 0,
         id: 0,
+        skip_buys: if rng.chance(25) { 1 + rng.below(2) } else { 0 },
     };
     // Signed units each trading account holds (negative: short).
     let mut held: BTreeMap<(usize, usize), i64> = BTreeMap::new();

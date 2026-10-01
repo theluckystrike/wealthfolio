@@ -1196,6 +1196,66 @@ impl Projector<'_> {
 
     // ------------------------------------------------------------ transfers
 
+    /// A lot of `units` at the transfer's own price (`quantity` x
+    /// `unit_price` x the multiplier, else its legacy amount, per unit): what
+    /// the receiver books for units nothing staged. `fee` is the charge the
+    /// lot carries.
+    #[allow(clippy::too_many_arguments)]
+    fn transfer_lot(
+        &self,
+        event: &EconomicEvent,
+        info: &AssetFacts,
+        units: Decimal,
+        quantity: Decimal,
+        unit_price: Decimal,
+        legacy_amount: Option<Decimal>,
+        fee: Decimal,
+        position_currency: &str,
+        account_currency: &str,
+        run: &mut RunLog,
+    ) -> Result<Lot, String> {
+        let compiled_basis = {
+            let price_basis = checked(
+                arith::product(&[quantity, unit_price, info.contract_multiplier]),
+                "transferred basis",
+            )?;
+            if !price_basis.is_zero() {
+                price_basis
+            } else if !quantity.is_zero() {
+                legacy_amount.unwrap_or(Decimal::ZERO).abs()
+            } else {
+                Decimal::ZERO
+            }
+        };
+        let lot_unit_price = if quantity.is_zero() {
+            Decimal::ZERO
+        } else {
+            checked(
+                arith::div(compiled_basis, quantity),
+                "transferred unit price",
+            )?
+        };
+        let (price, fee, _tax, fx_used) = self.to_position_currency(
+            lot_unit_price,
+            fee,
+            Decimal::ZERO,
+            event,
+            position_currency,
+            account_currency,
+        )?;
+        let book = self.lot_book_basis(event, position_currency, account_currency, run);
+        new_lot(
+            event.id.as_str().to_string(),
+            units,
+            price,
+            fee,
+            Decimal::ZERO,
+            event,
+            fx_used,
+            &book,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn transfer_in(
         &self,
@@ -1230,115 +1290,94 @@ impl Projector<'_> {
         };
         let paired = cached.is_some();
 
-        let (cost_basis_asset, added_lots, cover) = if let Some(lots) = cached {
-            let incoming_negative = lots
-                .iter()
-                .find(|lot| !lot.quantity.is_zero())
-                .map(|lot| lot.quantity.is_sign_negative())
-                .unwrap_or(false);
-            let incoming_abs: Decimal = lots.iter().map(|l| l.effective_quantity().abs()).sum();
-            let resident_opposite = if incoming_negative {
-                positive_effective(position)
-            } else {
-                negative_effective_abs(position)
-            };
-            let cover_abs = if info.allows_negative_lots {
-                incoming_abs.min(resident_opposite)
-            } else {
-                Decimal::ZERO
-            };
-            let (to_add, cover) = if cover_abs > Decimal::ZERO {
-                let (cover_lots, residual) = split_lots_by_cover(&lots, cover_abs)?;
-                let cover_proceeds: Decimal = cover_lots
-                    .iter()
-                    .map(|l| l.cost_basis)
-                    .sum::<Decimal>()
-                    .abs();
-                let reduction = if incoming_negative {
-                    reduce_positive_lots_fifo(position, cover_abs)?
-                } else {
-                    reduce_negative_lots_fifo(position, cover_abs)?
-                };
-                (residual, Some((reduction, cover_proceeds)))
-            } else {
-                (lots.clone(), None)
-            };
-            let cost_basis = add_transferred_lots(
-                position,
-                event.id.as_str(),
-                &to_add,
-                info.allows_negative_lots,
-            )?;
-            let added: Vec<Lot> = position
-                .lots
-                .iter()
-                .filter(|lot| lot.source_event.as_ref() == Some(&event.id))
-                .cloned()
-                .collect();
-            if let Some(g) = paired_group.as_deref() {
-                if cover_abs.is_zero() && added.is_empty() {
-                    // Rejected whole, so the fee is not paid either; the
-                    // lots stay cached.
-                    return Err(format!("TRANSFER_IN booked none of the cached lots for {asset} (negative lots not allowed); cache kept"));
-                }
-                effects.cache_removals.push(g.to_string());
-            }
-            (cost_basis, added, cover)
+        // The receiver books what its own activity says arrived: the lots
+        // the sender staged and, at the transfer's own price, the units the
+        // sender did not hold (its history starts after it acquired them) or,
+        // with nothing staged, all of them.
+        let mut lots = cached.unwrap_or_default();
+        let incoming_negative = lots
+            .iter()
+            .find(|lot| !lot.quantity.is_zero())
+            .map(|lot| lot.quantity.is_sign_negative())
+            .unwrap_or(false);
+        let staged_abs: Decimal = lots.iter().map(|l| l.effective_quantity().abs()).sum();
+        // A shortfall below the fold's dust (a split's rounding) is none.
+        let missing = if incoming_negative || !is_significant(quantity - staged_abs) {
+            Decimal::ZERO
         } else {
-            let compiled_basis = {
-                let price_basis = checked(
-                    arith::product(&[quantity, unit_price, info.contract_multiplier]),
-                    "transferred basis",
-                )?;
-                if !price_basis.is_zero() {
-                    price_basis
-                } else if !quantity.is_zero() {
-                    legacy_amount.unwrap_or(Decimal::ZERO).abs()
-                } else {
-                    Decimal::ZERO
-                }
-            };
-            let lot_unit_price = if quantity.is_zero() {
+            (quantity - staged_abs).max(Decimal::ZERO)
+        };
+        if missing > Decimal::ZERO {
+            // A paired leg's fee is capitalised below into every lot it
+            // delivered; an unpaired one's goes into its lot.
+            let fee = if paired {
                 Decimal::ZERO
             } else {
-                checked(
-                    arith::div(compiled_basis, quantity),
-                    "transferred unit price",
-                )?
+                event.charges.fee
             };
-            let (price, fee, _tax, fx_used) = self.to_position_currency(
-                lot_unit_price,
-                event.charges.fee,
-                Decimal::ZERO,
+            lots.push(self.transfer_lot(
                 event,
-                position_currency.as_str(),
-                account_currency.as_str(),
-            )?;
-            let book = self.lot_book_basis(
-                event,
+                &info,
+                missing,
+                quantity,
+                unit_price,
+                legacy_amount,
+                fee,
                 position_currency.as_str(),
                 account_currency.as_str(),
                 run,
-            );
-            let cost_basis = add_lot(
-                position,
-                event.id.as_str().to_string(),
-                quantity,
-                price,
-                fee,
-                Decimal::ZERO,
-                event,
-                fx_used,
-                &book,
-            )?;
-            let added: Vec<Lot> = position
-                .lots
-                .iter()
-                .filter(|lot| lot.source_event.as_ref() == Some(&event.id))
-                .cloned()
-                .collect();
-            (cost_basis, added, None)
+            )?);
+        }
+        let incoming_abs = staged_abs + missing;
+
+        // Units arriving into the opposite position cover it first
+        // (NOM-TXF-04); only the rest opens lots.
+        let resident_opposite = if incoming_negative {
+            positive_effective(position)
+        } else {
+            negative_effective_abs(position)
         };
+        let cover_abs = if info.allows_negative_lots {
+            incoming_abs.min(resident_opposite)
+        } else {
+            Decimal::ZERO
+        };
+        let (to_add, cover) = if cover_abs > Decimal::ZERO {
+            let (cover_lots, residual) = split_lots_by_cover(&lots, cover_abs)?;
+            let cover_proceeds: Decimal = cover_lots
+                .iter()
+                .map(|l| l.cost_basis)
+                .sum::<Decimal>()
+                .abs();
+            let reduction = if incoming_negative {
+                reduce_positive_lots_fifo(position, cover_abs)?
+            } else {
+                reduce_negative_lots_fifo(position, cover_abs)?
+            };
+            (residual, Some((reduction, cover_proceeds)))
+        } else {
+            (lots, None)
+        };
+        let cost_basis_asset = add_transferred_lots(
+            position,
+            event.id.as_str(),
+            &to_add,
+            info.allows_negative_lots,
+        )?;
+        let added_lots: Vec<Lot> = position
+            .lots
+            .iter()
+            .filter(|lot| lot.source_event.as_ref() == Some(&event.id))
+            .cloned()
+            .collect();
+        if let (true, Some(g)) = (paired, paired_group.as_deref()) {
+            if cover_abs.is_zero() && added_lots.is_empty() {
+                // Rejected whole, so the fee is not paid either; the lots
+                // stay cached.
+                return Err(format!("TRANSFER_IN booked none of the cached lots for {asset} (negative lots not allowed); cache kept"));
+            }
+            effects.cache_removals.push(g.to_string());
+        }
 
         if let Some((reduction, cover_proceeds)) = cover {
             self.record_reduction(

@@ -85,6 +85,11 @@ pub struct PricedFlow {
     /// Direction as a netted internal leg: a security transfer's direction
     /// decides, else the sign of its cash.
     pub leg_outflow: bool,
+    /// The units a security transfer's flow prices: what an outgoing leg
+    /// removed from its account, what an incoming leg records. Zero for
+    /// other flows.
+    #[serde(default, with = "crate::model::decimal_serde")]
+    pub units: Decimal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -103,4 +108,7 @@ pub struct PairEffect {
     pub transfer_out: ActivityId,
     pub in_account: AccountId,
     pub out_account: AccountId,
+    /// A pair of security legs (not cash).
+    #[serde(default)]
+    pub security: bool,
 }

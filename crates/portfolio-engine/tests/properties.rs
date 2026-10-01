@@ -653,12 +653,42 @@ fn p_txf_internal_pairs_cancel_at_portfolio_scope() {
                     .pair_for(&e.source)
                     .is_some_and(|p| p.in_account == p.out_account && !p.contribution_neutral)
             };
+            // A sender that held less than it sent reports the shortfall,
+            // and the receiver books the difference: those units enter the
+            // portfolio (EDGE-TXF-09).
+            let shortfall = |e: &&EconomicEvent| {
+                pipeline
+                    .facts()
+                    .transfer_pairs()
+                    .pair_for(&e.source)
+                    .is_some_and(|p| {
+                        pipeline.bundle.diagnostics.iter().any(|d| {
+                            matches!(
+                                d.code,
+                                DiagnosticCode::InsufficientQuantity
+                                    | DiagnosticCode::NoPositionToReduce
+                            ) && d.source == p.transfer_out.as_str()
+                        })
+                    })
+            };
             let only_internal_pairs = !events.is_empty()
                 && !events.iter().any(unlinked_conversion)
+                && !events.iter().any(shortfall)
                 && events.iter().all(|e| {
                     matches!(&e.flow.boundary, Boundary::Internal { counterparty } if scope.contains(counterparty))
                 });
-            if !only_internal_pairs {
+            // A holdings account's flows are inferred from its snapshots,
+            // not from activities: a day it moves has another flow.
+            let holdings_flow = scope.iter().any(|id| {
+                pipeline.facts().accounts()[id].tracking == TrackingMode::Holdings
+                    && pipeline.series.get(id).is_some_and(|s| {
+                        s.days.iter().any(|d| {
+                            d.date == *day
+                                && (!d.flow.inflow_base.is_zero() || !d.flow.outflow_base.is_zero())
+                        })
+                    })
+            });
+            if !only_internal_pairs || holdings_flow {
                 continue;
             }
             let Some(row) = portfolio.days.iter().find(|d| d.date == *day) else {
@@ -1464,6 +1494,10 @@ fn p_txf_legs_transfers_carry_their_lots() {
         let rejected = pipeline.bundle.rejected_activities();
         let lots = pipeline.lots();
         let fx = pipeline.fx();
+        // Costs are stored rounded and then converted (into a minor unit or
+        // another currency), which scales the rounding: equal within a
+        // millionth, far below any currency's smallest unit.
+        let close = |a: Decimal, b: Decimal| (a - b).abs() <= Decimal::new(1, 6);
         // The leg that moves the securities (a fee compiles into its own event).
         let event_of = |source: &ActivityId| {
             pipeline.ledger().events.iter().find(|e| {
@@ -1541,14 +1575,35 @@ fn p_txf_legs_transfers_carry_their_lots() {
                 .iter()
                 .map(|l| l.original_quantity * l.split_ratio)
                 .sum();
-            assert_eq!(received_units, sent_units, "{id}: units");
+            // The receiver books the units its own activity records; the
+            // sender gives what it held, so a shortfall (a history that
+            // starts after the units were acquired) arrives at the
+            // transfer's price and is the only difference.
+            let Action::SecurityTransfer { quantity, .. } = incoming.action else {
+                continue;
+            };
+            let topped_up = sent_units.abs() + DUST < quantity;
+            if sent_units.is_sign_positive() {
+                assert!(
+                    (received_units - quantity).abs() <= DUST,
+                    "{id}: units {received_units} received, the activity records {quantity}"
+                );
+            }
+            assert!(
+                topped_up || (received_units - sent_units).abs() <= DUST,
+                "{id}: units {received_units} received, {sent_units} sent"
+            );
+            if topped_up {
+                checked += 1;
+                continue;
+            }
             // A leg's fee is capitalised into the lots it delivers (§ the
             // TRANSFER_IN row): costs compare only without one.
             let fees = !out.charges.fee.is_zero() || !incoming.charges.fee.is_zero();
             let sent_base: Decimal = removed.iter().map(|d| d.cost_basis_base).sum();
             let received_base: Decimal = added.iter().map(|l| l.original_cost_basis_base).sum();
             assert!(
-                fees || (received_base - sent_base).abs() <= DUST,
+                fees || close(received_base, sent_base),
                 "{id}: cost in base {received_base} received, {sent_base} sent"
             );
 
@@ -1562,10 +1617,10 @@ fn p_txf_legs_transfers_carry_their_lots() {
             let Some(sources) = sources else {
                 continue;
             };
-            let mut sent_dates: Vec<NaiveDate> = sources.iter().map(|l| l.open_date).collect();
-            let mut received_dates: Vec<NaiveDate> = added.iter().map(|l| l.open_date).collect();
-            sent_dates.sort();
-            received_dates.sort();
+            // As sets: a lot split by the sender's dust (a split's rounding)
+            // is one acquisition, and dust is not booked.
+            let sent_dates: BTreeSet<NaiveDate> = sources.iter().map(|l| l.open_date).collect();
+            let received_dates: BTreeSet<NaiveDate> = added.iter().map(|l| l.open_date).collect();
             assert_eq!(received_dates, sent_dates, "{id}: acquisition dates");
             if let Some(receiving) = added.first().map(|l| l.currency.as_str()).filter(|_| !fees) {
                 let sent = removed
@@ -1578,7 +1633,7 @@ fn p_txf_legs_transfers_carry_their_lots() {
                 if let Some(sent) = sent {
                     let received: Decimal = added.iter().map(|l| l.original_cost_basis).sum();
                     assert!(
-                        (received - sent).abs() <= DUST,
+                        close(received, sent),
                         "{id}: cost {received} {receiving} received, {sent} sent"
                     );
                 }
@@ -1618,10 +1673,22 @@ fn p_txf_legs_transfers_carry_their_lots() {
             if added.is_empty() {
                 continue;
             }
-            let booked: Decimal = added
+            // The leg's own fee (capitalised; its tax is not), not the fees
+            // its lots carried in from the sender's purchases (part of the
+            // cost).
+            let base = pipeline.facts().policy().base_currency.as_str();
+            let Some(charges) =
+                fx.convert(event.charges.fee, event.currency.as_str(), base, event.date)
+            else {
+                continue;
+            };
+            // A short's cost is negative; the flow carries the size.
+            let booked: Decimal = (added
                 .iter()
-                .map(|l| l.original_cost_basis_base - l.fee_allocated_base - l.tax_allocated_base)
-                .sum();
+                .map(|l| l.original_cost_basis_base)
+                .sum::<Decimal>()
+                - charges)
+                .abs();
             assert!(
                 (flow.amount - booked).abs() <= DUST,
                 "{}: P-TXF-LEGS {} flows {} at cost but booked {booked}",
