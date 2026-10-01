@@ -2,7 +2,8 @@
 //!
 //! Facts in (activities, quotes, FX, observed snapshots, policy), values out
 //! (positions, lots, valuations, performance). No I/O, no clock, no locks, no
-//! async. See `docs/architecture/portfolio-engine.md`.
+//! async. See `docs/architecture/portfolio-engine.md`; what it must produce in
+//! the boundary cases is `docs/architecture/portfolio-engine-rules.md`.
 //!
 //! Stages: [`normalize`] → [`compile`] → [`resolve_surfaces`] → [`project`]
 //! → [`value`] → [`measure_account`] / [`measure_scope`]. Every stage is a

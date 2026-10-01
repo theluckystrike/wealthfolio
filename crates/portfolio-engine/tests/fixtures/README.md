@@ -6,6 +6,10 @@ the engine. The legacy oracle goldens, the parity harness and the divergence
 ledger that proved the kernel against the previous pipeline were retired after
 sign-off (architecture §4.5); this repository's history keeps them.
 
+A fixture that pins a rule of `docs/architecture/portfolio-engine-rules.md`
+works its expected values out by hand from that rule in `expected_notes`, and
+the rule names the fixture.
+
 ## Running
 
 ```bash

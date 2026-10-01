@@ -5,6 +5,11 @@ valuations and performance. The calculation path is split in two: a pure kernel
 crate that owns the mathematics, and a shell that owns everything the answer
 must not depend on — time, storage, network and scheduling.
 
+What it must produce where the answer is a decision (money in and out,
+transfers, dates and currencies, dated reads, and which writes invalidate which
+results) is stated in [portfolio-engine-rules.md](portfolio-engine-rules.md):
+code and tests follow it.
+
 ## 1. Overview
 
 `crates/portfolio-engine` is a **pure, deterministic calculation kernel**: facts
