@@ -107,8 +107,9 @@ BEGIN
 END;
 
 -- Account facts the kernel reads (currency, type, tracking mode, archived, and
--- the accounting settings under meta.accounting): the whole history may
--- change. Other meta keys (broker details, timestamps) do not.
+-- the accounting settings under meta.accounting, which the job also
+-- validates): the whole history may change. Other meta keys (broker details,
+-- timestamps) do not.
 CREATE TRIGGER projection_account_update AFTER UPDATE OF currency, account_type, tracking_mode, is_archived, meta ON accounts
 WHEN OLD.currency IS NOT NEW.currency
   OR OLD.account_type IS NOT NEW.account_type
@@ -132,6 +133,24 @@ WHEN OLD.currency IS NOT NEW.currency
      IS NOT (CASE WHEN json_valid(NEW.meta) THEN coalesce(
         json_extract(NEW.meta, '$.accounting.poolingScope'),
         json_extract(NEW.meta, '$.accounting.pooling_scope')) END)
+  OR (CASE WHEN json_valid(OLD.meta) THEN coalesce(
+        json_extract(OLD.meta, '$.accounting.lotSelectionStrategy'),
+        json_extract(OLD.meta, '$.accounting.lot_selection_strategy')) END)
+     IS NOT (CASE WHEN json_valid(NEW.meta) THEN coalesce(
+        json_extract(NEW.meta, '$.accounting.lotSelectionStrategy'),
+        json_extract(NEW.meta, '$.accounting.lot_selection_strategy')) END)
+BEGIN
+    INSERT INTO projection_state (scope, dirty_from, version)
+    VALUES (NEW.id, '0001-01-01', 1)
+    ON CONFLICT (scope) DO UPDATE SET
+        dirty_from = '0001-01-01',
+        version = projection_state.version + 1;
+END;
+
+-- An account can arrive after facts that refer to it (sync can deliver its
+-- snapshots and activities first, and a job cannot project an account that
+-- does not exist yet): it projects from the beginning.
+CREATE TRIGGER projection_account_insert AFTER INSERT ON accounts
 BEGIN
     INSERT INTO projection_state (scope, dirty_from, version)
     VALUES (NEW.id, '0001-01-01', 1)
@@ -141,12 +160,16 @@ BEGIN
 END;
 
 -- Asset facts the kernel reads: kind, quote currency, instrument type and the
--- contract multiplier (metadata.option, metadata.contractMultiplier). Profile,
--- logo or name edits do not touch the projection.
-CREATE TRIGGER projection_asset_update AFTER UPDATE OF kind, quote_ccy, instrument_type, metadata ON assets
+-- contract multiplier (metadata.option, metadata.contractMultiplier), and an FX
+-- asset's pair (instrument_symbol to quote_ccy). Profile, logo or name edits do
+-- not touch the projection. An FX asset's pair defines every rate it holds: a
+-- new pair, or an asset becoming or ceasing to be FX, may move any conversion,
+-- the old pair's as well as the new one's.
+CREATE TRIGGER projection_asset_update AFTER UPDATE OF kind, quote_ccy, instrument_type, instrument_symbol, metadata ON assets
 WHEN OLD.kind IS NOT NEW.kind
   OR OLD.quote_ccy IS NOT NEW.quote_ccy
   OR OLD.instrument_type IS NOT NEW.instrument_type
+  OR ((OLD.kind = 'FX' OR NEW.kind = 'FX') AND OLD.instrument_symbol IS NOT NEW.instrument_symbol)
   OR (CASE WHEN json_valid(OLD.metadata) THEN json_extract(OLD.metadata, '$.option') END)
      IS NOT (CASE WHEN json_valid(NEW.metadata) THEN json_extract(NEW.metadata, '$.option') END)
   OR (CASE WHEN json_valid(OLD.metadata) THEN json_extract(OLD.metadata, '$.contractMultiplier') END)
@@ -157,17 +180,58 @@ BEGIN
     ON CONFLICT (scope) DO UPDATE SET
         dirty_from = '0001-01-01',
         version = projection_state.version + 1;
+    INSERT INTO projection_state (scope, dirty_from, version)
+    SELECT '@all', '0001-01-01', 1
+    WHERE (OLD.kind = 'FX' OR NEW.kind = 'FX')
+      AND (OLD.kind IS NOT NEW.kind
+        OR OLD.quote_ccy IS NOT NEW.quote_ccy
+        OR OLD.instrument_symbol IS NOT NEW.instrument_symbol)
+    ON CONFLICT (scope) DO UPDATE SET
+        dirty_from = '0001-01-01',
+        version = projection_state.version + 1;
+END;
+
+-- An asset can arrive after snapshots that name it (their positions do not
+-- reference assets, and sync can deliver them first): its holders refold.
+CREATE TRIGGER projection_asset_insert AFTER INSERT ON assets
+BEGIN
+    INSERT INTO projection_state (scope, dirty_from, version)
+    VALUES ('a:' || NEW.id, '0001-01-01', 1)
+    ON CONFLICT (scope) DO UPDATE SET
+        dirty_from = '0001-01-01',
+        version = projection_state.version + 1;
+END;
+
+-- A deleted asset's holders refold. A deleted FX asset's rates are gone, which
+-- may move any conversion: when sync deletes the asset, its quotes cascade after
+-- it, so their own triggers can no longer tell them from prices.
+CREATE TRIGGER projection_asset_delete AFTER DELETE ON assets
+BEGIN
+    INSERT INTO projection_state (scope, dirty_from, version)
+    VALUES ('a:' || OLD.id, '0001-01-01', 1)
+    ON CONFLICT (scope) DO UPDATE SET
+        dirty_from = '0001-01-01',
+        version = projection_state.version + 1;
+    INSERT INTO projection_state (scope, dirty_from, version)
+    SELECT '@all', '0001-01-01', 1
+    WHERE OLD.kind = 'FX'
+    ON CONFLICT (scope) DO UPDATE SET
+        dirty_from = '0001-01-01',
+        version = projection_state.version + 1;
 END;
 
 -- Prices revalue the asset's holders from the quote's day. FX rates are quotes
 -- of FX assets: the job reaches back from the rate's day to its pair's
--- previous observation, since conversions take the nearest one either way.
+-- previous observation, since conversions take the nearest one either way. A
+-- quote's day is its timestamp's UTC date; the earlier of the two counts, since
+-- the engine reads the timestamp and repositories the day. A quote moved to
+-- another asset changes both.
 CREATE TRIGGER projection_quote_insert AFTER INSERT ON quotes
 BEGIN
     INSERT INTO projection_state (scope, dirty_from, version)
     VALUES (
         CASE WHEN (SELECT kind FROM assets WHERE id = NEW.asset_id) = 'FX' THEN 'fx:' || NEW.asset_id ELSE 'q:' || NEW.asset_id END,
-        coalesce(date(NEW.day), '0001-01-01'),
+        coalesce(min(coalesce(date(NEW.day), date(NEW.timestamp)), coalesce(date(NEW.timestamp), date(NEW.day))), '0001-01-01'),
         1
     )
     ON CONFLICT (scope) DO UPDATE SET
@@ -179,8 +243,17 @@ CREATE TRIGGER projection_quote_update AFTER UPDATE ON quotes
 BEGIN
     INSERT INTO projection_state (scope, dirty_from, version)
     VALUES (
+        CASE WHEN (SELECT kind FROM assets WHERE id = OLD.asset_id) = 'FX' THEN 'fx:' || OLD.asset_id ELSE 'q:' || OLD.asset_id END,
+        coalesce(min(coalesce(date(OLD.day), date(OLD.timestamp)), coalesce(date(OLD.timestamp), date(OLD.day))), '0001-01-01'),
+        1
+    )
+    ON CONFLICT (scope) DO UPDATE SET
+        dirty_from = min(coalesce(projection_state.dirty_from, excluded.dirty_from), excluded.dirty_from),
+        version = projection_state.version + 1;
+    INSERT INTO projection_state (scope, dirty_from, version)
+    VALUES (
         CASE WHEN (SELECT kind FROM assets WHERE id = NEW.asset_id) = 'FX' THEN 'fx:' || NEW.asset_id ELSE 'q:' || NEW.asset_id END,
-        coalesce(min(date(OLD.day), date(NEW.day)), '0001-01-01'),
+        coalesce(min(coalesce(date(NEW.day), date(NEW.timestamp)), coalesce(date(NEW.timestamp), date(NEW.day))), '0001-01-01'),
         1
     )
     ON CONFLICT (scope) DO UPDATE SET
@@ -193,7 +266,7 @@ BEGIN
     INSERT INTO projection_state (scope, dirty_from, version)
     VALUES (
         CASE WHEN (SELECT kind FROM assets WHERE id = OLD.asset_id) = 'FX' THEN 'fx:' || OLD.asset_id ELSE 'q:' || OLD.asset_id END,
-        coalesce(date(OLD.day), '0001-01-01'),
+        coalesce(min(coalesce(date(OLD.day), date(OLD.timestamp)), coalesce(date(OLD.timestamp), date(OLD.day))), '0001-01-01'),
         1
     )
     ON CONFLICT (scope) DO UPDATE SET
@@ -213,11 +286,18 @@ BEGIN
         version = projection_state.version + 1;
 END;
 
+-- A snapshot moved to another account (sync allows it) changes both, each from
+-- its own date.
 CREATE TRIGGER projection_snapshot_update AFTER UPDATE ON holdings_snapshots
 WHEN OLD.source <> 'CALCULATED' OR NEW.source <> 'CALCULATED'
 BEGIN
     INSERT INTO projection_state (scope, dirty_from, version)
-    VALUES (NEW.account_id, coalesce(min(date(OLD.snapshot_date), date(NEW.snapshot_date)), '0001-01-01'), 1)
+    VALUES (OLD.account_id, coalesce(date(OLD.snapshot_date), '0001-01-01'), 1)
+    ON CONFLICT (scope) DO UPDATE SET
+        dirty_from = min(coalesce(projection_state.dirty_from, excluded.dirty_from), excluded.dirty_from),
+        version = projection_state.version + 1;
+    INSERT INTO projection_state (scope, dirty_from, version)
+    VALUES (NEW.account_id, coalesce(date(NEW.snapshot_date), '0001-01-01'), 1)
     ON CONFLICT (scope) DO UPDATE SET
         dirty_from = min(coalesce(projection_state.dirty_from, excluded.dirty_from), excluded.dirty_from),
         version = projection_state.version + 1;

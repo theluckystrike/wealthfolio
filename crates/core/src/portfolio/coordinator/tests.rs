@@ -206,6 +206,109 @@ fn request() -> PortfolioJobRequest {
     }
 }
 
+// The in-memory repositories have no triggers: these tests set the marker the
+// SQL trigger writes (rules §5, pinned by the storage tests) and check the job
+// does what the marker asks.
+
+#[tokio::test]
+async fn an_account_arriving_after_its_snapshot_is_projected() {
+    let mut facts = scenario("EDGE-MIX-02").facts();
+    let all_accounts = facts.accounts.clone();
+    facts.accounts.retain(|a| a.id != "acc-h");
+    let mut h = harness(facts).await;
+    // Its snapshot's marker: a job cannot project an account it does not
+    // know, and consumes the marker.
+    h.store.mark(MarkerScope::Account("acc-h".into()), GENESIS);
+    let first = h
+        .coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    assert!(first.failures.is_empty());
+    assert!(h.rows("acc-h").is_empty());
+    // The account arrives; its insert marks it from the beginning.
+    h.coordinator.deps.sources.accounts = Arc::new(InMemoryAccountRepository::new(all_accounts));
+    h.store.mark(MarkerScope::Account("acc-h".into()), GENESIS);
+    let second = h
+        .coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    assert!(second.failures.is_empty());
+    assert!(!h.rows("acc-h").is_empty());
+}
+
+#[tokio::test]
+async fn a_lot_selection_change_is_validated() {
+    let h = harness(scenario("NOM-TRADE-01").facts()).await;
+    let first = h
+        .coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    assert!(first.failures.is_empty());
+    let account = first.account_ids[0].clone();
+    let mut settings = AccountAccountingSettings::default_for_account(account.clone());
+    settings.lot_selection_strategy = Some(crate::accounts::LotSelectionStrategy::HighestCost);
+    h.account_repo.set_accounting_settings(settings);
+    h.store.mark(MarkerScope::Account(account.clone()), GENESIS);
+    let second = h
+        .coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    assert!(second
+        .failures
+        .iter()
+        .any(|f| f.account_id == account && f.code == "UNSUPPORTED_COST_BASIS"));
+}
+
+#[tokio::test]
+async fn an_asset_arriving_after_its_snapshot_reprices_it() {
+    let mut facts = scenario("PERF-HOLD-02").facts();
+    facts.quotes.clear();
+    let mut arriving = facts.assets.clone();
+    for asset in &mut arriving {
+        asset.kind = crate::assets::AssetKind::Property;
+    }
+    facts.assets.clear();
+    let mut h = harness(facts).await;
+    h.coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    // The assets arrive; each insert marks its holders, snapshot holders
+    // included.
+    h.coordinator.deps.sources.assets = Arc::new(InMemoryAssetRepository::new(arriving.clone()));
+    for asset in &arriving {
+        h.store.mark(MarkerScope::Asset(asset.id.clone()), GENESIS);
+    }
+    h.coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    // Everything a rebuild from scratch gives, but when it was calculated.
+    let rows = |h: &Harness| {
+        let mut rows = h.rows("acc-h");
+        for row in &mut rows {
+            row.calculated_at = chrono::DateTime::<chrono::Utc>::MIN_UTC;
+        }
+        rows
+    };
+    let projected = rows(&h);
+    h.coordinator
+        .run_job(
+            PortfolioJobRequest {
+                force_full: true,
+                ..request()
+            },
+            &SilentObserver,
+        )
+        .await
+        .unwrap();
+    assert_eq!(projected, rows(&h));
+}
+
 fn plan_of(report: &PortfolioJobReport, account: &str) -> Option<RebuildPlan> {
     report
         .plans

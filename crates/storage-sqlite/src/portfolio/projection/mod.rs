@@ -451,6 +451,11 @@ mod tests {
         )
         .execute(&mut conn)
         .unwrap();
+        // The fixture's account and asset predate the projection, as rows do
+        // when the migration runs: only its first-run marker stands for them.
+        diesel::sql_query("DELETE FROM projection_state WHERE scope <> '@all'")
+            .execute(&mut conn)
+            .unwrap();
         // Disposals reference the disposing activity row.
         diesel::sql_query(
             "INSERT INTO activities (id, account_id, activity_type, status, activity_date, currency, \
@@ -591,7 +596,9 @@ mod tests {
 
     fn sql(db: &Db, statement: &str) {
         let mut conn = get_connection(&db.pool).unwrap();
-        diesel::sql_query(statement).execute(&mut conn).unwrap();
+        diesel::sql_query(statement)
+            .execute(&mut conn)
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
     }
 
     /// (dirty day, version) of a scope, `None` when no row.
@@ -648,6 +655,10 @@ mod tests {
              created_at, updated_at, tracking_mode, is_archived) \
              VALUES ('acc2', 'Other', 'SECURITIES', 'USD', 0, 1, datetime('now'), datetime('now'), 'TRANSACTIONS', 0)",
         );
+        // A new account projects from the beginning; what follows is about
+        // activities, so start it clean.
+        assert_eq!(dirty(&db, "acc2").as_deref(), Some("0001-01-01"));
+        sql(&db, "DELETE FROM projection_state WHERE scope = 'acc2'");
         let insert = |id: &str, account: &str, day: &str, group: &str| {
             format!(
                 "INSERT INTO activities (id, account_id, activity_type, status, activity_date, currency, \
@@ -1152,6 +1163,395 @@ mod tests {
         assert_eq!(
             marker(&db, "acc1").unwrap(),
             (Some("2025-01-02".to_string()), version + 1)
+        );
+    }
+
+    /// A job's completion: every pending marker consumed.
+    async fn consume_all(db: &Db) {
+        let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());
+        store
+            .complete_run(RunCompletion {
+                consumed: store.pending_markers().unwrap(),
+                ..RunCompletion::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    /// An FX asset (EUR to USD) with one rate, on 2025-01-03.
+    fn fx_pair(db: &Db) {
+        sql(
+            db,
+            "INSERT INTO assets (id, kind, instrument_type, instrument_symbol, is_active, quote_mode, \
+             quote_ccy, created_at, updated_at) \
+             VALUES ('fx-eur', 'FX', 'FX', 'EUR', 1, 'MARKET', 'USD', datetime('now'), datetime('now'))",
+        );
+        sql(
+            db,
+            "INSERT INTO quotes (id, asset_id, day, source, close, currency, created_at, timestamp) \
+             VALUES ('fx-q', 'fx-eur', '2025-01-03', 'MANUAL', '1.1', 'USD', datetime('now'), \
+             '2025-01-03T00:00:00Z')",
+        );
+    }
+
+    fn conversions_marked(db: &Db) -> bool {
+        dirty(db, "@all").is_some() || dirty(db, "fx:fx-eur").is_some()
+    }
+
+    #[tokio::test]
+    async fn an_fx_pair_edit_marks_every_conversion() {
+        let db = setup();
+        fx_pair(&db);
+        let fx = crate::fx::FxRepository::new(db.pool.clone(), db.writer.clone());
+        for (edit, rate) in [
+            ("instrument_symbol = 'GBP'", ("GBP", "USD")),
+            ("quote_ccy = 'CAD'", ("GBP", "CAD")),
+        ] {
+            consume_all(&db).await;
+            // Sync's generic asset upsert can rewrite either side of the pair.
+            sql(
+                &db,
+                &format!("UPDATE assets SET {edit} WHERE id = 'fx-eur'"),
+            );
+            let read = &fx.get_all_historical_exchange_rates().unwrap()[0];
+            assert_eq!(
+                (read.from_currency.as_str(), read.to_currency.as_str()),
+                rate
+            );
+            assert!(
+                conversions_marked(&db),
+                "{edit} left the old pair's conversions"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_synced_fx_asset_delete_marks_every_conversion() {
+        let db = setup();
+        fx_pair(&db);
+        consume_all(&db).await;
+        let fx = crate::fx::FxRepository::new(db.pool.clone(), db.writer.clone());
+        // Sync deletes the asset directly; its quotes cascade, after the asset
+        // that told them apart from prices is gone.
+        sql(&db, "DELETE FROM assets WHERE id = 'fx-eur'");
+        assert!(fx.get_all_historical_exchange_rates().unwrap().is_empty());
+        assert!(
+            conversions_marked(&db),
+            "the deleted rates were read as prices"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quote_moved_to_another_asset_marks_both() {
+        let db = setup();
+        sql(
+            &db,
+            "INSERT INTO assets (id, kind, is_active, quote_mode, quote_ccy, created_at, updated_at) \
+             VALUES ('OTHER', 'INVESTMENT', 1, 'MARKET', 'USD', datetime('now'), datetime('now'))",
+        );
+        sql(
+            &db,
+            "INSERT INTO quotes (id, asset_id, day, source, close, currency, created_at, timestamp) \
+             VALUES ('q-move', 'AAPL', '2025-01-03', 'MANUAL', '100', 'USD', datetime('now'), \
+             '2025-01-03T00:00:00Z')",
+        );
+        consume_all(&db).await;
+        sql(
+            &db,
+            "UPDATE quotes SET asset_id = 'OTHER' WHERE id = 'q-move'",
+        );
+        assert_eq!(dirty(&db, "q:AAPL").as_deref(), Some("2025-01-03"));
+        assert_eq!(dirty(&db, "q:OTHER").as_deref(), Some("2025-01-03"));
+    }
+
+    #[tokio::test]
+    async fn a_quote_marks_from_its_timestamp_date_as_well_as_its_day() {
+        let db = setup();
+        fx_pair(&db);
+        sql(
+            &db,
+            "INSERT INTO quotes (id, asset_id, day, source, close, currency, created_at, timestamp) \
+             VALUES ('fx-prior', 'fx-eur', '2024-12-15', 'MANUAL', '2', 'USD', datetime('now'), \
+             '2024-12-15T00:00:00Z')",
+        );
+        consume_all(&db).await;
+        // Sync's generic quote upsert accepts each field on its own; the
+        // engine reads the timestamp's date.
+        sql(
+            &db,
+            "UPDATE quotes SET timestamp = '2024-12-01T00:00:00Z' WHERE id = 'fx-q'",
+        );
+        assert_eq!(dirty(&db, "fx:fx-eur").as_deref(), Some("2024-12-01"));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_moved_to_another_account_marks_both() {
+        let db = setup();
+        sql(
+            &db,
+            "INSERT INTO accounts (id, name, account_type, currency, is_default, is_active, \
+             created_at, updated_at, tracking_mode, is_archived) \
+             VALUES ('acc2', 'Other', 'SECURITIES', 'USD', 0, 1, datetime('now'), datetime('now'), \
+             'HOLDINGS', 0)",
+        );
+        let snapshots = SnapshotRepository::new(db.pool.clone(), db.writer.clone());
+        let mut manual = snapshot(3, "10");
+        manual.id = "move-snapshot".into();
+        manual.source = SnapshotSource::ManualEntry;
+        snapshots.save_snapshots(&[manual]).await.unwrap();
+        consume_all(&db).await;
+        sql(
+            &db,
+            "UPDATE holdings_snapshots SET account_id = 'acc2' WHERE id = 'move-snapshot'",
+        );
+        assert_eq!(dirty(&db, "acc1").as_deref(), Some("2025-01-03"));
+        assert_eq!(dirty(&db, "acc2").as_deref(), Some("2025-01-03"));
+    }
+
+    #[tokio::test]
+    async fn an_account_arriving_after_its_snapshot_projects() {
+        let db = setup();
+        let snapshots = SnapshotRepository::new(db.pool.clone(), db.writer.clone());
+        let mut manual = snapshot(3, "10");
+        manual.id = "late-account-snapshot".into();
+        manual.account_id = "late-account".into();
+        manual.positions.clear();
+        manual.source = SnapshotSource::ManualEntry;
+        snapshots.save_snapshots(&[manual]).await.unwrap();
+        // A job cannot project an account that does not exist yet, and
+        // consumes the snapshot's marker.
+        consume_all(&db).await;
+        sql(
+            &db,
+            "INSERT INTO accounts (id, name, account_type, currency, is_default, is_active, \
+             created_at, updated_at, tracking_mode, is_archived) \
+             VALUES ('late-account', 'Late', 'SECURITIES', 'USD', 0, 1, datetime('now'), \
+             datetime('now'), 'HOLDINGS', 0)",
+        );
+        assert_eq!(dirty(&db, "late-account").as_deref(), Some("0001-01-01"));
+    }
+
+    #[tokio::test]
+    async fn an_asset_arriving_after_its_snapshot_refolds_its_holders() {
+        let db = setup();
+        let snapshots = SnapshotRepository::new(db.pool.clone(), db.writer.clone());
+        let mut manual = snapshot(3, "10");
+        manual.source = SnapshotSource::ManualEntry;
+        snapshots.save_snapshots(&[manual]).await.unwrap();
+        // Observed positions can name an asset sync has not delivered yet.
+        sql(&db, "DELETE FROM assets WHERE id = 'AAPL'");
+        consume_all(&db).await;
+        sql(
+            &db,
+            "INSERT INTO assets (id, kind, is_active, quote_mode, quote_ccy, created_at, updated_at) \
+             VALUES ('AAPL', 'PROPERTY', 1, 'MANUAL', 'USD', datetime('now'), datetime('now'))",
+        );
+        assert_eq!(dirty(&db, "a:AAPL").as_deref(), Some("0001-01-01"));
+    }
+
+    #[tokio::test]
+    async fn a_lot_selection_change_marks_its_account() {
+        let db = setup();
+        consume_all(&db).await;
+        sql(
+            &db,
+            "UPDATE accounts SET meta = '{\"accounting\":{\"lotSelectionStrategy\":\"HIGHEST_COST\"}}' \
+             WHERE id = 'acc1'",
+        );
+        let mut conn = get_connection(&db.pool).unwrap();
+        let account = crate::schema::accounts::table
+            .find("acc1")
+            .select(crate::accounts::AccountDB::as_select())
+            .first::<crate::accounts::AccountDB>(&mut conn)
+            .unwrap();
+        // The job validates this setting, so a change must reach it.
+        assert!(account
+            .accounting_settings()
+            .unwrap()
+            .ensure_supported_for_calculation()
+            .is_err());
+        assert_eq!(dirty(&db, "acc1").as_deref(), Some("0001-01-01"));
+    }
+
+    #[tokio::test]
+    async fn the_migration_round_trip_keeps_the_facts() {
+        use diesel::connection::SimpleConnection;
+        let db = setup();
+        let mut conn = get_connection(&db.pool).unwrap();
+        conn.batch_execute(include_str!(
+            "../../../migrations/2026-09-28-000001_projection_state/down.sql"
+        ))
+        .unwrap();
+        sql(
+            &db,
+            "UPDATE activities SET amount = '25' WHERE id = 'sell-1'",
+        );
+        conn.batch_execute(include_str!(
+            "../../../migrations/2026-09-28-000001_projection_state/up.sql"
+        ))
+        .unwrap();
+        assert_eq!(dirty(&db, "@all").as_deref(), Some("0001-01-01"));
+        let rows: Vec<String> = crate::schema::activities::table
+            .select(crate::schema::activities::id)
+            .load(&mut conn)
+            .unwrap();
+        assert_eq!(rows, vec!["sell-1"]);
+        assert!(!wealthfolio_core::sync::APP_SYNC_TABLES.contains(&"projection_state"));
+    }
+
+    /// Rules §5, mechanically: every column the engine reads (the
+    /// coordinator's `facts::raw_*` converters, the FX repository's pair, the
+    /// policy settings) and every insert and delete of a fact leaves a marker.
+    /// A column the engine starts reading belongs on this list.
+    #[tokio::test]
+    async fn every_fact_the_engine_reads_marks_when_it_changes() {
+        let db = setup();
+        let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());
+        sql(
+            &db,
+            "INSERT INTO accounts (id, name, account_type, currency, is_default, is_active, \
+             created_at, updated_at, tracking_mode, is_archived) \
+             VALUES ('acc2', 'Other', 'SECURITIES', 'USD', 0, 1, datetime('now'), datetime('now'), \
+             'HOLDINGS', 0)",
+        );
+        sql(
+            &db,
+            "INSERT INTO assets (id, kind, is_active, quote_mode, quote_ccy, created_at, updated_at) \
+             VALUES ('OTHER', 'INVESTMENT', 1, 'MARKET', 'USD', datetime('now'), datetime('now'))",
+        );
+        fx_pair(&db);
+        sql(
+            &db,
+            "INSERT INTO quotes (id, asset_id, day, source, close, currency, created_at, timestamp) \
+             VALUES ('q-aapl', 'AAPL', '2025-01-03', 'MANUAL', '100', 'USD', datetime('now'), \
+             '2025-01-03T00:00:00Z')",
+        );
+        let snapshots = SnapshotRepository::new(db.pool.clone(), db.writer.clone());
+        let mut manual = snapshot(3, "10");
+        manual.source = SnapshotSource::ManualEntry;
+        let snapshot_id = manual.id.clone();
+        snapshots.save_snapshots(&[manual]).await.unwrap();
+        sql(
+            &db,
+            "INSERT INTO app_settings (setting_key, setting_value) \
+             VALUES ('base_currency', 'USD'), ('timezone', 'UTC')",
+        );
+
+        let account = |set: &str| format!("UPDATE accounts SET {set} WHERE id = 'acc1'");
+        let accounting = |key: &str, value: &str| {
+            account(&format!(
+                "meta = '{{\"accounting\":{{\"{key}\":\"{value}\"}}}}'"
+            ))
+        };
+        let asset = |set: &str| format!("UPDATE assets SET {set} WHERE id = 'AAPL'");
+        let fx = |set: &str| format!("UPDATE assets SET {set} WHERE id = 'fx-eur'");
+        let activity = |set: &str| format!("UPDATE activities SET {set} WHERE id = 'sell-1'");
+        let quote = |set: &str| format!("UPDATE quotes SET {set} WHERE id = 'q-aapl'");
+        let observed =
+            |set: &str| format!("UPDATE holdings_snapshots SET {set} WHERE id = '{snapshot_id}'");
+        let setting = |key: &str, value: &str| {
+            format!("UPDATE app_settings SET setting_value = '{value}' WHERE setting_key = '{key}'")
+        };
+        let mut changes: Vec<String> = vec![
+            account("currency = 'CAD'"),
+            account("account_type = 'CASH'"),
+            account("tracking_mode = 'HOLDINGS'"),
+            account("is_archived = 1"),
+            accounting("costBasisMethod", "AVERAGE_COST"),
+            accounting("costBasisProfile", "CANADA_ACB"),
+            accounting("poolingScope", "PER_ACCOUNT"),
+            accounting("lotSelectionStrategy", "LOWEST_COST"),
+            asset("kind = 'PROPERTY'"),
+            asset("quote_ccy = 'CAD'"),
+            asset("instrument_type = 'EQUITY'"),
+            asset("metadata = '{\"contractMultiplier\": 10}'"),
+            asset("metadata = '{\"contractMultiplier\": 10, \"option\": {}}'"),
+            fx("instrument_symbol = 'GBP'"),
+            fx("quote_ccy = 'CAD'"),
+            quote("asset_id = 'OTHER'"),
+            quote("day = '2025-01-02'"),
+            quote("timestamp = '2025-01-01T00:00:00Z'"),
+            quote("close = '101'"),
+            quote("currency = 'CAD'"),
+            quote("source = 'YAHOO'"),
+            observed("account_id = 'acc2'"),
+            observed("snapshot_date = '2025-01-02'"),
+            observed("positions = '{}'"),
+            observed("cash_balances = '{\"USD\": \"1\"}'"),
+            observed("cost_basis = '1'"),
+            observed("net_contribution = '1'"),
+            observed("net_contribution_base = '1'"),
+            observed("cash_total_account_currency = '1'"),
+            observed("cash_total_base_currency = '1'"),
+            observed("source = 'BROKER_IMPORTED'"),
+            setting("base_currency", "EUR"),
+            setting("timezone", "Europe/Paris"),
+            fx("kind = 'INVESTMENT'"),
+        ];
+        changes.extend(
+            [
+                "account_id = 'acc2'",
+                "asset_id = 'AAPL'",
+                "activity_type = 'BUY'",
+                "activity_type_override = 'SELL'",
+                "subtype = 'DRIP'",
+                "status = 'PENDING'",
+                "activity_date = '2025-01-06T00:00:00Z'",
+                "quantity = '2'",
+                "unit_price = '3'",
+                "amount = '6'",
+                "fee = '1'",
+                "tax = '1'",
+                "currency = 'CAD'",
+                "fx_rate = '1.3'",
+                "source_group_id = 'g'",
+                "metadata = '{\"flow\": {\"is_external\": true}}'",
+                "source_system = 'BROKER'",
+                "is_user_modified = 1",
+                "created_at = '2025-01-01T00:00:00'",
+                "updated_at = '2025-01-02T00:00:00'",
+            ]
+            .into_iter()
+            .map(activity),
+        );
+        changes.extend([
+            "INSERT INTO accounts (id, name, account_type, currency, is_default, is_active, \
+             created_at, updated_at, tracking_mode, is_archived) \
+             VALUES ('acc3', 'New', 'SECURITIES', 'USD', 0, 1, datetime('now'), datetime('now'), \
+             'TRANSACTIONS', 0)"
+                .to_string(),
+            "INSERT INTO assets (id, kind, is_active, quote_mode, quote_ccy, created_at, updated_at) \
+             VALUES ('NEW', 'INVESTMENT', 1, 'MARKET', 'USD', datetime('now'), datetime('now'))"
+                .to_string(),
+            "INSERT INTO activities (id, account_id, activity_type, status, activity_date, currency, \
+             is_user_modified, needs_review, created_at, updated_at) \
+             VALUES ('dep-1', 'acc1', 'DEPOSIT', 'POSTED', '2025-01-07T00:00:00Z', 'USD', 0, 0, \
+             datetime('now'), datetime('now'))"
+                .to_string(),
+            "INSERT INTO quotes (id, asset_id, day, source, close, currency, created_at, timestamp) \
+             VALUES ('q-new', 'NEW', '2025-01-04', 'MANUAL', '5', 'USD', datetime('now'), \
+             '2025-01-04T00:00:00Z')"
+                .to_string(),
+            "DELETE FROM quotes WHERE id = 'q-new'".to_string(),
+            "DELETE FROM activities WHERE id = 'dep-1'".to_string(),
+            format!("DELETE FROM holdings_snapshots WHERE id = '{snapshot_id}'"),
+            "DELETE FROM assets WHERE id = 'NEW'".to_string(),
+        ]);
+        for change in &changes {
+            consume_all(&db).await;
+            sql(&db, change);
+            assert!(
+                !store.pending_markers().unwrap().is_empty(),
+                "no marker after: {change}"
+            );
+        }
+        let mut inserted = snapshot(4, "5");
+        inserted.source = SnapshotSource::ManualEntry;
+        consume_all(&db).await;
+        snapshots.save_snapshots(&[inserted]).await.unwrap();
+        assert!(
+            !store.pending_markers().unwrap().is_empty(),
+            "no marker after an observed snapshot insert"
         );
     }
 }
