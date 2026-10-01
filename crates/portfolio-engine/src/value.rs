@@ -1372,7 +1372,7 @@ fn scope_flows(
     scope: &[AccountId],
     window: Window,
 ) -> BTreeMap<NaiveDate, DailyFlow> {
-    let mut flows: BTreeMap<NaiveDate, DailyFlow> = BTreeMap::new();
+    let mut by_account: BTreeMap<&AccountId, BTreeMap<NaiveDate, DailyFlow>> = BTreeMap::new();
     for event in effects
         .events
         .iter()
@@ -1387,12 +1387,25 @@ fn scope_flows(
             }
         }
         add_flow(
-            &mut flows,
+            by_account.entry(&event.account).or_default(),
             event.date,
             flow.amount,
             flow.outflow,
             flow.source,
         );
+    }
+    // Each account's day at storage precision, as its stored row holds it,
+    // so a scope adds up exactly the rows it aggregates.
+    let mut flows: BTreeMap<NaiveDate, DailyFlow> = BTreeMap::new();
+    for (date, flow) in by_account.into_values().flatten() {
+        let stored = flows.entry(date).or_insert(DailyFlow {
+            inflow_base: Decimal::ZERO,
+            outflow_base: Decimal::ZERO,
+            source: flow.source,
+        });
+        stored.inflow_base += flow.inflow_base.round_dp(STORED_PRECISION);
+        stored.outflow_base += flow.outflow_base.round_dp(STORED_PRECISION);
+        stored.source = stored.source.combine(flow.source);
     }
     flows
 }
@@ -1412,7 +1425,7 @@ fn internal_adjustments(
         .iter()
         .map(|event| (event.source.as_str(), event))
         .collect();
-    let mut adjustments: BTreeMap<NaiveDate, (Decimal, Decimal)> = BTreeMap::new();
+    let mut by_account: BTreeMap<(&AccountId, NaiveDate), (Decimal, Decimal)> = BTreeMap::new();
     for pair in effects.pairs.iter().filter(|pair| {
         pair.in_account != pair.out_account
             && scope.contains(&pair.in_account)
@@ -1428,8 +1441,8 @@ fn internal_adjustments(
             if flow.amount.is_zero() {
                 continue;
             }
-            let entry = adjustments
-                .entry(event.date)
+            let entry = by_account
+                .entry((&event.account, event.date))
                 .or_insert((Decimal::ZERO, Decimal::ZERO));
             if flow.leg_outflow {
                 entry.1 += flow.amount;
@@ -1437,6 +1450,15 @@ fn internal_adjustments(
                 entry.0 += flow.amount;
             }
         }
+    }
+    // At storage precision per account and day, as the rows they net.
+    let mut adjustments: BTreeMap<NaiveDate, (Decimal, Decimal)> = BTreeMap::new();
+    for ((_, date), (inflow, outflow)) in by_account {
+        let entry = adjustments
+            .entry(date)
+            .or_insert((Decimal::ZERO, Decimal::ZERO));
+        entry.0 += inflow.round_dp(STORED_PRECISION);
+        entry.1 += outflow.round_dp(STORED_PRECISION);
     }
     adjustments
 }
