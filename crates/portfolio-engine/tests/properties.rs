@@ -2105,11 +2105,9 @@ fn p_txf_legs_transfers_carry_their_lots() {
             // at the transfer's price. A leg's fee is capitalised into the
             // lots it delivers (§ the TRANSFER_IN row): costs compare only
             // without one; a short's shortfall is left to the goldens. Units
-            // that cover convert their cost at the transfer day's rate, as
-            // every disposal's proceeds do: across currencies they compare in
-            // their own currency below.
+            // that cover keep their cost at the rates they were acquired at,
+            // as opened lots do (rules R2.4, EDGE-TXF-16).
             let fees = !out.charges.fee.is_zero() || !incoming.charges.fee.is_zero();
-            let covers_across = covering.iter().any(|d| d.currency.as_str() != base);
             let sent_base: Decimal = removed.iter().map(|d| d.cost_basis_base).sum();
             let topped_up_base = if topped_up {
                 pipeline
@@ -2136,9 +2134,7 @@ fn p_txf_legs_transfers_carry_their_lots() {
                 Some(Decimal::ZERO)
             };
             let moved_base = topped_up_base
-                .filter(|_| {
-                    !fees && !covers_across && (!topped_up || !sent_units.is_sign_negative())
-                })
+                .filter(|_| !fees && (!topped_up || !sent_units.is_sign_negative()))
                 .map(|topped_up_base| sent_base + topped_up_base);
             if let Some(moved_base) = moved_base {
                 let covered_base: Decimal = covering

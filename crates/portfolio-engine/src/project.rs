@@ -1082,6 +1082,7 @@ impl Projector<'_> {
                 event,
                 &reduction,
                 proceeds,
+                None,
                 &position_currency,
                 effects,
                 run,
@@ -1157,6 +1158,7 @@ impl Projector<'_> {
                 event,
                 &reduction,
                 amount,
+                None,
                 &position_currency,
                 effects,
                 run,
@@ -1349,12 +1351,28 @@ impl Projector<'_> {
                 .map(|l| l.cost_basis)
                 .sum::<Decimal>()
                 .abs();
+            // Delivered units carry their own cost in base, at the rates they
+            // were acquired at, as the lots they open do (rules R2.4); `None`
+            // when one has no rate.
+            let cover_proceeds_base = cover_lots
+                .iter()
+                .map(|l| {
+                    let rate = self.lot_rate_to_base(l, position_currency.as_str());
+                    (!rate.is_zero())
+                        .then(|| arith::mul(l.cost_basis, rate))
+                        .flatten()
+                })
+                .sum::<Option<Decimal>>()
+                .map(|total| total.abs());
             let reduction = if incoming_negative {
                 reduce_positive_lots_fifo(position, cover_abs)?
             } else {
                 reduce_negative_lots_fifo(position, cover_abs)?
             };
-            (residual, Some((reduction, cover_proceeds)))
+            (
+                residual,
+                Some((reduction, cover_proceeds, cover_proceeds_base)),
+            )
         } else {
             (lots, None)
         };
@@ -1379,13 +1397,14 @@ impl Projector<'_> {
             effects.cache_removals.push(g.to_string());
         }
 
-        if let Some((reduction, cover_proceeds)) = cover {
+        if let Some((reduction, cover_proceeds, cover_proceeds_base)) = cover {
             self.record_reduction(
                 &account_id,
                 asset,
                 event,
                 &reduction,
                 cover_proceeds,
+                cover_proceeds_base,
                 &position_currency,
                 effects,
                 run,
@@ -1526,6 +1545,7 @@ impl Projector<'_> {
             event,
             &reduction,
             proceeds,
+            None,
             &position_currency,
             effects,
             run,
@@ -1630,6 +1650,7 @@ impl Projector<'_> {
             event,
             &reduction,
             Decimal::ZERO,
+            None,
             &position_currency,
             effects,
             run,
@@ -1991,6 +2012,7 @@ impl Projector<'_> {
         event: &EconomicEvent,
         reduction: &Reduction,
         proceeds: Decimal,
+        proceeds_base: Option<Decimal>,
         position_currency: &Currency,
         effects: &mut SideEffects,
         run: &mut RunLog,
@@ -2001,6 +2023,7 @@ impl Projector<'_> {
             event,
             &reduction.removed_lots,
             proceeds,
+            proceeds_base,
             reduction.quantity_reduced,
             position_currency,
             effects,
@@ -2067,6 +2090,7 @@ impl Projector<'_> {
         event: &EconomicEvent,
         removed: &[Lot],
         total_proceeds: Decimal,
+        total_proceeds_base: Option<Decimal>,
         total_quantity: Decimal,
         position_currency: &Currency,
         effects: &mut SideEffects,
@@ -2095,13 +2119,18 @@ impl Projector<'_> {
             let cost_basis = lot.cost_basis;
             let acquisition_rate = self.lot_rate_to_base(lot, position_currency.as_str());
             let base_available = !disposal_rate.is_zero() && !acquisition_rate.is_zero();
-            let proceeds_base = if base_available {
-                checked(
+            let proceeds_base = match total_proceeds_base {
+                // Units a transfer delivered to cover the position carry their
+                // cost at the rates they were acquired at (rules R2.4).
+                Some(total) if base_available => checked(
+                    arith::proportional(total, effective, total_quantity),
+                    "disposal base proceeds",
+                )?,
+                _ if base_available => checked(
                     arith::mul(proceeds, disposal_rate),
                     "disposal base proceeds",
-                )?
-            } else {
-                Decimal::ZERO
+                )?,
+                _ => Decimal::ZERO,
             };
             let cost_basis_base = if base_available {
                 checked(
