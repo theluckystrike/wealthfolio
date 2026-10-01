@@ -1,7 +1,7 @@
 //! Coordinator over the in-memory doubles: marker-driven refolds and
 //! revalues, windowed persistence, and parity with the kernel goldens.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, RwLock};
 
 use super::*;
@@ -30,6 +30,9 @@ struct Harness {
     lot_repo: Arc<dyn LotRepositoryTrait>,
     projections: Arc<dyn ProjectionStoreTrait>,
     store: Arc<InMemoryProjectionStore>,
+    sources: FactSources,
+    base_currency: Arc<RwLock<String>>,
+    timezone: Arc<RwLock<String>>,
     _clock: crate::utils::clock::FrozenClock,
 }
 
@@ -103,9 +106,9 @@ async fn harness_with(facts: ScenarioFacts, cadence: WindowCadence) -> Harness {
         projections: projections.clone(),
     };
     let coordinator = PortfolioCoordinator::new(CoordinatorDeps {
-        base_currency,
-        timezone,
-        sources,
+        base_currency: base_currency.clone(),
+        timezone: timezone.clone(),
+        sources: sources.clone(),
         fx_service,
         snapshot_service,
         projections: projections.clone(),
@@ -127,6 +130,9 @@ async fn harness_with(facts: ScenarioFacts, cadence: WindowCadence) -> Harness {
         lot_repo,
         projections,
         store,
+        sources,
+        base_currency,
+        timezone,
         _clock: clock,
     }
 }
@@ -1561,4 +1567,460 @@ async fn an_fx_rate_revalues_from_its_previous_observation_and_refolds_only_late
                 .unwrap()
         )
     );
+}
+
+// ------------------------------------------------------------- app parity
+
+/// What every app path must reproduce: one kernel run over all of a
+/// scenario's facts (no window, no scope, no sparse read), stored through
+/// the same row mappings the coordinator writes with.
+struct Reference {
+    valuations: BTreeMap<String, Vec<crate::portfolio::valuation::DailyAccountValuation>>,
+    lots: BTreeMap<String, Vec<crate::lots::LotRecord>>,
+    disposals: BTreeMap<String, Vec<crate::lots::LotDisposal>>,
+    resolved: persist::Resolved,
+    rejected: BTreeSet<engine::model::ActivityId>,
+}
+
+fn reference(harness: &Harness, facts: &ScenarioFacts) -> Reference {
+    use crate::portfolio::snapshot::snapshot_date_requires_remediation;
+    let quotes: Vec<engine::model::RawQuote> = harness
+        .quote_service
+        .get_all_historical_quotes()
+        .unwrap()
+        .into_values()
+        .flatten()
+        .map(|(_, quote)| facts::raw_quote(&quote))
+        .collect();
+    let mut observed = Vec::new();
+    for account in facts
+        .accounts
+        .iter()
+        .filter(|a| a.tracking_mode == crate::accounts::TrackingMode::Holdings)
+    {
+        for snapshot in harness
+            .snapshot_repo
+            .get_snapshots_by_account(&account.id, None, None)
+            .unwrap()
+            .iter()
+            .filter(|s| {
+                s.source != SnapshotSource::Calculated
+                    && !snapshot_date_requires_remediation(s.snapshot_date, facts.as_of)
+            })
+        {
+            observed.push(facts::raw_observed_snapshot(snapshot));
+        }
+    }
+    let loaded = facts::LoadedFacts {
+        scope: Vec::new(),
+        raw: engine::model::RawFacts {
+            policy: engine::model::Policy::new(
+                engine::model::Currency::parse(&facts.base_currency).unwrap(),
+                facts.timezone.parse().unwrap_or(chrono_tz::Tz::UTC),
+                facts.as_of,
+            ),
+            accounts: facts.accounts.iter().map(facts::raw_account).collect(),
+            assets: facts.assets.iter().map(facts::raw_asset).collect(),
+            activities: facts.activities.iter().map(facts::raw_activity).collect(),
+            quotes,
+            fx_rates: facts.fx_rates.iter().map(facts::raw_fx_rate).collect(),
+            observed_snapshots: observed,
+        },
+        fx_pairs: BTreeMap::new(),
+        invalid_snapshot_dates: Vec::new(),
+        unsupported_accounts: Vec::new(),
+        base_currency: facts.base_currency.clone(),
+        timezone: facts.timezone.clone(),
+        as_of: facts.as_of,
+    };
+    let resolved = persist::resolve(&loaded).unwrap();
+    let fx = engine::FxResolver {
+        surface: &resolved.surfaces.fx,
+        policy: resolved.facts.policy(),
+    };
+    let range = resolved.range();
+    let bundle = engine::project(&resolved.ledger, &resolved.facts, &fx, None, range).unwrap();
+    let series = engine::value(&engine::ValueInputs {
+        resolved: engine::Resolved {
+            facts: &resolved.facts,
+            ledger: &resolved.ledger,
+            surfaces: &resolved.surfaces,
+            range,
+        },
+        bundle: &bundle,
+        lots: None,
+    });
+    let records = engine::lot_records(&bundle, &resolved.facts, &fx);
+    let mut valuations = BTreeMap::new();
+    let mut lots = BTreeMap::new();
+    let mut disposals = BTreeMap::new();
+    for account in facts.accounts.iter().filter(|a| !a.is_archived) {
+        let id = engine::model::AccountId::new(account.id.as_str());
+        valuations.insert(
+            account.id.clone(),
+            series
+                .get(&id)
+                .map(|s| persist::valuation_rows(s, &account.id, &facts.base_currency))
+                .unwrap_or_default(),
+        );
+        lots.insert(
+            account.id.clone(),
+            persist::lot_rows(&resolved, records.clone(), &account.id),
+        );
+        let own: Vec<&engine::model::LotDisposal> = bundle
+            .disposals
+            .iter()
+            .filter(|d| d.account == id)
+            .collect();
+        disposals.insert(
+            account.id.clone(),
+            persist::disposal_rows(&resolved, &own, &account.id),
+        );
+    }
+    let rejected = bundle.rejected_activities();
+    Reference {
+        valuations,
+        lots,
+        disposals,
+        resolved,
+        rejected,
+    }
+}
+
+fn normalized_disposals(mut rows: Vec<crate::lots::LotDisposal>) -> Vec<crate::lots::LotDisposal> {
+    for row in &mut rows {
+        row.created_at.clear();
+    }
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows
+}
+
+/// The first difference between two row lists, field by field.
+fn first_difference<T: serde::Serialize>(app: &[T], kernel: &[T]) -> Option<String> {
+    let app: Vec<serde_json::Value> = app
+        .iter()
+        .map(|r| serde_json::to_value(r).unwrap())
+        .collect();
+    let kernel: Vec<serde_json::Value> = kernel
+        .iter()
+        .map(|r| serde_json::to_value(r).unwrap())
+        .collect();
+    for (index, (a, k)) in app.iter().zip(&kernel).enumerate() {
+        if a == k {
+            continue;
+        }
+        let fields: Vec<String> = a
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(key, value)| k.get(key.as_str()) != Some(value))
+            .map(|(key, value)| format!("{key}: app {value} kernel {}", k[key.as_str()]))
+            .collect();
+        let at = a
+            .get("valuation_date")
+            .or_else(|| a.get("id"))
+            .cloned()
+            .unwrap_or_default();
+        return Some(format!("row {index} ({at}): {}", fields.join(", ")));
+    }
+    (app.len() != kernel.len()).then(|| format!("{} rows, kernel {}", app.len(), kernel.len()))
+}
+
+/// Where the stored projection of `accounts` differs from the reference.
+async fn stored_differences(
+    harness: &Harness,
+    reference: &Reference,
+    accounts: &[String],
+    label: &str,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    for account in accounts {
+        let mut note = |what: &str, difference: Option<String>| {
+            if let Some(difference) = difference {
+                found.push(format!("{label}: {what} of {account}: {difference}"));
+            }
+        };
+        note(
+            "valuations",
+            first_difference(
+                &normalized_valuations(harness.rows(account)),
+                &normalized_valuations(reference.valuations[account].clone()),
+            ),
+        );
+        let stored = harness
+            .lot_repo
+            .get_all_lots_for_account(account)
+            .await
+            .unwrap();
+        note(
+            "lots",
+            first_difference(
+                &normalized_lots(stored),
+                &normalized_lots(reference.lots[account].clone()),
+            ),
+        );
+        let stored = harness
+            .lot_repo
+            .get_lot_disposals_for_account(account)
+            .await
+            .unwrap();
+        note(
+            "disposals",
+            first_difference(
+                &normalized_disposals(stored),
+                &normalized_disposals(reference.disposals[account].clone()),
+            ),
+        );
+    }
+    found
+}
+
+/// Where the read path's performance differs from the kernel's over the
+/// reference.
+async fn read_differences(
+    harness: &Harness,
+    reference: &Reference,
+    accounts: &[String],
+    label: &str,
+) -> Vec<String> {
+    use crate::portfolio::performance::{
+        from_kernel, PerformanceService, PerformanceServiceTrait, PerformanceSummaryProfile,
+    };
+    let service = PerformanceService::new(
+        harness.base_currency.clone(),
+        harness.timezone.clone(),
+        harness.sources.clone(),
+        harness.valuation_repo.clone(),
+        harness.lot_repo.clone(),
+    );
+    let all_rows: Vec<_> = reference.valuations.values().flatten().cloned().collect();
+    let series = rows::stored_series(&all_rows);
+    let lot_rows: Vec<_> = reference.lots.values().flatten().cloned().collect();
+    let lots = rows::stored_lots(&lot_rows);
+    let disposal_rows: Vec<_> = reference.disposals.values().flatten().cloned().collect();
+    let disposals = rows::stored_disposals(&disposal_rows);
+    let range = reference.resolved.range();
+    let inputs = engine::MeasureInputs {
+        effects: engine::effects(
+            &engine::Resolved {
+                facts: &reference.resolved.facts,
+                ledger: &reference.resolved.ledger,
+                surfaces: &reference.resolved.surfaces,
+                range,
+            },
+            &disposals,
+            &lots,
+            &reference.rejected,
+        ),
+        series: &series,
+        lots: &lots,
+        disposals: &disposals,
+    };
+    let mut found = Vec::new();
+    let mut compare = |what: String,
+                       read: crate::errors::Result<
+        crate::portfolio::performance::PerformanceResult,
+    >,
+                       kernel: std::result::Result<
+        engine::model::PerformanceResult,
+        engine::EngineError,
+    >| {
+        let difference = match (read, kernel) {
+            (Ok(read), Ok(kernel)) => {
+                let read = serde_json::to_value(&read).unwrap();
+                let kernel = serde_json::to_value(from_kernel(kernel)).unwrap();
+                (read != kernel).then(|| {
+                    let keys: Vec<String> = read
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter(|(key, value)| kernel.get(key.as_str()) != Some(value))
+                        .map(|(key, value)| {
+                            let short = |v: &serde_json::Value| {
+                                v.to_string().chars().take(160).collect::<String>()
+                            };
+                            format!(
+                                "{key}: read {} kernel {}",
+                                short(value),
+                                short(&kernel[key.as_str()])
+                            )
+                        })
+                        .collect();
+                    keys.join("; ")
+                })
+            }
+            (Err(_), Err(_)) => None,
+            (read, kernel) => Some(format!(
+                "read {:?}, kernel {:?}",
+                read.map(|_| ()),
+                kernel.map(|_| ())
+            )),
+        };
+        if let Some(difference) = difference {
+            found.push(format!("{label}: {what}: {difference}"));
+        }
+    };
+    let modes = std::collections::HashMap::new();
+    let types = std::collections::HashMap::new();
+    let window = engine::Window::default();
+    let full = engine::MeasureProfile::Full;
+    for account in accounts {
+        let id = engine::model::AccountId::new(account.as_str());
+        compare(
+            format!("summary of {account}"),
+            service
+                .calculate_performance_summary(
+                    "account",
+                    account,
+                    None,
+                    None,
+                    None,
+                    None,
+                    PerformanceSummaryProfile::Full,
+                )
+                .await,
+            engine::measure_account(&inputs, &id, window, full, false),
+        );
+        compare(
+            format!("history of {account}"),
+            service
+                .calculate_performance_history("account", account, None, None, None, None)
+                .await,
+            engine::measure_account(&inputs, &id, window, full, true),
+        );
+        compare(
+            format!("scope of {account}"),
+            service
+                .calculate_performance_summary_for_accounts(
+                    account,
+                    std::slice::from_ref(account),
+                    "",
+                    &modes,
+                    &types,
+                    None,
+                    None,
+                    PerformanceSummaryProfile::Full,
+                )
+                .await,
+            engine::measure_scope(
+                &inputs,
+                account,
+                std::slice::from_ref(&id),
+                window,
+                full,
+                false,
+            ),
+        );
+    }
+    if accounts.len() > 1 {
+        let scope: Vec<engine::model::AccountId> = accounts
+            .iter()
+            .map(|a| engine::model::AccountId::new(a.as_str()))
+            .collect();
+        compare(
+            "portfolio".to_string(),
+            service
+                .calculate_performance_summary_for_accounts(
+                    "portfolio",
+                    accounts,
+                    "",
+                    &modes,
+                    &types,
+                    None,
+                    None,
+                    PerformanceSummaryProfile::Full,
+                )
+                .await,
+            engine::measure_scope(&inputs, "portfolio", &scope, window, full, false),
+        );
+    }
+    found
+}
+
+/// Where the app's answer differs from one kernel run over all the facts:
+/// at every window cadence (a boundary every day included), when one account
+/// is rebuilt on its own, and when performance is read back.
+async fn app_differences(facts: &ScenarioFacts, label: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut reference = None;
+    for cadence in [
+        WindowCadence::Days(1),
+        WindowCadence::Days(2),
+        WindowCadence::Year,
+    ] {
+        let harness = harness_with(facts.clone(), cadence).await;
+        let report = harness
+            .coordinator
+            .run_job(request(), &SilentObserver)
+            .await
+            .unwrap();
+        let failed: BTreeSet<&str> = report
+            .failures
+            .iter()
+            .map(|f| f.account_id.as_str())
+            .collect();
+        let accounts: Vec<String> = facts
+            .accounts
+            .iter()
+            .filter(|a| !a.is_archived && !failed.contains(a.id.as_str()))
+            .map(|a| a.id.clone())
+            .collect();
+        let reference = reference.get_or_insert_with(|| self::reference(&harness, facts));
+        found.extend(
+            stored_differences(
+                &harness,
+                reference,
+                &accounts,
+                &format!("{label} {cadence:?}"),
+            )
+            .await,
+        );
+        if matches!(cadence, WindowCadence::Year) {
+            found.extend(
+                read_differences(&harness, reference, &accounts, &format!("{label} read")).await,
+            );
+            for account in &accounts {
+                let alone = harness_with(facts.clone(), WindowCadence::Year).await;
+                let request = PortfolioJobRequest {
+                    account_ids: Some(vec![account.clone()]),
+                    ..request()
+                };
+                alone
+                    .coordinator
+                    .run_job(request, &SilentObserver)
+                    .await
+                    .unwrap();
+                found.extend(
+                    stored_differences(
+                        &alone,
+                        reference,
+                        std::slice::from_ref(account),
+                        &format!("{label} {account} alone"),
+                    )
+                    .await,
+                );
+            }
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn the_app_matches_one_kernel_run_on_every_scenario() {
+    let mut compared = 0;
+    let mut found = Vec::new();
+    for scenario in load_all_scenarios()
+        .into_iter()
+        .filter(|s| !s.has_marker(crate::test_support::scenario::Marker::S))
+    {
+        found.extend(app_differences(&scenario.facts(), &scenario.id).await);
+        compared += 1;
+    }
+    assert!(
+        found.is_empty(),
+        "{} differences:\n{}",
+        found.len(),
+        found.join("\n")
+    );
+    assert!(compared > 100, "only {compared} scenarios compared");
 }
