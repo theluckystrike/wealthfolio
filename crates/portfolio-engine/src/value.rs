@@ -50,6 +50,9 @@ impl<'a> Resolved<'a> {
 pub struct ValueInputs<'a> {
     pub resolved: Resolved<'a>,
     pub bundle: &'a ProjectionBundle,
+    /// The valued accounts' stored lots, when `bundle` carries none (a
+    /// revalue from stored rows): a transfer's direction reads them.
+    pub lots: Option<&'a [LotRecord]>,
 }
 
 /// A keyframe as valuation sees it: projected state or observed snapshot.
@@ -116,11 +119,17 @@ fn value_series(
 ) -> BTreeMap<AccountId, ValuationSeries> {
     let resolved = &inputs.resolved;
     let rejected = inputs.bundle.rejected_activities();
+    let opened = match inputs.lots {
+        Some(lots) => lots_opened(lots),
+        None => bundle_lots_opened(inputs.bundle, resolved.ledger),
+    };
+    let short = short_transfers(resolved.ledger, &opened, &inputs.bundle.disposals);
     // Valuation reads only the flows of the accounts it values, inside the
     // range: pricing anything else would be thrown away.
     let (effects, mut pricing_diagnostics) = priced_events(
         resolved,
         &inputs.bundle.disposals,
+        &short,
         &rejected,
         Some(EventSelection {
             range: resolved.range,
@@ -1115,9 +1124,89 @@ impl<'a> Valuer<'a> {
 pub fn effects(
     resolved: &Resolved<'_>,
     disposals: &[LotDisposal],
+    lots: &[LotRecord],
     rejected: &BTreeSet<ActivityId>,
 ) -> Effects {
-    priced_events(resolved, disposals, rejected, None).0
+    let short = short_transfers(resolved.ledger, &lots_opened(lots), disposals);
+    priced_events(resolved, disposals, &short, rejected, None).0
+}
+
+/// Signed units each activity opened in each account, from lot records.
+fn lots_opened(lots: &[LotRecord]) -> BTreeMap<(AccountId, ActivityId), Decimal> {
+    let mut opened = BTreeMap::new();
+    for lot in lots {
+        if let Some(activity) = &lot.open_activity {
+            *opened
+                .entry((lot.account.clone(), activity.clone()))
+                .or_insert(Decimal::ZERO) += lot.original_quantity;
+        }
+    }
+    opened
+}
+
+/// Signed units each activity opened in each account, from a projection:
+/// its open lots and the lots it closed.
+fn bundle_lots_opened(
+    bundle: &ProjectionBundle,
+    ledger: &CompiledLedger,
+) -> BTreeMap<(AccountId, ActivityId), Decimal> {
+    let source: BTreeMap<&EventId, &ActivityId> =
+        ledger.events.iter().map(|e| (&e.id, &e.source)).collect();
+    let mut opened = BTreeMap::new();
+    let mut add = |account: &AccountId, event: Option<&EventId>, quantity: Decimal| {
+        if let Some(activity) = event.and_then(|e| source.get(e)) {
+            *opened
+                .entry((account.clone(), (*activity).clone()))
+                .or_insert(Decimal::ZERO) += quantity;
+        }
+    };
+    for (account, state) in &bundle.final_state.accounts {
+        for lot in state.positions.values().flat_map(|p| p.lots.iter()) {
+            add(account, lot.source_event.as_ref(), lot.original_quantity);
+        }
+    }
+    for closure in &bundle.closures {
+        add(
+            &closure.account,
+            closure.open_event.as_ref(),
+            closure.original_quantity,
+        );
+    }
+    opened
+}
+
+/// Security transfers that moved a short position. A short is a liability:
+/// sending it out is an inflow, receiving it an outflow. Each leg reads its
+/// own account's records, so no path needs the partner's: an outgoing leg
+/// that disposed only short lots, an incoming leg that opened short lots or,
+/// opening none, covered long ones.
+fn short_transfers(
+    ledger: &CompiledLedger,
+    opened: &BTreeMap<(AccountId, ActivityId), Decimal>,
+    disposals: &[LotDisposal],
+) -> BTreeSet<ActivityId> {
+    let mut short = BTreeSet::new();
+    for event in &ledger.events {
+        let Action::SecurityTransfer { direction, .. } = event.action else {
+            continue;
+        };
+        let disposed: Vec<Decimal> = disposals
+            .iter()
+            .filter(|d| d.event == event.id && d.account == event.account && !d.quantity.is_zero())
+            .map(|d| d.quantity)
+            .collect();
+        let moved_short = match direction {
+            Direction::Out => !disposed.is_empty() && disposed.iter().all(|q| q.is_sign_negative()),
+            Direction::In => match opened.get(&(event.account.clone(), event.source.clone())) {
+                Some(quantity) if !quantity.is_zero() => quantity.is_sign_negative(),
+                _ => !disposed.is_empty() && disposed.iter().all(|q| q.is_sign_positive()),
+            },
+        };
+        if moved_short {
+            short.insert(event.source.clone());
+        }
+    }
+    short
 }
 
 /// The events a valuation prices: those inside `range`, of `accounts` when
@@ -1131,6 +1220,7 @@ struct EventSelection<'a> {
 fn priced_events(
     resolved: &Resolved<'_>,
     disposals: &[LotDisposal],
+    short: &BTreeSet<ActivityId>,
     rejected: &BTreeSet<ActivityId>,
     selection: Option<EventSelection<'_>>,
 ) -> (Effects, BTreeMap<AccountId, Vec<Diagnostic>>) {
@@ -1150,29 +1240,6 @@ fn priced_events(
         .filter(|a| a.external_transfer == Some(true))
         .map(|a| a.id.as_str())
         .collect();
-    // Transfers that move a short position (both legs of a pair): a short
-    // is a liability, so sending it out is an inflow and receiving it an
-    // outflow. The outgoing leg's disposals carry the sign of what moved.
-    let mut moves_short: BTreeSet<&ActivityId> = BTreeSet::new();
-    for event in &resolved.ledger.events {
-        let Action::SecurityTransfer {
-            direction: Direction::Out,
-            ..
-        } = event.action
-        else {
-            continue;
-        };
-        let mut moved = disposals
-            .iter()
-            .filter(|d| d.event == event.id && !d.quantity.is_zero())
-            .peekable();
-        if moved.peek().is_some() && moved.all(|d| d.quantity.is_sign_negative()) {
-            moves_short.insert(&event.source);
-            if let Some(pair) = facts.transfer_pairs.pair_for(&event.source) {
-                moves_short.insert(&pair.transfer_in);
-            }
-        }
-    }
     let mut valuer = Valuer::new(resolved, disposals, &AccountId::new("effects"), &base);
     let mut diagnostics: BTreeMap<AccountId, Vec<Diagnostic>> = BTreeMap::new();
     let mut events = Vec::with_capacity(resolved.ledger.events.len());
@@ -1208,7 +1275,7 @@ fn priced_events(
                     .is_some_and(|c| c.amount < Decimal::ZERO);
                 let security_outflow = match &event.action {
                     Action::SecurityTransfer { direction, .. } => {
-                        Some((*direction == Direction::Out) != moves_short.contains(&event.source))
+                        Some((*direction == Direction::Out) != short.contains(&event.source))
                     }
                     _ => None,
                 };

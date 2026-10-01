@@ -234,15 +234,18 @@ impl ValuationServiceTrait for ValuationService {
             self.today(),
         )?;
         let mut disposal_rows = Vec::new();
+        let mut lot_rows = Vec::new();
         for account_id in account_ids {
             disposal_rows.extend(self.lots.get_lot_disposals_for_account(account_id).await?);
+            lot_rows.extend(self.lots.get_all_lots_for_account(account_id).await?);
         }
         let series = rows::stored_series(&rows);
         let disposals = rows::stored_disposals(&disposal_rows);
+        let lots = rows::stored_lots(&lot_rows);
         let scope: Vec<AccountId> = account_ids.iter().map(AccountId::new).collect();
         let rejected = rows::stored_rejections(&self.sources, &measured)?;
         let aggregated = engine::aggregate_scope(
-            &measured.effects(&disposals, &rejected),
+            &measured.effects(&disposals, &lots, &rejected),
             &series,
             &scope,
             engine::Window {

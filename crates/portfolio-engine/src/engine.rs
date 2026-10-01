@@ -109,6 +109,7 @@ impl Engine {
         value(&ValueInputs {
             resolved: self.resolved(),
             bundle,
+            lots: None,
         })
     }
 
@@ -120,8 +121,13 @@ impl Engine {
     /// `disposals` supply the removed-lot basis of unquoted outbound
     /// transfers and `rejected` the activities the fold left out (computed
     /// or stored).
-    pub fn effects(&self, disposals: &[LotDisposal], rejected: &BTreeSet<ActivityId>) -> Effects {
-        effects(&self.resolved(), disposals, rejected)
+    pub fn effects(
+        &self,
+        disposals: &[LotDisposal],
+        lots: &[LotRecord],
+        rejected: &BTreeSet<ActivityId>,
+    ) -> Effects {
+        effects(&self.resolved(), disposals, lots, rejected)
     }
 
     /// The inputs `measure_account` and `measure_scope` read: the priced
@@ -134,7 +140,7 @@ impl Engine {
         rejected: &BTreeSet<ActivityId>,
     ) -> MeasureInputs<'a> {
         MeasureInputs {
-            effects: self.effects(disposals, rejected),
+            effects: self.effects(disposals, lots, rejected),
             series,
             lots,
             disposals,

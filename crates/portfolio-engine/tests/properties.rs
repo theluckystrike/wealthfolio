@@ -125,6 +125,7 @@ fn p_chunk_partitions_are_equivalent() {
             let chunked_series = wealthfolio_portfolio_engine::value(&ValueInputs {
                 resolved: one_shot.resolved(),
                 bundle: &chunked,
+                lots: None,
             });
             let left = serde_json::to_value(&chunked_series).unwrap();
             let right = serde_json::to_value(&one_shot.series).unwrap();
@@ -353,6 +354,7 @@ fn value_windowed(
                     range: window,
                 },
                 bundle: &bundle,
+                lots: None,
             },
             &seed,
             None,
@@ -625,6 +627,7 @@ fn p_txf_internal_pairs_cancel_at_portfolio_scope() {
         let Ok(portfolio) = aggregate_scope(
             &pipeline.effects(
                 &pipeline.bundle.disposals,
+                &pipeline.lots(),
                 &pipeline.bundle.rejected_activities(),
             ),
             &pipeline.series,
@@ -769,6 +772,7 @@ fn p_agg_scope_aggregation_is_exact() {
         let pipeline = Pipeline::from_scenario(&scenario);
         let effects = pipeline.effects(
             &pipeline.bundle.disposals,
+            &pipeline.lots(),
             &pipeline.bundle.rejected_activities(),
         );
         let scope = pipeline.portfolio_scope();
@@ -1569,7 +1573,7 @@ fn p_txf_legs_transfers_carry_their_lots() {
 
         // A transfer valued at cost carries the cost the fold booked, less
         // the charges capitalised into it (they are no flow, NOM-TXF-03).
-        let effects = pipeline.effects(&pipeline.bundle.disposals, &rejected);
+        let effects = pipeline.effects(&pipeline.bundle.disposals, &lots, &rejected);
         for effect in &effects.events {
             let Some(flow) = &effect.flow else { continue };
             if flow.source != FlowSource::CostBasisFallback {

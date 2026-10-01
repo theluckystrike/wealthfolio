@@ -522,6 +522,7 @@ pub fn capture_valuation(
                 &effects(
                     &inputs.resolved,
                     &inputs.bundle.disposals,
+                    &lot_records(inputs.bundle, inputs.resolved.facts, &inputs.resolved.fx()),
                     &inputs.bundle.rejected_activities(),
                 ),
                 series,
@@ -575,6 +576,7 @@ pub fn capture_portfolio_flows(
         &effects(
             &inputs.resolved,
             &inputs.bundle.disposals,
+            &lot_records(inputs.bundle, inputs.resolved.facts, &inputs.resolved.fx()),
             &inputs.bundle.rejected_activities(),
         ),
         series,
@@ -973,6 +975,7 @@ impl Pipeline {
         ValueInputs {
             resolved: self.resolved(),
             bundle: &self.bundle,
+            lots: None,
         }
     }
 

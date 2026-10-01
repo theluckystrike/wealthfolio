@@ -405,10 +405,12 @@ struct FoldStep {
 }
 
 /// What revaluing reads from the last run: stored disposals price unquoted
-/// outbound transfers, stored rejections keep the activities the last fold
-/// rejected out of the flows.
+/// outbound transfers, stored lots and disposals tell which way a transfer
+/// moved, stored rejections keep the activities the last fold rejected out of
+/// the flows.
 struct StoredInputs {
     disposals: Vec<KernelDisposal>,
+    lots: Vec<engine::model::LotRecord>,
     rejected: Vec<Diagnostic>,
 }
 
@@ -419,16 +421,20 @@ async fn stored_inputs(
     if accounts.is_empty() {
         return Ok(StoredInputs {
             disposals: Vec::new(),
+            lots: Vec::new(),
             rejected: Vec::new(),
         });
     }
     let mut stored_disposals: Vec<LotDisposal> = Vec::new();
+    let mut stored_lots = Vec::new();
     for account in accounts.keys() {
         stored_disposals.extend(context.lots.get_lot_disposals_for_account(account).await?);
+        stored_lots.extend(context.lots.get_all_lots_for_account(account).await?);
     }
     let ids: Vec<String> = accounts.keys().cloned().collect();
     Ok(StoredInputs {
         disposals: super::rows::stored_disposals(&stored_disposals),
+        lots: super::rows::stored_lots(&stored_lots),
         rejected: context
             .projections
             .activity_issues(&ids)?
@@ -564,6 +570,7 @@ fn refold_rows(
                 range: window,
             },
             bundle,
+            lots: None,
         },
         seed,
         Some(&valued(active)),
@@ -672,6 +679,7 @@ fn revalue_rows(
                 range: window,
             },
             bundle: &bundle,
+            lots: Some(&stored.lots),
         },
         &seed,
         Some(&valued(active)),
