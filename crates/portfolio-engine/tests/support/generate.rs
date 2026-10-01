@@ -1,7 +1,8 @@
 //! Generated scenarios: random combinations of the inputs the hand-written
-//! fixtures cover one at a time (archived and holdings accounts, sparse and
-//! invalid quotes, splits adjusted or not by the provider, transfers across
-//! days and both ways, shorts, minor units, options, FX), written as YAML in
+//! fixtures cover one at a time (archived and holdings accounts, accounts
+//! opening after the others, sparse, invalid and missing quotes, splits
+//! adjusted or not by the provider, transfers across days and both ways,
+//! shorts, minor units, options, FX), written as YAML in
 //! the fixture schema. The engine's property laws and the app parity test
 //! (`crates/core`, which includes this file by path) both run over them, so
 //! it uses the standard library only.
@@ -186,6 +187,20 @@ pub fn scenario_yaml(seed: u64) -> String {
     let mut splits: Vec<(usize, u64, u64, bool)> = Vec::new();
     let mut group = 0u64;
 
+    // Trading accounts open on the first day, or now and then later: an
+    // account added to a portfolio that already exists.
+    let opens: BTreeMap<usize, u64> = traders
+        .iter()
+        .enumerate()
+        .map(|(n, &index)| {
+            let day = if n > 0 && rng.chance(30) {
+                (start + 1 + rng.below(10)).min(as_of)
+            } else {
+                start
+            };
+            (index, day)
+        })
+        .collect();
     for &index in &traders {
         let account = &accounts[index];
         let (amount, currency) = if account.currency == "GBP" && rng.chance(30) {
@@ -194,7 +209,7 @@ pub fn scenario_yaml(seed: u64) -> String {
             (1_000 + rng.below(4_000), account.currency)
         };
         ledger.row(
-            start,
+            opens[&index],
             &account.id,
             &format!("type: DEPOSIT, amount: {amount}, currency: {currency}"),
         );
@@ -230,6 +245,9 @@ pub fn scenario_yaml(seed: u64) -> String {
         }
         for _ in 0..rng.below(3) {
             let index = *rng.pick(&traders);
+            if day < opens[&index] {
+                continue;
+            }
             let a = rng.below(assets.len() as u64) as usize;
             let asset = &assets[a];
             let account = &accounts[index];
@@ -306,12 +324,15 @@ pub fn scenario_yaml(seed: u64) -> String {
                     // A paired transfer, cash or what is held, arriving the
                     // same day or a day or two later, sometimes answered the
                     // same day.
-                    let to = loop {
-                        let candidate = *rng.pick(&traders);
-                        if candidate != index {
-                            break candidate;
-                        }
-                    };
+                    let open: Vec<usize> = traders
+                        .iter()
+                        .copied()
+                        .filter(|&candidate| candidate != index && opens[&candidate] <= day)
+                        .collect();
+                    if open.is_empty() {
+                        continue;
+                    }
+                    let to = *rng.pick(&open);
                     let mut legs = vec![(index, to)];
                     if rng.chance(30) {
                         legs.push((to, index));
@@ -357,6 +378,11 @@ pub fn scenario_yaml(seed: u64) -> String {
     // before a split half the time, now and then a non-positive one.
     let mut quotes = String::new();
     for (index, asset) in assets.iter().enumerate() {
+        // Now and then an asset has no quote at all: it is valued and
+        // transferred at cost.
+        if rng.chance(15) {
+            continue;
+        }
         let mut day = start.saturating_sub(3);
         while day <= as_of {
             if rng.chance(45) {

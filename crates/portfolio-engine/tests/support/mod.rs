@@ -428,6 +428,12 @@ pub fn scenario_selected(id: &str) -> bool {
     }
 }
 
+/// Whether `SCENARIO_FILTER` narrows the corpus, so a law's minimum count of
+/// checked cases does not apply.
+pub fn filtered() -> bool {
+    std::env::var("SCENARIO_FILTER").is_ok_and(|filter| !filter.trim().is_empty())
+}
+
 /// The generated scenarios (`generate`), parsed like the fixtures.
 pub fn generated_scenarios() -> Vec<Scenario> {
     (0..generate::generated_count())

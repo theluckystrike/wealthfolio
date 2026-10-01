@@ -720,8 +720,8 @@ fn p_txf_internal_pairs_cancel_at_portfolio_scope() {
     }
 }
 
-/// P-RECON (I8): a complete day's values re-derive from the keyframe and the
-/// public surfaces alone. Investments are Σ quantity × latest close (in the
+/// P-RECON (I8): a complete day's values re-derive from the keyframe (a
+/// holdings account's observed snapshot) and the public surfaces alone. Investments are Σ quantity × latest close (in the
 /// quote currency's major unit) × contract multiplier × FX into the account
 /// currency; cash is Σ bucket × FX. This walks `project` keyframes and
 /// `resolve` surfaces directly, never `value`'s own bookkeeping, so it is an
@@ -742,28 +742,68 @@ fn p_recon_complete_days_rederive_from_keyframes_and_surfaces() {
             .map(|s| &s.asset)
             .collect();
         for (account, series) in &pipeline.series {
-            let Some(keyframes) = pipeline.bundle.keyframes.get(account) else {
-                continue; // holdings-tracked: valued from observed snapshots
-            };
+            let keyframes = pipeline.bundle.keyframes.get(account);
+            // A holdings-tracked account has no keyframes: it is valued from
+            // its observed snapshots, by the same rule.
+            let mut snapshots: Vec<&ObservedSnapshot> = pipeline
+                .facts()
+                .observed_snapshots()
+                .iter()
+                .filter(|s| &s.account == account)
+                .collect();
+            snapshots.sort_by_key(|s| s.date);
             let account_currency = pipeline.facts().accounts()[account].currency.as_str();
             for day in &series.days {
                 if day.value_status != ValueStatus::Complete {
                     continue;
                 }
-                let Some(frame) = keyframes.iter().rev().find(|k| k.date <= day.date) else {
-                    continue;
+                // What the account held: (asset, units, alternative) and cash.
+                type Held<'a> = (
+                    Vec<(&'a AssetId, Decimal, bool)>,
+                    Vec<(&'a Currency, Decimal)>,
+                );
+                let (positions, buckets): Held = if let Some(keyframes) = keyframes {
+                    let Some(frame) = keyframes.iter().rev().find(|k| k.date <= day.date) else {
+                        continue;
+                    };
+                    (
+                        frame
+                            .state
+                            .positions
+                            .iter()
+                            .map(|(asset, p)| (asset, p.quantity, p.alternative))
+                            .collect(),
+                        frame.state.cash.iter().map(|(c, a)| (c, *a)).collect(),
+                    )
+                } else {
+                    let Some(snapshot) = snapshots.iter().rev().find(|s| s.date <= day.date) else {
+                        continue;
+                    };
+                    (
+                        snapshot
+                            .positions
+                            .iter()
+                            .map(|(asset, p)| {
+                                let alternative = pipeline
+                                    .facts()
+                                    .assets()
+                                    .get(asset)
+                                    .is_some_and(|a| a.alternative);
+                                (asset, p.quantity, alternative)
+                            })
+                            .collect(),
+                        snapshot.cash.iter().map(|(c, a)| (c, *a)).collect(),
+                    )
                 };
-                if frame
-                    .state
-                    .positions
-                    .keys()
-                    .any(|asset| split_assets.contains(asset))
+                if positions
+                    .iter()
+                    .any(|(asset, ..)| split_assets.contains(asset))
                 {
                     continue;
                 }
                 let mut investment = Decimal::ZERO;
-                for (asset, position) in &frame.state.positions {
-                    if position.alternative || position.quantity.is_zero() {
+                for (asset, quantity, alternative) in &positions {
+                    if *alternative || quantity.is_zero() {
                         continue;
                     }
                     let quote = pipeline
@@ -778,13 +818,13 @@ fn p_recon_complete_days_rederive_from_keyframes_and_surfaces() {
                     let multiplier = pipeline
                         .facts()
                         .assets()
-                        .get(asset)
+                        .get(*asset)
                         .map(|a| a.contract_multiplier)
                         .unwrap_or(Decimal::ONE);
-                    investment += position.quantity * quote.close * unit * multiplier * rate;
+                    investment += *quantity * quote.close * unit * multiplier * rate;
                 }
                 let mut cash = Decimal::ZERO;
-                for (currency, amount) in &frame.state.cash {
+                for (currency, amount) in &buckets {
                     let (major, unit) = policy.normalize_currency(currency.as_str());
                     let rate = fx
                         .rate(major, account_currency, day.date)
@@ -799,21 +839,24 @@ fn p_recon_complete_days_rederive_from_keyframes_and_surfaces() {
             }
         }
     }
-    assert!(checked > 100, "only {checked} complete days re-derived");
+    assert!(
+        filtered() || checked > 100,
+        "only {checked} complete days re-derived"
+    );
 }
 
-/// P-AGG (I9): scope aggregation is exact where it must be trivial and
-/// classifies transfers independently of the valuer. A one-account scope is
-/// that account's stored rows unchanged; on a day without a transfer pair
-/// inside the scope the scope's flows are the sum of the account flows
-/// (pair days are the netted case P-TXF and EDGE-TXF-02 pin); values sum and
-/// statuses absorb on every day. Internal pairs come from the ledger's pair
-/// table and activity dates, not from `aggregate_scope`. An account's
-/// inception day is skipped for the flow sum: its opening money is that
-/// account's starting value but an inflow to a scope that already exists.
+/// P-AGG (I9): scope aggregation adds up its accounts. A one-account scope is
+/// that account's stored rows unchanged; values sum and statuses absorb on
+/// every day. On every day after the first, the scope's net flow is what
+/// each account adds: its row's flow, or on its first day inside the scope
+/// the money that opened it, less its legs of transfers inside the scope
+/// (an outgoing leg whole, an incoming one in the share of units its sender
+/// gave). On a day without such a leg or an opening, each side is the plain
+/// sum. A dated read is the full read after its first day.
 #[test]
 fn p_agg_scope_aggregation_is_exact() {
     let mut pair_days = 0usize;
+    let mut dated_reads = 0usize;
     for scenario in corpus() {
         let pipeline = Pipeline::from_scenario(&scenario);
         let effects = pipeline.effects(
@@ -868,6 +911,108 @@ fn p_agg_scope_aggregation_is_exact() {
         else {
             continue;
         };
+        let Some(start) = portfolio.days.first().map(|day| day.date) else {
+            continue;
+        };
+        let inception: BTreeMap<&AccountId, NaiveDate> = scope
+            .iter()
+            .filter_map(|id| {
+                let first = pipeline.series.get(id)?.days.first()?;
+                Some((id, first.date))
+            })
+            .collect();
+        let holdings =
+            |id: &AccountId| pipeline.facts().accounts()[id].tracking == TrackingMode::Holdings;
+        let by_source: BTreeMap<&ActivityId, &EventEffect> = effects
+            .events
+            .iter()
+            .map(|event| (&event.source, event))
+            .collect();
+        // The legs of transfers inside the scope, signed (incoming adds,
+        // outgoing takes away), by account and day: an outgoing leg whole,
+        // an incoming one in the share of units its sender gave.
+        let mut legs: BTreeMap<(&AccountId, NaiveDate), Decimal> = BTreeMap::new();
+        for pair in effects.pairs.iter().filter(|pair| {
+            pair.in_account != pair.out_account
+                && scope.contains(&pair.in_account)
+                && scope.contains(&pair.out_account)
+        }) {
+            let leg = |source: &ActivityId| {
+                by_source
+                    .get(source)
+                    .and_then(|event| event.flow.map(|flow| (*event, flow)))
+            };
+            let (incoming, outgoing) = (leg(&pair.transfer_in), leg(&pair.transfer_out));
+            let share = match (incoming, outgoing) {
+                (Some((_, inflow)), Some((_, outflow)))
+                    if pair.security && inflow.units > outflow.units =>
+                {
+                    outflow.units / inflow.units
+                }
+                _ => Decimal::ONE,
+            };
+            for (event, flow, share) in [
+                incoming.map(|(event, flow)| (event, flow, share)),
+                outgoing.map(|(event, flow)| (event, flow, Decimal::ONE)),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let signed = if flow.leg_outflow {
+                    -flow.amount
+                } else {
+                    flow.amount
+                };
+                *legs.entry((&event.account, event.date)).or_default() += signed * share;
+            }
+        }
+        // What an account adds to the scope on a day, net: its row's flow,
+        // or on its first day inside the scope the money that opened it (a
+        // holdings account's first snapshot value, a transactions account's
+        // activity flows, else its net contribution), less its legs. A
+        // holdings flow of undetermined amount adds nothing.
+        let adds = |id: &AccountId, row: &DailyValuation| -> Decimal {
+            let opening = inception.get(id) == Some(&row.date) && row.date != start;
+            let own = if opening && holdings(id) {
+                if row.value_status != ValueStatus::Complete {
+                    return Decimal::ZERO;
+                }
+                row.total_value_base
+            } else if opening {
+                let brought: Vec<PricedFlow> = effects
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        &event.account == id
+                            && event.date == row.date
+                            && !matches!(&event.boundary, Boundary::Internal { counterparty } if counterparty == id)
+                    })
+                    .filter_map(|event| event.flow)
+                    .collect();
+                if brought.is_empty() {
+                    row.net_contribution_base
+                } else {
+                    brought
+                        .iter()
+                        .map(|flow| {
+                            if flow.outflow {
+                                -flow.amount
+                            } else {
+                                flow.amount
+                            }
+                        })
+                        .sum()
+                }
+            } else {
+                if holdings(id) && !row.flow.source.has_known_amount() {
+                    return Decimal::ZERO;
+                }
+                row.flow.inflow_base - row.flow.outflow_base
+            };
+            own - legs.get(&(id, row.date)).copied().unwrap_or_default()
+        };
+        // Each account's day rounds to storage precision on its own.
+        let tolerance = DUST * Decimal::from(scope.len() as u64 + 1);
         let activity_date = |id: &ActivityId| {
             pipeline
                 .facts()
@@ -890,11 +1035,7 @@ fn p_agg_scope_aggregation_is_exact() {
                 .flatten()
             })
             .collect();
-        let inception_days: BTreeSet<NaiveDate> = scope
-            .iter()
-            .filter_map(|id| pipeline.series.get(id))
-            .filter_map(|s| s.days.first().map(|d| d.date))
-            .collect();
+        let inception_days: BTreeSet<NaiveDate> = inception.values().copied().collect();
         for day in &portfolio.days {
             let rows: Vec<DailyValuation> = scope
                 .iter()
@@ -921,9 +1062,8 @@ fn p_agg_scope_aggregation_is_exact() {
             );
             if internal_days.contains(&day.date) {
                 pair_days += 1;
-            } else if inception_days.contains(&day.date) {
-                continue;
-            } else {
+            } else if !inception_days.contains(&day.date) {
+                // Without a pair or an opening, each side is the plain sum.
                 assert_eq!(
                     day.flow.inflow_base,
                     sum(|d| d.flow.inflow_base),
@@ -933,6 +1073,26 @@ fn p_agg_scope_aggregation_is_exact() {
                     day.flow.outflow_base,
                     sum(|d| d.flow.outflow_base),
                     "{id}: outflow"
+                );
+            }
+            if day.date > start {
+                let expected: Decimal = scope
+                    .iter()
+                    .filter_map(|account| {
+                        let row = pipeline
+                            .series
+                            .get(account)?
+                            .days
+                            .iter()
+                            .find(|d| d.date == day.date)?;
+                        Some(adds(account, &DailyValuation::stored(row)))
+                    })
+                    .sum();
+                let net = day.flow.inflow_base - day.flow.outflow_base;
+                assert!(
+                    (net - expected).abs() <= tolerance,
+                    "{id}: net flow {net}, its accounts add {expected} ({:?})",
+                    day.flow
                 );
             }
             let value_status = rows
@@ -946,8 +1106,56 @@ fn p_agg_scope_aggregation_is_exact() {
                 .fold(BasisStatus::NotApplicable, BasisStatus::combine);
             assert_eq!(day.basis_status, basis_status, "{id}: basis status");
         }
+
+        // A dated read is the full read from its second day on (its first
+        // opens it): cut between the legs of every transfer that spans days,
+        // and halfway.
+        let mut cuts: BTreeSet<NaiveDate> = effects
+            .pairs
+            .iter()
+            .filter(|pair| scope.contains(&pair.in_account) && scope.contains(&pair.out_account))
+            .filter_map(|pair| {
+                let (out, incoming) = (
+                    activity_date(&pair.transfer_out)?,
+                    activity_date(&pair.transfer_in)?,
+                );
+                (out != incoming).then(|| out.min(incoming).succ_opt())?
+            })
+            .collect();
+        if let Some(end) = portfolio.days.last().map(|day| day.date) {
+            cuts.insert(start + (end - start) / 2);
+        }
+        for cut in cuts {
+            let window = Window {
+                start: Some(cut),
+                end: None,
+            };
+            let Ok(dated) = aggregate_scope(&effects, &pipeline.series, &scope, window) else {
+                continue;
+            };
+            for day in dated.days.iter().filter(|day| day.date > cut) {
+                let full = portfolio
+                    .days
+                    .iter()
+                    .find(|full| full.date == day.date)
+                    .expect("a dated day is a full day");
+                assert_eq!(
+                    day.flow, full.flow,
+                    "{}: {} read from {cut}",
+                    scenario.id, day.date
+                );
+            }
+            dated_reads += 1;
+        }
     }
-    assert!(pair_days > 0, "the corpus has no internal transfer days");
+    assert!(
+        filtered() || pair_days > 0,
+        "the corpus has no internal transfer days"
+    );
+    assert!(
+        filtered() || dated_reads > 100,
+        "only {dated_reads} dated reads"
+    );
 }
 
 fn portfolio_days(pipeline: &Pipeline) -> Option<Vec<DailyValuation>> {
@@ -1054,7 +1262,10 @@ fn p_agg_add_an_unrelated_deposit_adds_only_itself() {
         }
         checked += 1;
     }
-    assert!(checked > 50, "only {checked} portfolios made busy");
+    assert!(
+        filtered() || checked > 50,
+        "only {checked} portfolios made busy"
+    );
 }
 
 /// P-DIAG (I10): every degraded day and every silent-fallback input is
@@ -1286,7 +1497,7 @@ fn p_names_account_ids_carry_no_order() {
         checked += 1;
     }
     assert!(
-        checked > 20,
+        filtered() || checked > 20,
         "only {checked} multi-account scenarios renamed"
     );
 }
@@ -1393,7 +1604,10 @@ fn p_units_minor_units_are_the_same_money() {
         assert_same(&scenario.id, "P-UNITS", &in_cents, &reference);
         checked += 1;
     }
-    assert!(checked > 20, "only {checked} scenarios rewritten in cents");
+    assert!(
+        filtered() || checked > 20,
+        "only {checked} scenarios rewritten in cents"
+    );
 }
 
 /// An account state valued on `day` from the public surfaces, by P-RECON's
@@ -1533,12 +1747,15 @@ fn p_flow_flows_account_for_the_value_they_move() {
             checked += 1;
         }
     }
-    assert!(checked > 20, "only {checked} flow days checked");
+    assert!(
+        filtered() || checked > 20,
+        "only {checked} flow days checked"
+    );
 }
 
 /// P-REJECT: a rejected activity is as if it had never been entered. Folding
-/// without it leaves every account in the same state on every day, and the
-/// fold reports nothing about the attempt but the rejection.
+/// without it leaves every account in the same state, value and flow on every
+/// day, and the fold reports nothing about the attempt but the rejection.
 #[test]
 fn p_reject_a_rejected_activity_leaves_no_trace() {
     let mut checked = 0usize;
@@ -1582,6 +1799,20 @@ fn p_reject_a_rejected_activity_leaves_no_trace() {
                 );
             }
         }
+        // Nor anything valued or flowed on a day both runs value.
+        for (account, series) in &pipeline.series {
+            let Some(without_it) = other.series.get(account) else {
+                continue;
+            };
+            for day in &series.days {
+                let Some(same) = without_it.days.iter().find(|d| d.date == day.date) else {
+                    continue;
+                };
+                let id = format!("{}: P-REJECT {account} on {}", scenario.id, day.date);
+                assert_eq!(day.total_value_base, same.total_value_base, "{id}: value");
+                assert_eq!(day.flow, same.flow, "{id}: flow");
+            }
+        }
         let reported: Vec<Value> = pipeline
             .bundle
             .diagnostics
@@ -1606,7 +1837,7 @@ fn p_reject_a_rejected_activity_leaves_no_trace() {
         );
         checked += 1;
     }
-    assert!(checked > 0, "no scenario rejects an activity");
+    assert!(filtered() || checked > 0, "no scenario rejects an activity");
 }
 
 /// P-TXF-LEGS: a security transfer moves lots, it does not make them. The
@@ -1935,7 +2166,7 @@ fn p_txf_legs_transfers_carry_their_lots() {
         }
     }
     assert!(
-        checked > 5,
+        filtered() || checked > 5,
         "only {checked} security transfer pairs checked"
     );
 }
