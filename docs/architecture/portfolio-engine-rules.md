@@ -107,7 +107,7 @@ is `0001-01-01`; `@all` refolds every account from `GENESIS`.
 | Account           | insert                                                                                                    | the account, from `GENESIS` (sync can deliver its snapshots first)                                                                                 |
 | Account           | currency, type, tracking mode, archived, accounting method, profile, pooling scope, lot selection         | the account, from `GENESIS`                                                                                                                        |
 | Activity          | insert, update, delete (any field)                                                                        | old and new accounts, from the day before their old and new dates; transfer partners likewise; a split's old and new assets from `GENESIS`         |
-| Asset             | insert                                                                                                    | its holders from `GENESIS`; an FX asset: `@all` (sync can deliver snapshots and rates first)                                                       |
+| Asset             | insert                                                                                                    | its holders, from `GENESIS` (sync can deliver snapshots naming it first; an FX asset's rates cannot precede it, quotes reference their asset)      |
 | Asset             | kind, quote currency, instrument type, option, contract multiplier, and an FX asset's `instrument_symbol` | its holders from `GENESIS`; an FX asset, or one becoming or ceasing to be FX: `@all`                                                               |
 | Asset             | delete                                                                                                    | as its kind was: its holders from `GENESIS`, or `@all` for an FX asset                                                                             |
 | Quote             | insert, update, delete                                                                                    | its asset's prices (an FX asset's: conversions) from the earliest of its old and new `day` and timestamp dates; old and new assets when reassigned |
@@ -115,9 +115,9 @@ is `0001-01-01`; `@all` refolds every account from `GENESIS`.
 | Snapshot position | insert, update, delete                                                                                    | its snapshot's account from the snapshot's date                                                                                                    |
 | Settings          | base currency, time zone                                                                                  | `@all`                                                                                                                                             |
 
-A run consumes a marker only after writing what it covers. A marker for an
-account that does not exist yet is kept, not consumed, and a run never skips an
-account that has never been valued.
+A run consumes a marker only after writing what it covers. An account or asset
+that arrives after facts naming it marks itself on insert (rows above), so a run
+that could not project it yet projects it once it exists.
 
 ## 6. Data normalized where written
 
