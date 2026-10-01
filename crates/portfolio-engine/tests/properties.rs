@@ -253,7 +253,10 @@ fn restrict(
 fn p_win_windowed_valuation_is_equivalent() {
     for scenario in corpus() {
         let one_shot = Pipeline::from_scenario(&scenario);
-        let range = one_shot.range();
+        let range = DateRange {
+            start: genesis(&one_shot),
+            end: one_shot.range().end,
+        };
         if range.start == range.end {
             continue;
         }
@@ -295,6 +298,20 @@ fn p_win_windowed_valuation_is_equivalent() {
     }
 }
 
+/// The first day the app values (its genesis): the first activity or
+/// observed snapshot, whichever comes first. A holdings account's first
+/// snapshot can come before any activity (EDGE-MIX-04).
+fn genesis(pipeline: &Pipeline) -> NaiveDate {
+    let range = pipeline.range();
+    pipeline
+        .facts()
+        .observed_snapshots()
+        .iter()
+        .map(|s| s.date)
+        .filter(|day| *day <= range.end)
+        .fold(range.start, NaiveDate::min)
+}
+
 fn value_windowed(
     pipeline: &Pipeline,
     cuts: &[NaiveDate],
@@ -304,7 +321,7 @@ fn value_windowed(
     let mut state: Option<ProjectionState> = None;
     let mut started: BTreeSet<AccountId> = BTreeSet::new();
     let mut days: BTreeMap<AccountId, Vec<DailyValuation>> = BTreeMap::new();
-    let mut start = pipeline.range().start;
+    let mut start = genesis(pipeline);
     let mut ends: Vec<NaiveDate> = cuts.to_vec();
     ends.push(pipeline.range().end);
     for end in ends {
@@ -678,8 +695,21 @@ fn p_txf_internal_pairs_cancel_at_portfolio_scope() {
                         })
                     })
             };
+            // A transfer with a holdings account shows up in its snapshots.
+            let holdings_pair = |e: &&EconomicEvent| {
+                pipeline
+                    .facts()
+                    .transfer_pairs()
+                    .pair_for(&e.source)
+                    .is_some_and(|p| {
+                        [&p.in_account, &p.out_account].iter().any(|id| {
+                            pipeline.facts().accounts()[*id].tracking == TrackingMode::Holdings
+                        })
+                    })
+            };
             let only_internal_pairs = !events.is_empty()
                 && !events.iter().any(unlinked_conversion)
+                && !events.iter().any(holdings_pair)
                 && !events.iter().any(shortfall)
                 && events.iter().all(|e| {
                     matches!(&e.flow.boundary, Boundary::Internal { counterparty } if scope.contains(counterparty))
@@ -845,6 +875,116 @@ fn p_recon_complete_days_rederive_from_keyframes_and_surfaces() {
     );
 }
 
+/// A holdings snapshot valued on `day` from the public surfaces, by P-RECON's
+/// rule, in `currency`; `None` when a price or rate is missing, or a position
+/// is alternative or split-adjusted.
+fn value_snapshot(
+    pipeline: &Pipeline,
+    snapshot: &ObservedSnapshot,
+    currency: &str,
+    day: NaiveDate,
+    split_assets: &BTreeSet<&AssetId>,
+) -> Option<Decimal> {
+    let policy = pipeline.facts().policy();
+    let fx = pipeline.fx();
+    let mut total = Decimal::ZERO;
+    for (asset, position) in &snapshot.positions {
+        if position.quantity.is_zero() {
+            continue;
+        }
+        let facts = pipeline.facts().assets().get(asset);
+        if facts.is_some_and(|a| a.alternative) || split_assets.contains(asset) {
+            return None;
+        }
+        let quote = pipeline.surfaces().quotes.latest_on_or_before(asset, day)?;
+        let (major, unit) = policy.normalize_currency(quote.currency.as_str());
+        let multiplier = facts.map(|a| a.contract_multiplier).unwrap_or(Decimal::ONE);
+        total +=
+            position.quantity * quote.close * unit * multiplier * fx.rate(major, currency, day)?;
+    }
+    for (bucket, amount) in &snapshot.cash {
+        let (major, unit) = policy.normalize_currency(bucket.as_str());
+        total += *amount * unit * fx.rate(major, currency, day)?;
+    }
+    Some(total)
+}
+
+/// P-HOLD: a holdings account's flows come only from its snapshots, which
+/// hold what it records. It has a flow only on a snapshot day after its
+/// first, and there the net flow is the new snapshot's value less the
+/// previous snapshot's holdings at that day's prices: a deposit it records
+/// adds no flow of its own (EDGE-MIX-04). Re-derived where the account
+/// currency is the base's, without splits.
+#[test]
+fn p_hold_holdings_flows_come_from_snapshots() {
+    let mut checked = 0usize;
+    for scenario in corpus() {
+        let pipeline = Pipeline::from_scenario(&scenario);
+        let policy = pipeline.facts().policy();
+        let base = policy
+            .major_currency(policy.base_currency.as_str())
+            .to_string();
+        let split_assets: BTreeSet<&AssetId> = pipeline
+            .surfaces()
+            .splits
+            .iter()
+            .map(|s| &s.asset)
+            .collect();
+        for (account, series) in &pipeline.series {
+            let facts = &pipeline.facts().accounts()[account];
+            if facts.tracking != TrackingMode::Holdings {
+                continue;
+            }
+            let mut snapshots: Vec<&ObservedSnapshot> = pipeline
+                .facts()
+                .observed_snapshots()
+                .iter()
+                .filter(|s| &s.account == account)
+                .collect();
+            snapshots.sort_by_key(|s| s.date);
+            for (index, row) in series.days.iter().enumerate() {
+                if row.flow == DailyFlow::default() {
+                    continue;
+                }
+                let id = format!("{}: P-HOLD {account} on {}", scenario.id, row.date);
+                assert!(
+                    index > 0 && snapshots.iter().any(|s| s.date == row.date),
+                    "{id}: a flow without a snapshot ({:?})",
+                    row.flow
+                );
+                if row.flow.source != FlowSource::QuoteDerivedMarketValue
+                    || policy.major_currency(facts.currency.as_str()) != base
+                {
+                    continue;
+                }
+                let Some(previous) = snapshots.iter().rev().find(|s| s.date < row.date) else {
+                    continue;
+                };
+                let Some(before) = value_snapshot(
+                    &pipeline,
+                    previous,
+                    facts.currency.as_str(),
+                    row.date,
+                    &split_assets,
+                ) else {
+                    continue;
+                };
+                let net = row.flow.inflow_base - row.flow.outflow_base;
+                let moved = row.total_value_base - before;
+                assert!(
+                    (net - moved).abs() <= DUST,
+                    "{id}: net flow {net}, the snapshot moved {moved}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        filtered() || checked > 20,
+        "only {checked} holdings transitions checked"
+    );
+}
+
 /// P-AGG (I9): scope aggregation adds up its accounts. A one-account scope is
 /// that account's stored rows unchanged; values sum and statuses absorb on
 /// every day. On every day after the first, the scope's net flow is what
@@ -931,11 +1071,15 @@ fn p_agg_scope_aggregation_is_exact() {
         // The legs of transfers inside the scope, signed (incoming adds,
         // outgoing takes away), by account and day: an outgoing leg whole,
         // an incoming one in the share of units its sender gave.
+        // A transfer with a holdings account is not a pair here: its side
+        // shows up in that account's snapshots.
         let mut legs: BTreeMap<(&AccountId, NaiveDate), Decimal> = BTreeMap::new();
         for pair in effects.pairs.iter().filter(|pair| {
             pair.in_account != pair.out_account
                 && scope.contains(&pair.in_account)
                 && scope.contains(&pair.out_account)
+                && !holdings(&pair.in_account)
+                && !holdings(&pair.out_account)
         }) {
             let leg = |source: &ActivityId| {
                 by_source
@@ -969,8 +1113,7 @@ fn p_agg_scope_aggregation_is_exact() {
         // What an account adds to the scope on a day, net: its row's flow,
         // or on its first day inside the scope the money that opened it (a
         // holdings account's first snapshot value, a transactions account's
-        // activity flows, else its net contribution), less its legs. A
-        // holdings flow of undetermined amount adds nothing.
+        // activity flows, else its net contribution), less its legs.
         let adds = |id: &AccountId, row: &DailyValuation| -> Decimal {
             let opening = inception.get(id) == Some(&row.date) && row.date != start;
             let own = if opening && holdings(id) {
@@ -1004,9 +1147,6 @@ fn p_agg_scope_aggregation_is_exact() {
                         .sum()
                 }
             } else {
-                if holdings(id) && !row.flow.source.has_known_amount() {
-                    return Decimal::ZERO;
-                }
                 row.flow.inflow_base - row.flow.outflow_base
             };
             own - legs.get(&(id, row.date)).copied().unwrap_or_default()

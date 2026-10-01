@@ -428,7 +428,8 @@ pub fn project_accounts(
 
 /// 5. Price the states from the resolved surfaces; report per-day status and
 ///    diagnostics; finalise deferred flows. Holdings-mode accounts are valued
-///    from their observed snapshots instead of the projection.
+///    from their observed snapshots instead of the projection, and their
+///    flows come only from those snapshots (what they record is inside them).
 pub fn value(inputs: &ValueInputs<'_>) -> BTreeMap<AccountId, ValuationSeries>;
 
 /// Every event priced once, as plain data: its flow in base, its
@@ -439,9 +440,10 @@ pub fn effects(resolved: &Resolved<'_>, disposals: &[LotDisposal]) -> Effects;
 /// Scope aggregation: per-day sums in base currency. Each account adds its
 /// own flows less its legs of internal transfers (both legs in scope; an
 /// incoming leg in the share of units its sender gave, wherever a dated read
-/// starts). A holdings account's flow is one net movement, so its legs come
-/// off that net. An account opening inside the scope adds the money that
-/// opened it: a holdings account its first snapshot's value.
+/// starts). A transfer with a holdings account is not netted as a pair: its
+/// side shows up in that account's snapshots. An account opening inside the
+/// scope adds the money that opened it: a holdings account its first
+/// snapshot's value.
 pub fn aggregate_scope(
     effects: &Effects,
     series: &BTreeMap<AccountId, ValuationSeries>,
@@ -724,15 +726,15 @@ Testable contract; the property suite (§5) encodes each one.
 The kernel is verified by fixtures rather than mocks: every test is facts in,
 values out.
 
-| Harness           | What it checks                                                                                                                                                                                                                  |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Scenario fixtures | One YAML file per scenario: facts, intent, and expected notes in prose. Nominal, edge, regression, performance and lifecycle families.                                                                                          |
-| Kernel goldens    | Reviewed snapshots of full engine output per scenario: keyframes, lots, disposals, valuations with statuses, flows, performance windows.                                                                                        |
-| Property laws     | The invariants of §4.6 over the whole corpus: determinism, chunk equivalence, conservation, split neutrality, transfer cancellation, honesty.                                                                                   |
-| Coordinator tests | The shell path: real fact loading, row mapping, persistence, freshness verdicts, plan selection, and lifecycle steps equal to a fresh rebuild.                                                                                  |
-| App parity        | Every scenario through the app equals one kernel run over all its facts: stored rows at one-day, two-day and yearly windows, each account rebuilt alone, and the performance reads.                                             |
-| Generated corpus  | Deterministic random scenarios (`tests/support/generate.rs`) mixing archived and holdings accounts, sparse and invalid quotes, splits, transfers, shorts and minor units, run through the property laws and the app parity law. |
-| Scale benchmark   | The six stages over a generated 20k-activity portfolio.                                                                                                                                                                         |
+| Harness           | What it checks                                                                                                                                                                                                                                                              |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Scenario fixtures | One YAML file per scenario: facts, intent, and expected notes in prose. Nominal, edge, regression, performance and lifecycle families.                                                                                                                                      |
+| Kernel goldens    | Reviewed snapshots of full engine output per scenario: keyframes, lots, disposals, valuations with statuses, flows, performance windows.                                                                                                                                    |
+| Property laws     | The invariants of §4.6 over the whole corpus: determinism, chunk equivalence, conservation, split neutrality, transfer cancellation, honesty.                                                                                                                               |
+| Coordinator tests | The shell path: real fact loading, row mapping, persistence, freshness verdicts, plan selection, and lifecycle steps equal to a fresh rebuild.                                                                                                                              |
+| App parity        | Every scenario through the app equals one kernel run over all its facts: stored rows at one-day, two-day and yearly windows, each account rebuilt alone, and the performance reads.                                                                                         |
+| Generated corpus  | Deterministic random scenarios (`tests/support/generate.rs`) mixing archived and holdings accounts, accounts opening after the others, sparse, invalid and missing quotes, splits, transfers, shorts and minor units, run through the property laws and the app parity law. |
+| Scale benchmark   | The six stages over a generated 20k-activity portfolio.                                                                                                                                                                                                                     |
 
 `crates/portfolio-engine/tests/fixtures/README.md` documents the fixture schema,
 the golden format, the harnesses and how to verify a fixture by hand.

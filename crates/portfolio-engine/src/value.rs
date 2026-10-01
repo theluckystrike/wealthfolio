@@ -181,14 +181,22 @@ fn value_series(
             days.push(valuer.value_day(&keyframes[active], day, None));
         }
 
-        // Flows: activity map for this account's scope, then fallbacks, then
-        // holdings-transition inference (authoritative on observed rows).
-        let flows = scope_flows(
-            &effects,
-            std::slice::from_ref(account_id),
-            Window::default(),
-        );
-        stamp_flows(&mut days, &flows);
+        // Flows: a holdings account's come only from its snapshots, which
+        // already hold what it records (a deposit recorded between two
+        // snapshots would count twice); any other's from its activity map,
+        // then fallbacks.
+        if account.tracking == TrackingMode::Holdings {
+            if let Some(first) = days.first_mut() {
+                first.flow = DailyFlow::default();
+            }
+        } else {
+            let flows = scope_flows(
+                &effects,
+                std::slice::from_ref(account_id),
+                Window::default(),
+            );
+            stamp_flows(&mut days, &flows);
+        }
         valuer.infer_holdings_flows(&mut days, &keyframes);
         if seed.is_some() {
             // The seed day only carries the state into the window.
@@ -280,7 +288,7 @@ pub fn aggregate_scope(
                 day.flow
             };
             let flow = match adjustments.get(&(&history.account, day.date)) {
-                Some(legs) => net_internal(flow, *legs, holdings),
+                Some(legs) => net_internal(flow, *legs),
                 None => flow,
             };
             let entry = by_date.entry(day.date).or_insert_with(|| DailyValuation {
@@ -389,32 +397,15 @@ fn opening_flow(
     }
 }
 
-/// An account's flow less its legs of transfer pairs inside the scope. A
-/// transactions account's flows are its legs, each on its side, so each side
-/// loses its legs (at most what it holds). A holdings account's flow is one
-/// net movement inferred at its snapshots, so the legs come off that net and
-/// what remains is its external flow, whichever side it falls on; an
-/// undetermined one stays undetermined.
-fn net_internal(
-    flow: DailyFlow,
-    (inflow, outflow): (Decimal, Decimal),
-    holdings: bool,
-) -> DailyFlow {
-    let (inflow_base, outflow_base) = if !holdings {
-        (
-            flow.inflow_base - flow.inflow_base.min(inflow),
-            flow.outflow_base - flow.outflow_base.min(outflow),
-        )
-    } else if flow.source.has_known_amount() {
-        split_flow(flow.inflow_base - flow.outflow_base - (inflow - outflow))
-    } else {
-        return flow;
-    };
+/// An account's flow less its legs of transfer pairs inside the scope. Its
+/// flows are its legs, each on its side, so each side loses its legs (at
+/// most what it holds).
+fn net_internal(flow: DailyFlow, (inflow, outflow): (Decimal, Decimal)) -> DailyFlow {
     // Netting removes scope-internal legs; it adds no differently valued
     // flow, so the day keeps the provenance of the flows that survive.
     DailyFlow {
-        inflow_base,
-        outflow_base,
+        inflow_base: flow.inflow_base - flow.inflow_base.min(inflow),
+        outflow_base: flow.outflow_base - flow.outflow_base.min(outflow),
         source: flow.source,
     }
 }
@@ -1615,11 +1606,21 @@ fn internal_adjustments<'a>(
         .iter()
         .map(|event| (event.source.as_str(), event))
         .collect();
+    // A holdings account's flows come from its snapshots, not its legs: a
+    // transfer with one is not netted as a pair, its side shows up in that
+    // account's next snapshot (the same day, or in transit until then).
+    let holdings = |id: &AccountId| {
+        effects
+            .account(id)
+            .is_some_and(|account| account.tracking == TrackingMode::Holdings)
+    };
     let mut by_account: BTreeMap<(&AccountId, NaiveDate), (Decimal, Decimal)> = BTreeMap::new();
     for pair in effects.pairs.iter().filter(|pair| {
         pair.in_account != pair.out_account
             && scope.contains(&pair.in_account)
             && scope.contains(&pair.out_account)
+            && !holdings(&pair.in_account)
+            && !holdings(&pair.out_account)
     }) {
         // Both legs, wherever the window cuts: the share depends on the pair,
         // and only the legs inside the window are netted.
