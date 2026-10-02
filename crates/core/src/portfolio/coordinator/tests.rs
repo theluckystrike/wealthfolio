@@ -309,6 +309,61 @@ async fn an_asset_arriving_after_its_snapshot_reprices_it() {
     assert_eq!(projected, rows(&h));
 }
 
+#[tokio::test]
+async fn an_fx_asset_arriving_after_its_rates_revalues_conversions() {
+    use chrono::TimeZone;
+    use rust_decimal::Decimal;
+    use std::collections::HashMap;
+    // A holdings account of 100 EUR in a USD portfolio, EUR/USD at 1.
+    let mut facts = scenario("EDGE-MIX-04").facts();
+    facts.activities.clear();
+    facts.accounts[0].currency = "EUR".into();
+    facts.observed_snapshots.truncate(1);
+    facts.observed_snapshots[0].currency = "EUR".into();
+    facts.observed_snapshots[0].cash_balances = HashMap::from([("EUR".into(), Decimal::from(100))]);
+    facts.fx_rates = vec![crate::fx::ExchangeRate {
+        id: "old-fx".into(),
+        from_currency: "EUR".into(),
+        to_currency: "USD".into(),
+        rate: Decimal::ONE,
+        source: "MANUAL".into(),
+        timestamp: chrono::Utc.with_ymd_and_hms(2025, 1, 1, 12, 0, 0).unwrap(),
+    }];
+    let h = harness(facts).await;
+    h.coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    // A sync batch delivers a rate of 2 before its FX asset: the rate's own
+    // trigger marks it as a price, the asset's insert as a holder change and
+    // as conversions from the rate's day.
+    let day = NaiveDate::from_ymd_opt(2025, 1, 3).unwrap();
+    h.fx_repo.add_rates(vec![crate::fx::ExchangeRate {
+        id: "batch-fx".into(),
+        from_currency: "EUR".into(),
+        to_currency: "USD".into(),
+        rate: Decimal::from(2),
+        source: "MANUAL".into(),
+        timestamp: chrono::Utc.with_ymd_and_hms(2025, 1, 3, 12, 0, 0).unwrap(),
+    }]);
+    h.store.mark(MarkerScope::Prices("batch-fx".into()), day);
+    h.store.mark(MarkerScope::Asset("batch-fx".into()), GENESIS);
+    h.store.mark(MarkerScope::Fx("batch-fx".into()), day);
+    let report = h
+        .coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty());
+    let value = h
+        .rows("acc-h")
+        .into_iter()
+        .find(|row| row.valuation_date == day)
+        .unwrap()
+        .total_value_base;
+    assert_eq!(value, Decimal::from(200));
+}
+
 fn plan_of(report: &PortfolioJobReport, account: &str) -> Option<RebuildPlan> {
     report
         .plans

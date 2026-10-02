@@ -1,3 +1,4 @@
+DROP TRIGGER projection_settings_delete;
 DROP TRIGGER projection_settings_update;
 DROP TRIGGER projection_settings_insert;
 DROP TRIGGER projection_snapshot_position_delete;

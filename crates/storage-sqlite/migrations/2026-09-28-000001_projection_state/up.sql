@@ -191,14 +191,24 @@ BEGIN
         version = projection_state.version + 1;
 END;
 
--- An asset can arrive after snapshots that name it (their positions do not
--- reference assets, and sync can deliver them first): its holders refold.
+-- An asset can arrive after facts that name it: snapshots do not reference
+-- assets, and a sync batch defers foreign keys, so its quotes can come first.
+-- Its holders refold, and an FX asset's rates, which their own triggers took
+-- for prices while the asset was missing, convert from the earliest.
 CREATE TRIGGER projection_asset_insert AFTER INSERT ON assets
 BEGIN
     INSERT INTO projection_state (scope, dirty_from, version)
     VALUES ('a:' || NEW.id, '0001-01-01', 1)
     ON CONFLICT (scope) DO UPDATE SET
         dirty_from = '0001-01-01',
+        version = projection_state.version + 1;
+    INSERT INTO projection_state (scope, dirty_from, version)
+    SELECT 'fx:' || NEW.id,
+        coalesce((SELECT min(min(coalesce(date(q.day), date(q.timestamp)), coalesce(date(q.timestamp), date(q.day)))) FROM quotes q WHERE q.asset_id = NEW.id), '0001-01-01'),
+        1
+    WHERE NEW.kind = 'FX' AND EXISTS (SELECT 1 FROM quotes q WHERE q.asset_id = NEW.id)
+    ON CONFLICT (scope) DO UPDATE SET
+        dirty_from = min(coalesce(projection_state.dirty_from, excluded.dirty_from), excluded.dirty_from),
         version = projection_state.version + 1;
 END;
 
@@ -329,7 +339,7 @@ BEGIN
     INSERT INTO projection_state (scope, dirty_from, version)
     SELECT s.account_id, coalesce(date(s.snapshot_date), '0001-01-01'), 1
     FROM holdings_snapshots s
-    WHERE s.id = NEW.snapshot_id AND s.source <> 'CALCULATED'
+    WHERE s.id IN (OLD.snapshot_id, NEW.snapshot_id) AND s.source <> 'CALCULATED'
     ON CONFLICT (scope) DO UPDATE SET
         dirty_from = min(coalesce(projection_state.dirty_from, excluded.dirty_from), excluded.dirty_from),
         version = projection_state.version + 1;
@@ -358,8 +368,18 @@ BEGIN
 END;
 
 CREATE TRIGGER projection_settings_update AFTER UPDATE ON app_settings
-WHEN NEW.setting_key IN ('base_currency', 'timezone')
-  AND OLD.setting_value IS NOT NEW.setting_value
+WHEN (OLD.setting_key IN ('base_currency', 'timezone') OR NEW.setting_key IN ('base_currency', 'timezone'))
+  AND (OLD.setting_key IS NOT NEW.setting_key OR OLD.setting_value IS NOT NEW.setting_value)
+BEGIN
+    INSERT INTO projection_state (scope, dirty_from, version)
+    VALUES ('@all', '0001-01-01', 1)
+    ON CONFLICT (scope) DO UPDATE SET
+        dirty_from = '0001-01-01',
+        version = projection_state.version + 1;
+END;
+
+CREATE TRIGGER projection_settings_delete AFTER DELETE ON app_settings
+WHEN OLD.setting_key IN ('base_currency', 'timezone')
 BEGIN
     INSERT INTO projection_state (scope, dirty_from, version)
     VALUES ('@all', '0001-01-01', 1)

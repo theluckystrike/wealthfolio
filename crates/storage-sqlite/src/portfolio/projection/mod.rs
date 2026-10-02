@@ -1399,14 +1399,118 @@ mod tests {
         assert!(!wealthfolio_core::sync::APP_SYNC_TABLES.contains(&"projection_state"));
     }
 
+    #[tokio::test]
+    async fn an_fx_asset_arriving_after_its_rates_in_a_sync_batch_marks_its_conversions() {
+        use wealthfolio_core::sync::{SyncEntity, SyncOperation};
+        let db = setup();
+        consume_all(&db).await;
+        let sync =
+            crate::sync::app_sync::AppSyncRepository::new(db.pool.clone(), db.writer.clone());
+        // A batch defers foreign keys, so the rate can come before its asset;
+        // its own trigger then takes it for a price.
+        let applied = sync
+            .apply_remote_events_lww_batch(vec![
+                (
+                    SyncEntity::Quote,
+                    "batch-fx-q".into(),
+                    SyncOperation::Create,
+                    "batch-fx-q-event".into(),
+                    "2026-02-12T00:00:00Z".into(),
+                    1,
+                    serde_json::json!({"id": "batch-fx-q", "asset_id": "batch-fx", "day": "2025-01-03",
+                        "timestamp": "2025-01-03T12:00:00Z", "source": "MANUAL", "close": "1.5",
+                        "currency": "USD", "created_at": "2025-01-03T12:00:00Z"}),
+                ),
+                (
+                    SyncEntity::Asset,
+                    "batch-fx".into(),
+                    SyncOperation::Create,
+                    "batch-fx-asset-event".into(),
+                    "2026-02-12T00:00:00Z".into(),
+                    2,
+                    serde_json::json!({"id": "batch-fx", "kind": "FX", "instrument_type": "FX",
+                        "instrument_symbol": "EUR", "is_active": 1, "quote_mode": "MARKET",
+                        "quote_ccy": "USD", "created_at": "2025-01-03T12:00:00Z",
+                        "updated_at": "2025-01-03T12:00:00Z"}),
+                ),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(applied, 2);
+        assert_eq!(dirty(&db, "fx:batch-fx").as_deref(), Some("2025-01-03"));
+    }
+
+    #[tokio::test]
+    async fn an_fx_asset_multiplier_edit_marks_its_holders_only() {
+        let db = setup();
+        fx_pair(&db);
+        consume_all(&db).await;
+        // Rates do not read the multiplier: only a pair or kind change marks
+        // every conversion.
+        sql(
+            &db,
+            "UPDATE assets SET metadata = '{\"contractMultiplier\": 10}' WHERE id = 'fx-eur'",
+        );
+        assert_eq!(dirty(&db, "a:fx-eur").as_deref(), Some("0001-01-01"));
+        assert_eq!(dirty(&db, "@all"), None);
+    }
+
+    #[tokio::test]
+    async fn a_policy_setting_deleted_or_renamed_marks_everything() {
+        let db = setup();
+        sql(
+            &db,
+            "INSERT INTO app_settings (setting_key, setting_value) \
+             VALUES ('base_currency', 'EUR'), ('timezone', 'America/Toronto'), ('unused', 'UTC')",
+        );
+        for change in [
+            "DELETE FROM app_settings WHERE setting_key = 'base_currency'",
+            "DELETE FROM app_settings WHERE setting_key = 'timezone'",
+            // The value stays; which key holds it changes.
+            "UPDATE app_settings SET setting_key = 'timezone' WHERE setting_key = 'unused'",
+            "UPDATE app_settings SET setting_key = 'unused' WHERE setting_key = 'timezone'",
+        ] {
+            consume_all(&db).await;
+            sql(&db, change);
+            assert_eq!(
+                dirty(&db, "@all").as_deref(),
+                Some("0001-01-01"),
+                "{change}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_position_moved_to_another_snapshot_marks_both() {
+        let db = setup();
+        let snapshots = SnapshotRepository::new(db.pool.clone(), db.writer.clone());
+        let mut old = snapshot(2, "10");
+        old.source = SnapshotSource::ManualEntry;
+        let old_id = old.id.clone();
+        let mut new = snapshot(5, "0");
+        new.positions.clear();
+        new.source = SnapshotSource::ManualEntry;
+        let new_id = new.id.clone();
+        snapshots.save_snapshots(&[old, new]).await.unwrap();
+        consume_all(&db).await;
+        sql(
+            &db,
+            &format!(
+                "UPDATE snapshot_positions SET snapshot_id = '{new_id}' WHERE snapshot_id = '{old_id}'"
+            ),
+        );
+        assert_eq!(dirty(&db, "acc1").as_deref(), Some("2025-01-02"));
+    }
+
     /// Rules §5, mechanically: every column the engine reads (the
     /// coordinator's `facts::raw_*` converters, the FX repository's pair, the
-    /// policy settings) and every insert and delete of a fact leaves a marker.
-    /// A column the engine starts reading belongs on this list.
+    /// policy settings) and every insert and delete of a fact leaves the
+    /// marker the table states, with its earliest day. A column the engine
+    /// starts reading belongs on this list.
     #[tokio::test]
     async fn every_fact_the_engine_reads_marks_when_it_changes() {
+        const G: &str = "0001-01-01";
         let db = setup();
-        let store = ProjectionStore::new(db.pool.clone(), db.writer.clone());
         sql(
             &db,
             "INSERT INTO accounts (id, name, account_type, currency, is_default, is_active, \
@@ -1452,106 +1556,181 @@ mod tests {
         let setting = |key: &str, value: &str| {
             format!("UPDATE app_settings SET setting_value = '{value}' WHERE setting_key = '{key}'")
         };
-        let mut changes: Vec<String> = vec![
-            account("currency = 'CAD'"),
-            account("account_type = 'CASH'"),
-            account("tracking_mode = 'HOLDINGS'"),
-            account("is_archived = 1"),
-            accounting("costBasisMethod", "AVERAGE_COST"),
-            accounting("costBasisProfile", "CANADA_ACB"),
-            accounting("poolingScope", "PER_ACCOUNT"),
-            accounting("lotSelectionStrategy", "LOWEST_COST"),
-            asset("kind = 'PROPERTY'"),
-            asset("quote_ccy = 'CAD'"),
-            asset("instrument_type = 'EQUITY'"),
-            asset("metadata = '{\"contractMultiplier\": 10}'"),
-            asset("metadata = '{\"contractMultiplier\": 10, \"option\": {}}'"),
-            fx("instrument_symbol = 'GBP'"),
-            fx("quote_ccy = 'CAD'"),
-            quote("asset_id = 'OTHER'"),
-            quote("day = '2025-01-02'"),
-            quote("timestamp = '2025-01-01T00:00:00Z'"),
-            quote("close = '101'"),
-            quote("currency = 'CAD'"),
-            quote("source = 'YAHOO'"),
-            observed("account_id = 'acc2'"),
-            observed("snapshot_date = '2025-01-02'"),
-            observed("positions = '{}'"),
-            observed("cash_balances = '{\"USD\": \"1\"}'"),
-            observed("cost_basis = '1'"),
-            observed("net_contribution = '1'"),
-            observed("net_contribution_base = '1'"),
-            observed("cash_total_account_currency = '1'"),
-            observed("cash_total_base_currency = '1'"),
-            observed("source = 'BROKER_IMPORTED'"),
-            setting("base_currency", "EUR"),
-            setting("timezone", "Europe/Paris"),
-            fx("kind = 'INVESTMENT'"),
+        // Each change, in order, and the markers it must leave.
+        let acc1 = vec![("acc1", G)];
+        let aapl = vec![("a:AAPL", G)];
+        let all = vec![("@all", G)];
+        let mut changes: Vec<(String, Vec<(&str, &str)>)> = vec![
+            (account("currency = 'CAD'"), acc1.clone()),
+            (account("account_type = 'CASH'"), acc1.clone()),
+            (account("tracking_mode = 'HOLDINGS'"), acc1.clone()),
+            (account("is_archived = 1"), acc1.clone()),
+            (accounting("costBasisMethod", "AVERAGE_COST"), acc1.clone()),
+            (accounting("costBasisProfile", "CANADA_ACB"), acc1.clone()),
+            (accounting("poolingScope", "PER_ACCOUNT"), acc1.clone()),
+            (
+                accounting("lotSelectionStrategy", "LOWEST_COST"),
+                acc1.clone(),
+            ),
+            (asset("kind = 'PROPERTY'"), aapl.clone()),
+            (asset("quote_ccy = 'CAD'"), aapl.clone()),
+            (asset("instrument_type = 'EQUITY'"), aapl.clone()),
+            (
+                asset("metadata = '{\"contractMultiplier\": 10}'"),
+                aapl.clone(),
+            ),
+            (
+                asset("metadata = '{\"contractMultiplier\": 10, \"option\": {}}'"),
+                aapl.clone(),
+            ),
+            (fx("instrument_symbol = 'GBP'"), all.clone()),
+            (fx("quote_ccy = 'CAD'"), all.clone()),
+            (
+                quote("asset_id = 'OTHER'"),
+                vec![("q:AAPL", "2025-01-03"), ("q:OTHER", "2025-01-03")],
+            ),
+            (quote("day = '2025-01-02'"), vec![("q:OTHER", "2025-01-02")]),
+            (
+                quote("timestamp = '2025-01-01T00:00:00Z'"),
+                vec![("q:OTHER", "2025-01-01")],
+            ),
+            (quote("close = '101'"), vec![("q:OTHER", "2025-01-01")]),
+            (quote("currency = 'CAD'"), vec![("q:OTHER", "2025-01-01")]),
+            (quote("source = 'YAHOO'"), vec![("q:OTHER", "2025-01-01")]),
+            (
+                observed("account_id = 'acc2'"),
+                vec![("acc1", "2025-01-03"), ("acc2", "2025-01-03")],
+            ),
+            (
+                observed("snapshot_date = '2025-01-02'"),
+                vec![("acc2", "2025-01-02")],
+            ),
+            (observed("positions = '{}'"), vec![("acc2", "2025-01-02")]),
+            (
+                observed("cash_balances = '{\"USD\": \"1\"}'"),
+                vec![("acc2", "2025-01-02")],
+            ),
+            (observed("cost_basis = '1'"), vec![("acc2", "2025-01-02")]),
+            (
+                observed("net_contribution = '1'"),
+                vec![("acc2", "2025-01-02")],
+            ),
+            (
+                observed("net_contribution_base = '1'"),
+                vec![("acc2", "2025-01-02")],
+            ),
+            (
+                observed("cash_total_account_currency = '1'"),
+                vec![("acc2", "2025-01-02")],
+            ),
+            (
+                observed("cash_total_base_currency = '1'"),
+                vec![("acc2", "2025-01-02")],
+            ),
+            (
+                observed("source = 'BROKER_IMPORTED'"),
+                vec![("acc2", "2025-01-02")],
+            ),
+            (setting("base_currency", "EUR"), all.clone()),
+            (setting("timezone", "Europe/Paris"), all.clone()),
+            (fx("kind = 'INVESTMENT'"), all.clone()),
+            // sell-1 is dated 2025-01-05: its account is dirty from the day
+            // before, until its date moves.
+            (
+                activity("account_id = 'acc2'"),
+                vec![("acc1", "2025-01-04"), ("acc2", "2025-01-04")],
+            ),
         ];
-        changes.extend(
-            [
-                "account_id = 'acc2'",
-                "asset_id = 'AAPL'",
-                "activity_type = 'BUY'",
-                "activity_type_override = 'SELL'",
-                "subtype = 'DRIP'",
-                "status = 'PENDING'",
-                "activity_date = '2025-01-06T00:00:00Z'",
-                "quantity = '2'",
-                "unit_price = '3'",
-                "amount = '6'",
-                "fee = '1'",
-                "tax = '1'",
-                "currency = 'CAD'",
-                "fx_rate = '1.3'",
-                "source_group_id = 'g'",
-                "metadata = '{\"flow\": {\"is_external\": true}}'",
-                "source_system = 'BROKER'",
-                "is_user_modified = 1",
-                "created_at = '2025-01-01T00:00:00'",
-                "updated_at = '2025-01-02T00:00:00'",
-            ]
-            .into_iter()
-            .map(activity),
-        );
+        for set in [
+            "asset_id = 'AAPL'",
+            "activity_type = 'BUY'",
+            "activity_type_override = 'SELL'",
+            "subtype = 'DRIP'",
+            "status = 'PENDING'",
+            "activity_date = '2025-01-06T00:00:00Z'",
+        ] {
+            changes.push((activity(set), vec![("acc2", "2025-01-04")]));
+        }
+        for set in [
+            "quantity = '2'",
+            "unit_price = '3'",
+            "amount = '6'",
+            "fee = '1'",
+            "tax = '1'",
+            "currency = 'CAD'",
+            "fx_rate = '1.3'",
+            "source_group_id = 'g'",
+            "metadata = '{\"flow\": {\"is_external\": true}}'",
+            "source_system = 'BROKER'",
+            "is_user_modified = 1",
+            "created_at = '2025-01-01T00:00:00'",
+            "updated_at = '2025-01-02T00:00:00'",
+        ] {
+            changes.push((activity(set), vec![("acc2", "2025-01-05")]));
+        }
         changes.extend([
-            "INSERT INTO accounts (id, name, account_type, currency, is_default, is_active, \
-             created_at, updated_at, tracking_mode, is_archived) \
-             VALUES ('acc3', 'New', 'SECURITIES', 'USD', 0, 1, datetime('now'), datetime('now'), \
-             'TRANSACTIONS', 0)"
-                .to_string(),
-            "INSERT INTO assets (id, kind, is_active, quote_mode, quote_ccy, created_at, updated_at) \
-             VALUES ('NEW', 'INVESTMENT', 1, 'MARKET', 'USD', datetime('now'), datetime('now'))"
-                .to_string(),
-            "INSERT INTO activities (id, account_id, activity_type, status, activity_date, currency, \
-             is_user_modified, needs_review, created_at, updated_at) \
-             VALUES ('dep-1', 'acc1', 'DEPOSIT', 'POSTED', '2025-01-07T00:00:00Z', 'USD', 0, 0, \
-             datetime('now'), datetime('now'))"
-                .to_string(),
-            "INSERT INTO quotes (id, asset_id, day, source, close, currency, created_at, timestamp) \
-             VALUES ('q-new', 'NEW', '2025-01-04', 'MANUAL', '5', 'USD', datetime('now'), \
-             '2025-01-04T00:00:00Z')"
-                .to_string(),
-            "DELETE FROM quotes WHERE id = 'q-new'".to_string(),
-            "DELETE FROM activities WHERE id = 'dep-1'".to_string(),
-            format!("DELETE FROM holdings_snapshots WHERE id = '{snapshot_id}'"),
-            "DELETE FROM assets WHERE id = 'NEW'".to_string(),
+            (
+                "INSERT INTO accounts (id, name, account_type, currency, is_default, is_active, \
+                 created_at, updated_at, tracking_mode, is_archived) \
+                 VALUES ('acc3', 'New', 'SECURITIES', 'USD', 0, 1, datetime('now'), \
+                 datetime('now'), 'TRANSACTIONS', 0)"
+                    .to_string(),
+                vec![("acc3", G)],
+            ),
+            (
+                "INSERT INTO assets (id, kind, is_active, quote_mode, quote_ccy, created_at, \
+                 updated_at) VALUES ('NEW', 'INVESTMENT', 1, 'MARKET', 'USD', datetime('now'), \
+                 datetime('now'))"
+                    .to_string(),
+                vec![("a:NEW", G)],
+            ),
+            (
+                "INSERT INTO activities (id, account_id, activity_type, status, activity_date, \
+                 currency, is_user_modified, needs_review, created_at, updated_at) \
+                 VALUES ('dep-1', 'acc1', 'DEPOSIT', 'POSTED', '2025-01-07T00:00:00Z', 'USD', 0, 0, \
+                 datetime('now'), datetime('now'))"
+                    .to_string(),
+                vec![("acc1", "2025-01-06")],
+            ),
+            (
+                "INSERT INTO quotes (id, asset_id, day, source, close, currency, created_at, \
+                 timestamp) VALUES ('q-new', 'NEW', '2025-01-04', 'MANUAL', '5', 'USD', \
+                 datetime('now'), '2025-01-04T00:00:00Z')"
+                    .to_string(),
+                vec![("q:NEW", "2025-01-04")],
+            ),
+            (
+                "DELETE FROM quotes WHERE id = 'q-new'".to_string(),
+                vec![("q:NEW", "2025-01-04")],
+            ),
+            (
+                "DELETE FROM activities WHERE id = 'dep-1'".to_string(),
+                vec![("acc1", "2025-01-06")],
+            ),
+            (
+                format!("DELETE FROM holdings_snapshots WHERE id = '{snapshot_id}'"),
+                vec![("acc2", "2025-01-02")],
+            ),
+            (
+                "DELETE FROM assets WHERE id = 'NEW'".to_string(),
+                vec![("a:NEW", G)],
+            ),
         ]);
-        for change in &changes {
+        for (change, markers) in &changes {
             consume_all(&db).await;
             sql(&db, change);
-            assert!(
-                !store.pending_markers().unwrap().is_empty(),
-                "no marker after: {change}"
-            );
+            for (scope, day) in markers {
+                assert_eq!(
+                    dirty(&db, scope).as_deref(),
+                    Some(*day),
+                    "{scope} after: {change}"
+                );
+            }
         }
         let mut inserted = snapshot(4, "5");
         inserted.source = SnapshotSource::ManualEntry;
         consume_all(&db).await;
         snapshots.save_snapshots(&[inserted]).await.unwrap();
-        assert!(
-            !store.pending_markers().unwrap().is_empty(),
-            "no marker after an observed snapshot insert"
-        );
+        assert_eq!(dirty(&db, "acc1").as_deref(), Some("2025-01-04"));
     }
 }
