@@ -1209,7 +1209,6 @@ impl Projector<'_> {
         quantity: Decimal,
         unit_price: Decimal,
         legacy_amount: Option<Decimal>,
-        fee: Decimal,
         position_currency: &str,
         account_currency: &str,
         run: &mut RunLog,
@@ -1235,9 +1234,9 @@ impl Projector<'_> {
                 "transferred unit price",
             )?
         };
-        let (price, fee, _tax, fx_used) = self.to_position_currency(
+        let (price, _fee, _tax, fx_used) = self.to_position_currency(
             lot_unit_price,
-            fee,
+            Decimal::ZERO,
             Decimal::ZERO,
             event,
             position_currency,
@@ -1248,7 +1247,7 @@ impl Projector<'_> {
             event.id.as_str().to_string(),
             units,
             price,
-            fee,
+            Decimal::ZERO,
             Decimal::ZERO,
             event,
             fx_used,
@@ -1309,13 +1308,6 @@ impl Projector<'_> {
             (quantity - staged_abs).max(Decimal::ZERO)
         };
         if missing > Decimal::ZERO {
-            // A paired leg's fee is capitalised below into every lot it
-            // delivered; an unpaired one's goes into its lot.
-            let fee = if paired {
-                Decimal::ZERO
-            } else {
-                event.charges.fee
-            };
             lots.push(self.transfer_lot(
                 event,
                 &info,
@@ -1323,7 +1315,6 @@ impl Projector<'_> {
                 quantity,
                 unit_price,
                 legacy_amount,
-                fee,
                 position_currency.as_str(),
                 account_currency.as_str(),
                 run,
@@ -1373,6 +1364,27 @@ impl Projector<'_> {
             &to_add,
             info.allows_negative_lots,
         )?;
+        // The leg's whole fee, paid from cash, goes into the lots it opens,
+        // after any cover; a leg that opens none capitalises nothing (rules
+        // R2.4). An unpaired leg's net contribution includes it, as its
+        // units' cost; a paired leg's moves by the carried basis alone, so
+        // the pair still nets to zero at portfolio scope (I7).
+        let fee = if event.charges.fee.is_zero() {
+            Decimal::ZERO
+        } else {
+            self.to_position_currency(
+                Decimal::ZERO,
+                event.charges.fee,
+                Decimal::ZERO,
+                event,
+                position_currency.as_str(),
+                account_currency.as_str(),
+            )?
+            .1
+        };
+        if !paired && !fee.is_zero() {
+            capitalize_fee(position, &event.id, fee, info.allows_negative_lots)?;
+        }
         let added_lots: Vec<Lot> = position
             .lots
             .iter()
@@ -1474,19 +1486,7 @@ impl Projector<'_> {
         state.net_contribution += cost_basis_account;
         state.net_contribution_base += cost_basis_base;
 
-        // A paired leg's fee is paid from cash and capitalised into the lots
-        // it delivered, as an unpaired leg's and a trade's fee is (Appendix
-        // A). Net contribution moves by the carried basis alone, so the pair
-        // still nets to zero at portfolio scope (I7).
-        if paired && !event.charges.fee.is_zero() {
-            let (_, fee, _, _) = self.to_position_currency(
-                Decimal::ZERO,
-                event.charges.fee,
-                Decimal::ZERO,
-                event,
-                position_currency.as_str(),
-                account_currency.as_str(),
-            )?;
+        if paired && !fee.is_zero() {
             if let Some(position) = state.positions.get_mut(asset) {
                 capitalize_fee(position, &event.id, fee, info.allows_negative_lots)?;
             }

@@ -22,8 +22,8 @@ activities:
   - { id: in-1, account: acc-t, type: TRANSFER_IN, date: 2025-01-03T10:00:00Z, asset: x, quantity: 10, unit_price: 10, fee: 5, source_group_id: g1 }
   - { id: out-1, account: acc-h, type: TRANSFER_OUT, date: 2025-01-05T10:00:00Z, asset: x, quantity: 10, unit_price: 99, source_group_id: g1 }
 expected_notes: >
-  The 10 units arrive at acc-t's price, 10, with its fee capitalised: 105
-  of cost. 4 cover the short at 42 (realized 48 - 42 = +6) and 6 open a lot
-  at 63. Cash: 1000 + 48 - 5 = 1043. acc-t: inflow 105 - 5 = 100 on 01-03
-  (R2.4), not waiting for 01-05 nor using 99. acc-h: worth 100 every day,
+  The 10 units arrive at acc-t's price, 10: 100 of cost. 4 cover the short
+  at 40 (realized 48 - 40 = +8) and 6 open a lot at 60, plus the whole fee
+  of 5: 65 (R2.4). Cash: 1000 + 48 - 5 = 1043. acc-t: inflow 40 + 65 - 5 =
+  100 on 01-03, not waiting for 01-05 nor using 99. acc-h: worth 100 every day,
   no flow. Portfolio: 100 in on 01-03; no transfer is left pending.
