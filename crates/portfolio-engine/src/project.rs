@@ -1081,8 +1081,7 @@ impl Projector<'_> {
                 asset,
                 event,
                 &reduction,
-                proceeds,
-                None,
+                Proceeds::sale(proceeds),
                 &position_currency,
                 effects,
                 run,
@@ -1157,8 +1156,7 @@ impl Projector<'_> {
                 asset,
                 event,
                 &reduction,
-                amount,
-                None,
+                Proceeds::sale(amount),
                 &position_currency,
                 effects,
                 run,
@@ -1395,8 +1393,10 @@ impl Projector<'_> {
                 asset,
                 event,
                 &reduction,
-                cover_proceeds,
-                cover_proceeds_base,
+                Proceeds::Shared {
+                    local: cover_proceeds,
+                    base: cover_proceeds_base,
+                },
                 &position_currency,
                 effects,
                 run,
@@ -1529,21 +1529,12 @@ impl Projector<'_> {
         } else {
             reduce_positive_lots_fifo(position, quantity)?
         };
-        let removed = reduction.cost_basis_removed;
-        let proceeds = if short { removed.abs() } else { removed };
-        // The leg gives the cost it removed, in base at the rates the lots
-        // were acquired at (rules R2.4, R3.3), so it needs no rate on the
-        // transfer day.
-        let proceeds_base = self
-            .historical_base_cost(&reduction.removed_lots, position_currency.as_str())
-            .map(|total| if short { total.abs() } else { total });
         self.record_reduction(
             &account_id,
             asset,
             event,
             &reduction,
-            proceeds,
-            proceeds_base,
+            Proceeds::AtCost,
             &position_currency,
             effects,
             run,
@@ -1556,7 +1547,7 @@ impl Projector<'_> {
             reduction.quantity_reduced,
             run,
         );
-        if !position_currency.as_str().is_empty() && removed != Decimal::ZERO {
+        if !position_currency.as_str().is_empty() && reduction.cost_basis_removed != Decimal::ZERO {
             let removed_account = self.lots_cost_basis_in(
                 &reduction.removed_lots,
                 position_currency.as_str(),
@@ -1647,8 +1638,7 @@ impl Projector<'_> {
             asset,
             event,
             &reduction,
-            Decimal::ZERO,
-            None,
+            Proceeds::sale(Decimal::ZERO),
             &position_currency,
             effects,
             run,
@@ -2009,8 +1999,7 @@ impl Projector<'_> {
         asset: &AssetId,
         event: &EconomicEvent,
         reduction: &Reduction,
-        proceeds: Decimal,
-        proceeds_base: Option<Decimal>,
+        proceeds: Proceeds,
         position_currency: &Currency,
         effects: &mut SideEffects,
         run: &mut RunLog,
@@ -2021,7 +2010,6 @@ impl Projector<'_> {
             event,
             &reduction.removed_lots,
             proceeds,
-            proceeds_base,
             reduction.quantity_reduced,
             position_currency,
             effects,
@@ -2087,8 +2075,7 @@ impl Projector<'_> {
         asset: &AssetId,
         event: &EconomicEvent,
         removed: &[Lot],
-        total_proceeds: Decimal,
-        total_proceeds_base: Option<Decimal>,
+        proceeds: Proceeds,
         total_quantity: Decimal,
         position_currency: &Currency,
         effects: &mut SideEffects,
@@ -2101,9 +2088,12 @@ impl Projector<'_> {
             .fx
             .rate(position_currency.as_str(), self.base(), event.date)
             .unwrap_or(Decimal::ZERO);
-        // A transfer leg disposes at its lots' cost, at the rates they were
-        // acquired at, so it needs no disposal-day rate (rules R2.4).
-        let proceeds_base_known = total_proceeds_base.is_some() || !disposal_rate.is_zero();
+        // Proceeds of a transfer leg are known in base without a rate on the
+        // day (rules R2.4).
+        let proceeds_base_known = match proceeds {
+            Proceeds::Shared { base, .. } => base.is_some() || !disposal_rate.is_zero(),
+            Proceeds::AtCost => true,
+        };
         if !proceeds_base_known {
             run.diagnostics.push(Diagnostic::warning(
                 DiagnosticCode::FxUnavailable,
@@ -2113,23 +2103,33 @@ impl Projector<'_> {
         }
         for (index, lot) in removed.iter().enumerate() {
             let effective = lot.effective_quantity();
-            let proceeds = checked(
-                arith::proportional(total_proceeds, effective, total_quantity),
-                "disposal proceeds",
-            )?;
             let cost_basis = lot.cost_basis;
             let acquisition_rate = self.lot_rate_to_base(lot, position_currency.as_str());
             let base_available = proceeds_base_known && !acquisition_rate.is_zero();
-            let proceeds_base = match total_proceeds_base {
-                Some(total) if base_available => checked(
-                    arith::proportional(total, effective, total_quantity),
-                    "disposal base proceeds",
-                )?,
-                _ if base_available => checked(
-                    arith::mul(proceeds, disposal_rate),
-                    "disposal base proceeds",
-                )?,
-                _ => Decimal::ZERO,
+            let share = |total: Decimal, what: &str| {
+                checked(arith::proportional(total, effective, total_quantity), what)
+            };
+            let (proceeds, proceeds_base) = match proceeds {
+                Proceeds::Shared { local, base } => {
+                    let proceeds = share(local, "disposal proceeds")?;
+                    let proceeds_base = match base {
+                        Some(total) if base_available => share(total, "disposal base proceeds")?,
+                        _ if base_available => checked(
+                            arith::mul(proceeds, disposal_rate),
+                            "disposal base proceeds",
+                        )?,
+                        _ => Decimal::ZERO,
+                    };
+                    (proceeds, proceeds_base)
+                }
+                Proceeds::AtCost if base_available => (
+                    cost_basis,
+                    checked(
+                        arith::mul(cost_basis, acquisition_rate),
+                        "disposal base proceeds",
+                    )?,
+                ),
+                Proceeds::AtCost => (cost_basis, Decimal::ZERO),
             };
             let cost_basis_base = if base_available {
                 checked(
@@ -2185,6 +2185,28 @@ impl Projector<'_> {
                     .rate(position_currency, self.base(), lot.acquisition_date)
             })
             .unwrap_or(Decimal::ZERO)
+    }
+}
+
+/// What the units a reduction removes receive.
+#[derive(Clone, Copy)]
+enum Proceeds {
+    /// A total in the position's currency, shared by the units removed: a
+    /// sale's proceeds, or the cost of the units a transfer delivered to
+    /// cover the position, with its base value when known (rules R2.4).
+    /// Without one, it converts at the disposal day's rate.
+    Shared {
+        local: Decimal,
+        base: Option<Decimal>,
+    },
+    /// Each lot its own cost, in base at its acquisition rate: a transfer
+    /// leg gives what it removed and realizes nothing (rules R2.4).
+    AtCost,
+}
+
+impl Proceeds {
+    fn sale(local: Decimal) -> Self {
+        Self::Shared { local, base: None }
     }
 }
 
