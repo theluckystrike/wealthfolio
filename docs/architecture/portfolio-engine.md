@@ -195,6 +195,14 @@ first after it, however far away. Window invariance (P-WIN) makes a windowed run
 equal to one run over the range, and the app parity law (§5) holds the
 coordinator and the read path to the same answer.
 
+**Snapshot reads.** Services outside the engine that read positions (holdings,
+account values, net worth) read them through `SnapshotService`
+(`get_latest_snapshots_as_of`, `get_latest_holdings_snapshot`): a holdings
+account's snapshot read on a later day has its quantities carried across the
+splits recorded since its date, with the engine's own grouping (`SplitRow`,
+`group_splits`, rules R1.5), so every screen agrees with the stored valuations.
+Stored snapshots stay as entered.
+
 **Completion.** After the last window a run commits, in one transaction, the lot
 books of the refolded accounts (open lots and lots closed since the stale day),
 their disposals, what the fold decided about their activities (rejected,

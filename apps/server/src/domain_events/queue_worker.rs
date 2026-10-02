@@ -45,8 +45,8 @@ pub struct QueueWorkerDeps {
     // we pass what we need for enqueue_portfolio_job (which spawns its own async task).
     // The shared.rs enqueue_portfolio_job needs Arc<AppState>, so we'll need to pass
     // a callback or restructure slightly. For now, we'll store what we need.
-    pub snapshot_repository:
-        Arc<dyn wealthfolio_core::portfolio::snapshot::SnapshotRepositoryTrait + Send + Sync>,
+    pub snapshot_service:
+        Arc<dyn wealthfolio_core::portfolio::snapshot::SnapshotServiceTrait + Send + Sync>,
     pub quote_service: Arc<dyn wealthfolio_core::quotes::QuoteServiceTrait + Send + Sync>,
     pub portfolio_coordinator: Arc<wealthfolio_core::portfolio::coordinator::PortfolioCoordinator>,
     pub account_service: Arc<wealthfolio_core::accounts::AccountService>,
@@ -427,7 +427,7 @@ async fn refresh_all_goal_summaries(deps: Arc<QueueWorkerDeps>) {
     let latest_snapshot_cutoff = user_today(parse_user_timezone_or_default(&timezone));
     let service = CurrentAccountValuationService::new(
         deps.account_service.as_ref(),
-        deps.snapshot_repository.as_ref(),
+        deps.snapshot_service.as_ref(),
         deps.asset_service.as_ref(),
         deps.quote_service.as_ref(),
         deps.fx_service.as_ref(),

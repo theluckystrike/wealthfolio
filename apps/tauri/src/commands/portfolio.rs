@@ -561,13 +561,13 @@ pub async fn get_current_valuation(
     let account_filter = filter.into_account_filter()?;
     let resolved = resolve_current_valuation_scope(&account_filter, &context).await?;
     let account_service = context.account_service();
-    let snapshot_repository = context.snapshot_repository();
+    let snapshot_service = context.snapshot_service();
     let asset_service = context.asset_service();
     let quote_service = context.quote_service();
     let fx_service = context.fx_service();
     let service = CurrentAccountValuationService::new(
         account_service.as_ref(),
-        snapshot_repository.as_ref(),
+        snapshot_service.as_ref(),
         asset_service.as_ref(),
         quote_service.as_ref(),
         fx_service.as_ref(),

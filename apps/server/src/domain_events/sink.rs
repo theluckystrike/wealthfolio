@@ -70,8 +70,8 @@ impl WebDomainEventSink {
         event_bus: EventBus,
         broker_sync_running: Arc<AtomicBool>,
         health_service: Arc<dyn wealthfolio_core::health::HealthServiceTrait + Send + Sync>,
-        snapshot_repository: Arc<
-            dyn wealthfolio_core::portfolio::snapshot::SnapshotRepositoryTrait + Send + Sync,
+        snapshot_service: Arc<
+            dyn wealthfolio_core::portfolio::snapshot::SnapshotServiceTrait + Send + Sync,
         >,
         quote_service: Arc<dyn wealthfolio_core::quotes::QuoteServiceTrait + Send + Sync>,
         portfolio_coordinator: Arc<wealthfolio_core::portfolio::coordinator::PortfolioCoordinator>,
@@ -99,7 +99,7 @@ impl WebDomainEventSink {
             event_bus,
             broker_sync_running,
             health_service,
-            snapshot_repository,
+            snapshot_service,
             quote_service,
             portfolio_coordinator,
             account_service,

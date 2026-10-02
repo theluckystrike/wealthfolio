@@ -20,7 +20,6 @@ use wealthfolio_spending::insight::InsightService;
 use wealthfolio_spending::settings::SpendingSettingsService;
 use wealthfolio_storage_sqlite::{
     agent::{McpAuditRepository, PatRepository},
-    portfolio::snapshot::SnapshotRepository,
     sync::AppSyncRepository,
 };
 
@@ -59,7 +58,6 @@ pub struct ServiceContext {
     pub performance_service: Arc<dyn portfolio::performance::PerformanceServiceTrait>,
     pub income_service: Arc<dyn portfolio::income::IncomeServiceTrait>,
     pub snapshot_service: Arc<dyn portfolio::snapshot::SnapshotServiceTrait>,
-    pub snapshot_repository: Arc<SnapshotRepository>,
     pub lots_repository: Arc<dyn LotRepositoryTrait>,
     pub app_sync_repository: Arc<AppSyncRepository>,
     pub holdings_service: Arc<dyn portfolio::holdings::HoldingsServiceTrait>,
@@ -184,10 +182,6 @@ impl ServiceContext {
 
     pub fn snapshot_service(&self) -> Arc<dyn portfolio::snapshot::SnapshotServiceTrait> {
         Arc::clone(&self.snapshot_service)
-    }
-
-    pub fn snapshot_repository(&self) -> Arc<SnapshotRepository> {
-        Arc::clone(&self.snapshot_repository)
     }
 
     pub fn holdings_service(&self) -> Arc<dyn portfolio::holdings::HoldingsServiceTrait> {

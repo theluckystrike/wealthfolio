@@ -372,7 +372,7 @@ pub async fn get_current_valuation(
     let resolved = resolve_current_valuation_scope(&body.filter, &state)?;
     let service = CurrentAccountValuationService::new(
         state.account_service.as_ref(),
-        state.snapshot_repository.as_ref(),
+        state.snapshot_service.as_ref(),
         state.asset_service.as_ref(),
         state.quote_service.as_ref(),
         state.fx_service.as_ref(),

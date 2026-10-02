@@ -236,7 +236,7 @@ pub(super) fn raw_asset(a: &crate::assets::Asset) -> RawAsset {
     }
 }
 
-pub(super) fn raw_activity(a: &Activity) -> RawActivity {
+pub(crate) fn raw_activity(a: &Activity) -> RawActivity {
     RawActivity {
         id: a.id.clone(),
         account_id: a.account_id.clone(),

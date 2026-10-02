@@ -9,6 +9,7 @@ use crate::assets::{
 use crate::errors::Result;
 use crate::fx::{ExchangeRate, FxServiceTrait, NewExchangeRate};
 use crate::portfolio::economic_events::BasisStatus;
+use crate::portfolio::snapshot::SnapshotService;
 use crate::portfolio::snapshot::{
     AccountStateSnapshot, Position, SnapshotRepositoryTrait, SnapshotSource,
 };
@@ -20,6 +21,7 @@ use crate::quotes::{
     LatestQuotePair, LatestQuoteSnapshot, ProviderInfo, Quote, QuoteImport, QuoteServiceTrait,
     QuoteSyncState, SymbolSearchResult, SymbolSyncPlan, SyncResult,
 };
+use crate::test_support::in_memory::InMemoryActivityRepository;
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
@@ -961,11 +963,18 @@ fn create_net_worth_service_with_valuations(
     let valuation_repo = Arc::new(MockValuationRepository::new(valuations));
     let fx_service = Arc::new(MockFxService::new("USD"));
 
+    let snapshot_service = Arc::new(SnapshotService::new(
+        Arc::new(RwLock::new("UTC".to_string())),
+        account_repo.clone(),
+        snapshot_repo,
+        Arc::new(InMemoryActivityRepository::new(Vec::new(), HashSet::new())),
+    ));
+
     NetWorthService::new(
         base_currency,
         account_repo,
         asset_repo,
-        snapshot_repo,
+        snapshot_service,
         market_data_repo,
         valuation_repo,
         fx_service,

@@ -2,7 +2,7 @@
 //! observed for holdings-tracked accounts) served to readers, plus manual
 //! snapshot writes that raise `HoldingsChanged`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -15,9 +15,12 @@ use super::holdings_timeline::HoldingsTimeline;
 use super::snapshot_model::{AccountStateSnapshot, SnapshotMetadata, SnapshotSource};
 use super::snapshot_traits::SnapshotRepositoryTrait;
 use crate::accounts::{Account, AccountRepositoryTrait, TrackingMode};
+use crate::activities::ActivityRepositoryTrait;
 use crate::errors::{Error, Result};
 use crate::events::{DomainEvent, DomainEventSink, NoOpDomainEventSink};
+use crate::portfolio::coordinator::raw_activity;
 use crate::utils::time_utils::{parse_user_timezone_or_default, user_today};
+use wealthfolio_portfolio_engine as engine;
 
 #[async_trait]
 pub trait SnapshotServiceTrait: Send + Sync {
@@ -50,12 +53,24 @@ pub trait SnapshotServiceTrait: Send + Sync {
         end_date: Option<NaiveDate>,
     ) -> Result<HoldingsTimeline>;
 
-    /// Retrieves the most recent calculated **holdings** snapshot for a specific account.
+    /// Retrieves the most recent **holdings** snapshot for a specific account,
+    /// read today (see [`Self::get_latest_snapshots_as_of`]).
     /// Returns `Ok(None)` when no snapshot exists yet. Valuation fields will be zero or default.
     fn get_latest_holdings_snapshot(
         &self,
         account_id: &str,
     ) -> Result<Option<AccountStateSnapshot>>;
+
+    /// The latest snapshot of each account on or before `day`, with its
+    /// positions, read on `day`: a holdings account's snapshot states
+    /// quantities as of its date, so they are carried across the splits
+    /// recorded since, as valuation carries them (engine rules R1.5). Other
+    /// accounts' snapshots are projections whose lots are already split.
+    fn get_latest_snapshots_as_of(
+        &self,
+        account_ids: &[String],
+        day: NaiveDate,
+    ) -> Result<HashMap<String, AccountStateSnapshot>>;
 
     /// Saves a manual snapshot for the given account.
     /// - The snapshot's source is preserved from the input (e.g., ManualEntry or CsvImport).
@@ -106,6 +121,7 @@ pub struct SnapshotService {
     timezone: Arc<RwLock<String>>,
     account_repository: Arc<dyn AccountRepositoryTrait>,
     snapshot_repository: Arc<dyn SnapshotRepositoryTrait>,
+    activity_repository: Arc<dyn ActivityRepositoryTrait>,
     event_sink: Arc<dyn DomainEventSink>,
 }
 
@@ -114,13 +130,87 @@ impl SnapshotService {
         timezone: Arc<RwLock<String>>,
         account_repository: Arc<dyn AccountRepositoryTrait>,
         snapshot_repository: Arc<dyn SnapshotRepositoryTrait>,
+        activity_repository: Arc<dyn ActivityRepositoryTrait>,
     ) -> Self {
         Self {
             timezone,
             account_repository,
             snapshot_repository,
+            activity_repository,
             event_sink: Arc::new(NoOpDomainEventSink),
         }
+    }
+
+    /// Carries holdings accounts' snapshot quantities to `day` across the
+    /// splits recorded after each snapshot's date (engine rules R1.5), with
+    /// the engine's own split grouping. Total cost is unchanged, so the
+    /// average cost per unit moves the other way.
+    fn carry_splits(
+        &self,
+        snapshots: &mut HashMap<String, AccountStateSnapshot>,
+        day: NaiveDate,
+    ) -> Result<()> {
+        let account_ids: Vec<String> = snapshots.keys().cloned().collect();
+        if account_ids.is_empty() {
+            return Ok(());
+        }
+        let holdings: HashSet<String> = self
+            .account_repository
+            .list(None, None, Some(&account_ids))?
+            .into_iter()
+            .filter(|account| account.tracking_mode == TrackingMode::Holdings)
+            .map(|account| account.id)
+            .collect();
+        let assets: Vec<String> = snapshots
+            .values()
+            .filter(|snapshot| {
+                holdings.contains(&snapshot.account_id) && snapshot.snapshot_date < day
+            })
+            .flat_map(|snapshot| snapshot.positions.keys().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if assets.is_empty() {
+            return Ok(());
+        }
+        let timezone = parse_user_timezone_or_default(&self.timezone.read().unwrap());
+        let splits = engine::group_splits(
+            self.activity_repository
+                .get_split_activities_by_asset_ids(&assets)?
+                .iter()
+                .map(raw_activity)
+                .filter_map(|raw| engine::SplitRow::from_raw(&raw, &timezone)),
+        );
+        for snapshot in snapshots
+            .values_mut()
+            .filter(|snapshot| holdings.contains(&snapshot.account_id))
+        {
+            for position in snapshot.positions.values_mut() {
+                let asset = engine::model::AssetId::new(position.asset_id.as_str());
+                let factor =
+                    engine::split_quantity_factor(&splits, &asset, snapshot.snapshot_date, day);
+                if factor == Some(Decimal::ONE) {
+                    continue;
+                }
+                let carried = factor.and_then(|factor| {
+                    Some((
+                        position.quantity.checked_mul(factor)?,
+                        position.average_cost.checked_div(factor)?,
+                    ))
+                });
+                match carried {
+                    Some((quantity, average_cost)) => {
+                        position.quantity = quantity;
+                        position.average_cost = average_cost;
+                    }
+                    None => warn!(
+                        "Split factor for {} in snapshot {} is out of range; quantities read as stored",
+                        position.asset_id, snapshot.id
+                    ),
+                }
+            }
+        }
+        Ok(())
     }
 
     fn create_initial_snapshot(account: &Account, date: NaiveDate) -> AccountStateSnapshot {
@@ -350,7 +440,11 @@ impl SnapshotServiceTrait for SnapshotService {
             .snapshot_repository
             .get_latest_snapshot_before_date(account_id, tomorrow)?
         {
-            Some(snapshot) => Ok(Some(snapshot)),
+            Some(snapshot) => {
+                let mut snapshots = HashMap::from([(account_id.to_string(), snapshot)]);
+                self.carry_splits(&mut snapshots, today)?;
+                Ok(snapshots.remove(account_id))
+            }
             None => {
                 // It's possible no snapshot exists yet, which is not necessarily an error,
                 // but we should inform the caller.
@@ -361,6 +455,33 @@ impl SnapshotServiceTrait for SnapshotService {
                 Ok(None)
             }
         }
+    }
+
+    fn get_latest_snapshots_as_of(
+        &self,
+        account_ids: &[String],
+        day: NaiveDate,
+    ) -> Result<HashMap<String, AccountStateSnapshot>> {
+        let mut snapshots = self
+            .snapshot_repository
+            .get_latest_snapshots_before_date(account_ids, day)?;
+        if snapshots.is_empty() {
+            return Ok(snapshots);
+        }
+        let snapshot_ids: Vec<String> = snapshots
+            .values()
+            .map(|snapshot| snapshot.id.clone())
+            .collect();
+        let mut positions = self
+            .snapshot_repository
+            .get_snapshot_positions_batch(&snapshot_ids)?;
+        for snapshot in snapshots.values_mut() {
+            if let Some(positions) = positions.remove(&snapshot.id) {
+                snapshot.positions = positions;
+            }
+        }
+        self.carry_splits(&mut snapshots, day)?;
+        Ok(snapshots)
     }
 
     async fn save_manual_snapshot(

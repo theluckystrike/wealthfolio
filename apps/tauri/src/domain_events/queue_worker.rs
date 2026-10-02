@@ -374,13 +374,13 @@ async fn refresh_all_goal_summaries(context: &Arc<ServiceContext>) {
     let timezone = context.get_timezone();
     let latest_snapshot_cutoff = user_today(parse_user_timezone_or_default(&timezone));
     let account_service = context.account_service();
-    let snapshot_repository = context.snapshot_repository();
+    let snapshot_service = context.snapshot_service();
     let asset_service = context.asset_service();
     let quote_service = context.quote_service();
     let fx_service = context.fx_service();
     let service = CurrentAccountValuationService::new(
         account_service.as_ref(),
-        snapshot_repository.as_ref(),
+        snapshot_service.as_ref(),
         asset_service.as_ref(),
         quote_service.as_ref(),
         fx_service.as_ref(),

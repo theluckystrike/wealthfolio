@@ -1970,6 +1970,14 @@ mod tests {
             ))
         }
 
+        fn get_latest_snapshots_as_of(
+            &self,
+            _account_ids: &[String],
+            _day: NaiveDate,
+        ) -> Result<HashMap<String, AccountStateSnapshot>> {
+            Ok(HashMap::new())
+        }
+
         async fn save_manual_snapshot(
             &self,
             _account_id: &str,

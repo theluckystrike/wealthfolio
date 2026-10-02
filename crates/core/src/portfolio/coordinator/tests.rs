@@ -4,6 +4,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, RwLock};
 
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+
 use super::*;
 use crate::accounts::{AccountAccountingSettings, AccountRepositoryTrait, CostBasisMethod};
 use crate::activities::{Activity, ActivityRepositoryTrait};
@@ -12,7 +15,8 @@ use crate::fx::{FxRepositoryTrait, FxService};
 use crate::lots::LotRepositoryTrait;
 use crate::portfolio::projection::{ActivityIssueKind, GENESIS};
 use crate::portfolio::snapshot::{
-    AccountStateSnapshot, SnapshotRepositoryTrait, SnapshotService, SnapshotSource,
+    AccountStateSnapshot, SnapshotRepositoryTrait, SnapshotService, SnapshotServiceTrait,
+    SnapshotSource,
 };
 use crate::portfolio::valuation::ValuationRepositoryTrait;
 use crate::quotes::{Quote, QuoteServiceTrait};
@@ -89,6 +93,7 @@ async fn harness_with(facts: ScenarioFacts, cadence: WindowCadence) -> Harness {
         timezone.clone(),
         account_repo_dyn.clone(),
         snapshot_repo.clone(),
+        activity_repo_dyn.clone(),
     ));
     let store = Arc::new(InMemoryProjectionStore::new(
         snapshot_repo.clone(),
@@ -261,6 +266,121 @@ async fn a_lot_selection_change_is_validated() {
         .failures
         .iter()
         .any(|f| f.account_id == account && f.code == "UNSUPPORTED_COST_BASIS"));
+}
+
+/// Rules R1.5: every read of a holdings snapshot on a later day (holdings,
+/// account values, net worth) carries its quantities across the splits
+/// recorded since, as valuation does, so it agrees with the stored rows.
+#[tokio::test]
+async fn a_holdings_snapshot_read_after_its_splits_agrees_with_its_valuation() {
+    // EDGE-SPLIT-03 without its second snapshot: acc-h holds 10 x and 10 y
+    // from 01-01; both split 2:1 on 01-03, x recorded on acc-h, y on acc-t.
+    let mut facts = scenario("EDGE-SPLIT-03").facts();
+    let first = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+    facts
+        .observed_snapshots
+        .retain(|s| s.snapshot_date == first);
+    let h = harness(facts).await;
+    h.coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    let snapshots = SnapshotService::new(
+        h.timezone.clone(),
+        h.account_repo.clone(),
+        h.snapshot_repo.clone(),
+        h.activity_repo.clone(),
+    );
+    let held = |snapshot: &AccountStateSnapshot| -> BTreeMap<String, (Decimal, Decimal)> {
+        snapshot
+            .positions
+            .iter()
+            .map(|(asset, p)| (asset.clone(), (p.quantity, p.average_cost)))
+            .collect()
+    };
+    let expected = |quantity: Decimal, average_cost: Decimal| {
+        BTreeMap::from([
+            ("x".to_string(), (quantity, average_cost)),
+            ("y".to_string(), (quantity, average_cost)),
+        ])
+    };
+    let read = |day: u32| {
+        snapshots
+            .get_latest_snapshots_as_of(
+                &["acc-h".to_string()],
+                NaiveDate::from_ymd_opt(2025, 1, day).unwrap(),
+            )
+            .unwrap()
+            .remove("acc-h")
+            .unwrap()
+    };
+    assert_eq!(held(&read(2)), expected(dec!(10), dec!(5)), "as entered");
+    assert_eq!(held(&read(3)), expected(dec!(20), dec!(2.5)), "split");
+
+    // Read today (01-04), as the holdings page does: 20 x at 10 and 20 y at
+    // 5 is the 300 the stored row for today holds.
+    let today = snapshots
+        .get_latest_holdings_snapshot("acc-h")
+        .unwrap()
+        .unwrap();
+    assert_eq!(held(&today), expected(dec!(20), dec!(2.5)));
+    let row = h.rows("acc-h").pop().unwrap();
+    assert_eq!(
+        (row.valuation_date, row.total_value),
+        (NaiveDate::from_ymd_opt(2025, 1, 4).unwrap(), dec!(300))
+    );
+    // The snapshot itself stays as entered.
+    let stored = h
+        .snapshot_repo
+        .get_latest_snapshot_before_date("acc-h", NaiveDate::from_ymd_opt(2025, 1, 4).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(held(&stored), expected(dec!(10), dec!(5)));
+}
+
+/// A transactions account's snapshots are projections: its lots split only
+/// on its own split rows (rules R1.5), so a split recorded on another
+/// account after its latest snapshot leaves it as projected.
+#[tokio::test]
+async fn a_transactions_snapshot_is_not_carried_across_another_accounts_split() {
+    // EDGE-SPLIT-03 with y's split recorded on acc-h, and acc-t holding 10 y
+    // bought on 01-01.
+    let mut facts = scenario("EDGE-SPLIT-03").facts();
+    let split = facts
+        .activities
+        .iter_mut()
+        .find(|a| a.id == "split-y")
+        .unwrap();
+    split.account_id = "acc-h".to_string();
+    let mut buy = split.clone();
+    buy.id = "buy-y".to_string();
+    buy.account_id = "acc-t".to_string();
+    buy.activity_type = "BUY".to_string();
+    buy.activity_date = as_of_instant(NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(), "UTC");
+    buy.quantity = Some(dec!(10));
+    buy.unit_price = Some(dec!(10));
+    buy.amount = Some(dec!(100));
+    facts.activities.push(buy);
+    let h = harness(facts).await;
+    h.coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    let snapshots = SnapshotService::new(
+        h.timezone.clone(),
+        h.account_repo.clone(),
+        h.snapshot_repo.clone(),
+        h.activity_repo.clone(),
+    );
+    let read = snapshots
+        .get_latest_snapshots_as_of(
+            &["acc-t".to_string()],
+            NaiveDate::from_ymd_opt(2025, 1, 4).unwrap(),
+        )
+        .unwrap()
+        .remove("acc-t")
+        .unwrap();
+    assert_eq!(read.positions["y"].quantity, dec!(10));
 }
 
 #[tokio::test]

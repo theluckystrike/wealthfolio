@@ -480,6 +480,7 @@ async fn build_context(
             timezone.clone(),
             account_repository.clone(),
             snapshot_repository.clone(),
+            activity_repository.clone(),
         )
         .with_event_sink(domain_event_sink.clone()),
     );
@@ -601,7 +602,7 @@ async fn build_context(
         base_currency.clone(),
         account_repository.clone(),
         asset_repository.clone(),
-        snapshot_repository.clone(),
+        snapshot_service.clone(),
         quote_service.clone(),
         valuation_repository.clone(),
         fx_service.clone(),
@@ -760,7 +761,6 @@ async fn build_context(
             performance_service,
             income_service,
             snapshot_service,
-            snapshot_repository,
             lots_repository,
             app_sync_repository,
             holdings_service,

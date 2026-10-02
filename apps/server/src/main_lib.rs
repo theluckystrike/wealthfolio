@@ -627,6 +627,7 @@ async fn initialize_profile_state(
             timezone.clone(),
             account_repo.clone(),
             snapshot_repository.clone(),
+            activity_repository.clone(),
         )
         .with_event_sink(domain_event_sink.clone()),
     );
@@ -659,7 +660,7 @@ async fn initialize_profile_state(
             base_currency.clone(),
             account_repo.clone(),
             asset_repository.clone(),
-            snapshot_repository.clone(),
+            snapshot_service.clone(),
             quote_service.clone(),
             valuation_repository.clone(),
             fx_service.clone(),
@@ -1081,7 +1082,7 @@ async fn initialize_profile_state(
         event_bus.clone(),
         broker_sync_running.clone(),
         health_service.clone(),
-        snapshot_repository.clone(),
+        snapshot_service.clone(),
         quote_service.clone(),
         portfolio_coordinator.clone(),
         account_service.clone(),
