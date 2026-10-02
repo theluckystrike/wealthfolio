@@ -616,7 +616,10 @@ fn canonical_quote_time(timestamp: &str) -> Option<(String, String)> {
 }
 
 /// Applies `canonical_quote_time` to quotes a snapshot restore copied, and
-/// drops those whose timestamp cannot be read (R6.1).
+/// drops those whose timestamp cannot be read (R6.1). Rewritten rows are set
+/// aside and put back, so days that trade places never collide on the way;
+/// a row landing on a day another quote holds is dropped: the row already
+/// there is kept, else the lowest id.
 fn normalize_restored_quotes(conn: &mut SqliteConnection) -> Result<()> {
     #[derive(QueryableByName)]
     struct QuoteTime {
@@ -627,34 +630,104 @@ fn normalize_restored_quotes(conn: &mut SqliteConnection) -> Result<()> {
         #[diesel(sql_type = diesel::sql_types::Text)]
         timestamp: String,
     }
+    let run = |conn: &mut SqliteConnection, sql: &str| {
+        diesel::sql_query(sql)
+            .execute(conn)
+            .map_err(|err| restore_sql_error("normalize", "quotes", err))
+    };
     let rows = diesel::sql_query("SELECT id, day, timestamp FROM quotes")
         .load::<QuoteTime>(conn)
         .map_err(|err| restore_sql_error("normalize", "quotes", err))?;
-    let mut dropped = 0usize;
+    run(
+        conn,
+        "CREATE TEMP TABLE _quote_times (id TEXT PRIMARY KEY, day TEXT, timestamp TEXT)",
+    )?;
+    let mut unreadable = 0usize;
+    let mut rewritten = 0usize;
     for row in rows {
-        match canonical_quote_time(&row.timestamp) {
-            Some((timestamp, day)) if timestamp == row.timestamp && day == row.day => {}
-            Some((timestamp, day)) => {
-                diesel::sql_query("UPDATE quotes SET timestamp = ?, day = ? WHERE id = ?")
-                    .bind::<diesel::sql_types::Text, _>(timestamp)
-                    .bind::<diesel::sql_types::Text, _>(day)
-                    .bind::<diesel::sql_types::Text, _>(&row.id)
-                    .execute(conn)
-                    .map_err(|err| restore_sql_error("normalize", "quotes", err))?;
-            }
+        let (timestamp, day) = match canonical_quote_time(&row.timestamp) {
+            Some((timestamp, day)) if timestamp == row.timestamp && day == row.day => continue,
+            Some(canonical) => canonical,
             None => {
-                diesel::sql_query("DELETE FROM quotes WHERE id = ?")
-                    .bind::<diesel::sql_types::Text, _>(&row.id)
-                    .execute(conn)
-                    .map_err(|err| restore_sql_error("normalize", "quotes", err))?;
-                dropped += 1;
+                unreadable += 1;
+                (String::new(), String::new())
             }
-        }
+        };
+        rewritten += 1;
+        diesel::sql_query("INSERT INTO _quote_times (id, day, timestamp) VALUES (?, ?, ?)")
+            .bind::<diesel::sql_types::Text, _>(&row.id)
+            .bind::<diesel::sql_types::Text, _>(day)
+            .bind::<diesel::sql_types::Text, _>(timestamp)
+            .execute(conn)
+            .map_err(|err| restore_sql_error("normalize", "quotes", err))?;
     }
-    if dropped > 0 {
-        log::warn!("Snapshot restore skipped {dropped} quotes with an unreadable timestamp");
+    run(
+        conn,
+        "CREATE TEMP TABLE _moved_quotes AS \
+         SELECT * FROM quotes WHERE id IN (SELECT id FROM _quote_times WHERE day <> '')",
+    )?;
+    run(
+        conn,
+        "DELETE FROM quotes WHERE id IN (SELECT id FROM _quote_times)",
+    )?;
+    run(
+        conn,
+        "UPDATE _moved_quotes SET \
+         day = (SELECT day FROM _quote_times t WHERE t.id = _moved_quotes.id), \
+         timestamp = (SELECT timestamp FROM _quote_times t WHERE t.id = _moved_quotes.id)",
+    )?;
+    let restored = run(
+        conn,
+        "INSERT OR IGNORE INTO quotes SELECT * FROM _moved_quotes ORDER BY id",
+    )?;
+    run(conn, "DROP TABLE _moved_quotes")?;
+    run(conn, "DROP TABLE _quote_times")?;
+    if unreadable > 0 {
+        log::warn!("Snapshot restore skipped {unreadable} quotes with an unreadable timestamp");
+    }
+    let colliding = rewritten - unreadable - restored;
+    if colliding > 0 {
+        log::warn!(
+            "Snapshot restore skipped {colliding} quotes whose day another quote of the same asset and source holds"
+        );
     }
     Ok(())
+}
+
+/// Whether another quote holds the asset, day and source of a synced quote
+/// (rules R6.1): the row already there is kept.
+fn synced_quote_day_is_taken(
+    conn: &mut SqliteConnection,
+    fields: &[(String, serde_json::Value)],
+    id: &str,
+) -> Result<bool> {
+    #[derive(QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|(column, _)| column == name)
+            .and_then(|(_, value)| value.as_str())
+    };
+    let (Some(asset_id), Some(day), Some(source)) =
+        (field("asset_id"), field("day"), field("source"))
+    else {
+        return Ok(false);
+    };
+    let taken = diesel::sql_query(
+        "SELECT count(*) AS count FROM quotes \
+         WHERE asset_id = ? AND day = ? AND source = ? AND id <> ?",
+    )
+    .bind::<diesel::sql_types::Text, _>(asset_id)
+    .bind::<diesel::sql_types::Text, _>(day)
+    .bind::<diesel::sql_types::Text, _>(source)
+    .bind::<diesel::sql_types::Text, _>(id)
+    .get_result::<Count>(conn)
+    .map_err(StorageError::from)?;
+    Ok(taken.count > 0)
 }
 
 fn synced_snapshot_payload_is_safe(fields: &[(String, serde_json::Value)]) -> bool {
@@ -2177,6 +2250,14 @@ fn apply_remote_event_lww_tx(
                     if entity == SyncEntity::Quote && !normalize_synced_quote_time(&mut fields) {
                         log::warn!(
                             "Skipping synced quote '{}' with an unreadable timestamp",
+                            entity_id_value
+                        );
+                        applied_entity_change = false;
+                    } else if entity == SyncEntity::Quote
+                        && synced_quote_day_is_taken(conn, &fields, &entity_id_value)?
+                    {
+                        log::warn!(
+                            "Skipping synced quote '{}': another quote of its asset and source holds its day",
                             entity_id_value
                         );
                         applied_entity_change = false;
@@ -6779,6 +6860,108 @@ mod tests {
                 ("q-naive", "2025-01-03", "2025-01-03T12:00:00+00:00"),
                 ("q-offset", "2024-12-02", "2024-12-02T03:00:00+00:00"),
             ]
+        );
+    }
+
+    #[derive(QueryableByName)]
+    struct QuoteDayRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        id: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        day: String,
+    }
+
+    fn quote_days(conn: &mut SqliteConnection) -> Vec<(String, String)> {
+        diesel::sql_query("SELECT id, day FROM quotes ORDER BY id")
+            .load::<QuoteDayRow>(conn)
+            .expect("read quotes")
+            .into_iter()
+            .map(|row| (row.id, row.day))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_restored_snapshot_keeps_one_quote_per_day() {
+        let (pool, writer) = setup_db();
+        let mut conn = get_connection(&pool).expect("conn");
+        diesel::sql_query(
+            "INSERT INTO assets (id, kind, is_active, quote_mode, quote_ccy, created_at, updated_at) \
+             VALUES ('asset-days', 'INVESTMENT', 1, 'MARKET', 'USD', datetime('now'), datetime('now'))",
+        )
+        .execute(&mut conn)
+        .expect("insert asset");
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("snapshot.db");
+        let mut source = SqliteConnection::establish(path.to_str().expect("path")).expect("open");
+        // q-a and q-b swap days; q-onto lands on q-kept's day; q-m1 and q-m2
+        // both land on 01-21 (rules R6.1).
+        source
+            .batch_execute(
+                "CREATE TABLE quotes (id TEXT, asset_id TEXT, day TEXT, source TEXT, close TEXT, \
+                 currency TEXT, created_at TEXT, timestamp TEXT); \
+                 INSERT INTO quotes VALUES \
+                 ('q-a', 'asset-days', '2025-01-03', 'MANUAL', '1', 'USD', '2025-01-01', '2025-01-04T12:00:00'), \
+                 ('q-b', 'asset-days', '2025-01-04', 'MANUAL', '1', 'USD', '2025-01-01', '2025-01-03T12:00:00'), \
+                 ('q-kept', 'asset-days', '2025-01-10', 'MANUAL', '1', 'USD', '2025-01-01', '2025-01-10T12:00:00Z'), \
+                 ('q-onto', 'asset-days', '2025-01-11', 'MANUAL', '1', 'USD', '2025-01-01', '2025-01-10T13:00:00'), \
+                 ('q-m1', 'asset-days', '2025-01-20', 'MANUAL', '1', 'USD', '2025-01-01', '2025-01-21T12:00:00'), \
+                 ('q-m2', 'asset-days', '2025-01-22', 'MANUAL', '1', 'USD', '2025-01-01', '2025-01-21T13:00:00');",
+            )
+            .expect("seed snapshot");
+        let repo = AppSyncRepository::new(pool.clone(), writer);
+        repo.restore_snapshot_tables_from_file(
+            path.to_string_lossy().into_owned(),
+            vec!["quotes".to_string()],
+            1,
+            "device-restore".to_string(),
+            Some(1),
+        )
+        .await
+        .expect("restore");
+
+        let expected = [
+            ("q-a", "2025-01-04"),
+            ("q-b", "2025-01-03"),
+            ("q-kept", "2025-01-10"),
+            ("q-m1", "2025-01-21"),
+        ]
+        .map(|(id, day)| (id.to_string(), day.to_string()));
+        assert_eq!(quote_days(&mut conn), expected);
+    }
+
+    #[tokio::test]
+    async fn a_synced_quote_landing_on_another_quotes_day_is_skipped() {
+        let (pool, writer) = setup_db();
+        let mut conn = get_connection(&pool).expect("conn");
+        diesel::sql_query(
+            "INSERT INTO assets (id, kind, is_active, quote_mode, quote_ccy, created_at, updated_at) \
+             VALUES ('asset-taken', 'INVESTMENT', 1, 'MARKET', 'USD', datetime('now'), datetime('now'))",
+        )
+        .execute(&mut conn)
+        .expect("insert asset");
+        let repo = AppSyncRepository::new(pool.clone(), writer);
+        for (id, timestamp, applied) in [
+            ("q-there", "2025-01-03T12:00:00Z", true),
+            // Its day says 01-04, its timestamp 01-03, where q-there is.
+            ("q-late", "2025-01-03T15:00:00Z", false),
+        ] {
+            let applied_now = repo
+                .apply_remote_event_lww(
+                    SyncEntity::Quote,
+                    id.to_string(),
+                    SyncOperation::Create,
+                    format!("evt-{id}"),
+                    "2026-02-12T00:00:00Z".to_string(),
+                    1,
+                    synced_quote(id, "asset-taken", timestamp),
+                )
+                .await
+                .expect("apply quote");
+            assert_eq!(applied_now, applied, "{id}");
+        }
+        assert_eq!(
+            quote_days(&mut conn),
+            vec![("q-there".to_string(), "2025-01-03".to_string())]
         );
     }
 
