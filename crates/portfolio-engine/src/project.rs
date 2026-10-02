@@ -2088,13 +2088,9 @@ impl Projector<'_> {
             .fx
             .rate(position_currency.as_str(), self.base(), event.date)
             .unwrap_or(Decimal::ZERO);
-        // Proceeds of a transfer leg are known in base without a rate on the
-        // day (rules R2.4).
-        let proceeds_base_known = match proceeds {
-            Proceeds::Shared { base, .. } => base.is_some() || !disposal_rate.is_zero(),
-            Proceeds::AtCost => true,
-        };
-        if !proceeds_base_known {
+        // Only proceeds without a base value of their own need the day's
+        // rate; a transfer leg's do not (rules R2.4).
+        if matches!(proceeds, Proceeds::Shared { base: None, .. }) && disposal_rate.is_zero() {
             run.diagnostics.push(Diagnostic::warning(
                 DiagnosticCode::FxUnavailable,
                 event.source.as_str(),
@@ -2105,44 +2101,44 @@ impl Projector<'_> {
             let effective = lot.effective_quantity();
             let cost_basis = lot.cost_basis;
             let acquisition_rate = self.lot_rate_to_base(lot, position_currency.as_str());
-            let base_available = proceeds_base_known && !acquisition_rate.is_zero();
+            let at_acquisition_rate = |amount: Decimal| {
+                (!acquisition_rate.is_zero())
+                    .then(|| checked(arith::mul(amount, acquisition_rate), "disposal base cost"))
+                    .transpose()
+            };
             let share = |total: Decimal, what: &str| {
                 checked(arith::proportional(total, effective, total_quantity), what)
             };
+            // Each side in base is recorded when its rate is known, whatever
+            // the other's; realized P&L in base needs both (rules R3.4).
             let (proceeds, proceeds_base) = match proceeds {
                 Proceeds::Shared { local, base } => {
                     let proceeds = share(local, "disposal proceeds")?;
                     let proceeds_base = match base {
-                        Some(total) if base_available => share(total, "disposal base proceeds")?,
-                        _ if base_available => checked(
+                        Some(total) => Some(share(total, "disposal base proceeds")?),
+                        None if !disposal_rate.is_zero() => Some(checked(
                             arith::mul(proceeds, disposal_rate),
                             "disposal base proceeds",
-                        )?,
-                        _ => Decimal::ZERO,
+                        )?),
+                        None => None,
                     };
                     (proceeds, proceeds_base)
                 }
-                Proceeds::AtCost if base_available => (
-                    cost_basis,
-                    checked(
-                        arith::mul(cost_basis, acquisition_rate),
-                        "disposal base proceeds",
-                    )?,
-                ),
-                Proceeds::AtCost => (cost_basis, Decimal::ZERO),
+                Proceeds::AtCost => (cost_basis, at_acquisition_rate(cost_basis)?),
             };
-            let cost_basis_base = if base_available {
-                checked(
-                    arith::mul(cost_basis, acquisition_rate),
-                    "disposal base cost",
-                )?
-            } else {
-                Decimal::ZERO
-            };
+            let cost_basis_base = at_acquisition_rate(cost_basis)?;
             let stored_proceeds = proceeds.round_dp(STORED_PRECISION);
             let stored_cost = cost_basis.round_dp(STORED_PRECISION);
-            let stored_proceeds_base = proceeds_base.round_dp(STORED_PRECISION);
-            let stored_cost_base = cost_basis_base.round_dp(STORED_PRECISION);
+            let stored_proceeds_base = proceeds_base.unwrap_or_default().round_dp(STORED_PRECISION);
+            let stored_cost_base = cost_basis_base
+                .unwrap_or_default()
+                .round_dp(STORED_PRECISION);
+            let realized_pnl_base = match (proceeds_base, cost_basis_base) {
+                (Some(_), Some(_)) => {
+                    (stored_proceeds_base - stored_cost_base).round_dp(STORED_PRECISION)
+                }
+                _ => Decimal::ZERO,
+            };
             effects.disposals.push(LotDisposal {
                 id: format!("{}:{}:{index}", event.id, lot.id),
                 lot_id: lot.id.clone(),
@@ -2156,8 +2152,7 @@ impl Projector<'_> {
                 realized_pnl: (stored_proceeds - stored_cost).round_dp(STORED_PRECISION),
                 proceeds_base: stored_proceeds_base,
                 cost_basis_base: stored_cost_base,
-                realized_pnl_base: (stored_proceeds_base - stored_cost_base)
-                    .round_dp(STORED_PRECISION),
+                realized_pnl_base,
                 currency: position_currency.clone(),
                 fx_rate_to_base: disposal_rate,
             });
