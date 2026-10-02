@@ -614,7 +614,7 @@ struct Valuer<'a> {
     carried_fx: BTreeMap<(String, String), (i64, NaiveDate)>,
     /// Cost in base of the lots each incoming transfer booked, when pricing
     /// flows (`TransferRecords::booked`).
-    booked: Option<&'a BTreeMap<(AccountId, ActivityId), Decimal>>,
+    booked: Option<&'a BTreeMap<(AccountId, ActivityId), BookedCost>>,
 }
 
 impl<'a> Valuer<'a> {
@@ -1140,8 +1140,8 @@ impl<'a> Valuer<'a> {
                 };
                 // A paired leg receives the sender's lots at their cost, not
                 // at the activity's price: it flows the cost it booked (less
-                // its own fee, capitalised into those lots), as the outgoing
-                // leg flows the cost it removed.
+                // its own fee, when capitalised into lots it opened), as the
+                // outgoing leg flows the cost it removed (rules R2.4).
                 let paired = self
                     .resolved
                     .facts
@@ -1153,12 +1153,15 @@ impl<'a> Valuer<'a> {
                     .and_then(|b| b.get(&(event.account.clone(), event.source.clone())))
                     .copied();
                 if let (true, Some(booked)) = (paired, booked) {
-                    if let Some(fee) =
-                        self.flow_to_base(event.charges.fee, event.currency.as_str(), event)
-                    {
+                    let fee = if booked.opened_lots {
+                        event.charges.fee
+                    } else {
+                        Decimal::ZERO
+                    };
+                    if let Some(fee) = self.flow_to_base(fee, event.currency.as_str(), event) {
                         // A short's cost is negative; its direction is the
                         // leg's (`TransferRecords::short`).
-                        return ((booked - fee).abs(), source);
+                        return ((booked.cost - fee).abs(), source);
                     }
                 }
                 if let Some(basis) = book_basis {
@@ -1296,9 +1299,18 @@ struct TransferRecords {
     /// that disposed only short lots, an incoming leg that opened short lots
     /// or, opening none, covered long ones.
     short: BTreeSet<ActivityId>,
-    /// Cost in base of the units each incoming leg delivered to its account:
-    /// the lots it opened and the opposite position it covered.
-    booked: BTreeMap<(AccountId, ActivityId), Decimal>,
+    /// What each incoming leg delivered to its account.
+    booked: BTreeMap<(AccountId, ActivityId), BookedCost>,
+}
+
+#[derive(Clone, Copy)]
+struct BookedCost {
+    /// Cost in base of the lots the leg opened and the opposite position it
+    /// covered.
+    cost: Decimal,
+    /// Whether it opened lots: its fee is capitalised into them, so a leg
+    /// that only covered carries no fee in its cost.
+    opened_lots: bool,
 }
 
 fn transfer_records(
@@ -1362,19 +1374,21 @@ fn transfer_records(
             short.insert(event.source.clone());
         }
     }
-    let mut booked: BTreeMap<(AccountId, ActivityId), Option<Decimal>> = opened
+    let mut booked: BTreeMap<(AccountId, ActivityId), (Option<Decimal>, bool)> = opened
         .into_iter()
-        .map(|(key, (_, cost))| (key, cost))
+        .map(|(key, (_, cost))| (key, (cost, true)))
         .collect();
     for (key, cost) in covered {
-        let total = booked.entry(key).or_insert(Some(Decimal::ZERO));
-        *total = total.zip(cost).map(|(opened, covered)| opened + covered);
+        let total = booked.entry(key).or_insert((Some(Decimal::ZERO), false));
+        total.0 = total.0.zip(cost).map(|(opened, covered)| opened + covered);
     }
     TransferRecords {
         short,
         booked: booked
             .into_iter()
-            .filter_map(|(key, cost)| cost.map(|cost| (key, cost)))
+            .filter_map(|(key, (cost, opened_lots))| {
+                cost.map(|cost| (key, BookedCost { cost, opened_lots }))
+            })
             .collect(),
     }
 }
