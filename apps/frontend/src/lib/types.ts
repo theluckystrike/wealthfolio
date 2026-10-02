@@ -173,18 +173,31 @@ export interface Activity {
   updatedAt: string;
 }
 
+interface TypedActivity {
+  activityType: string;
+  activityTypeOverride?: string | null;
+}
+
+/**
+ * The user's type override, when it is not blank: a blank override is none,
+ * as the backend and the portfolio engine read it.
+ */
+function typeOverride(activity: TypedActivity): string | undefined {
+  return activity.activityTypeOverride?.trim() || undefined;
+}
+
 /**
  * Helper to get effective type (respects user override)
  */
-export function getEffectiveType(activity: Activity): string {
-  return activity.activityTypeOverride ?? activity.activityType;
+export function getEffectiveType(activity: TypedActivity): string {
+  return typeOverride(activity) ?? activity.activityType;
 }
 
 /**
  * Check if activity has user override
  */
-export function hasUserOverride(activity: Activity): boolean {
-  return activity.activityTypeOverride !== undefined && activity.activityTypeOverride !== null;
+export function hasUserOverride(activity: TypedActivity): boolean {
+  return typeOverride(activity) !== undefined;
 }
 
 /**

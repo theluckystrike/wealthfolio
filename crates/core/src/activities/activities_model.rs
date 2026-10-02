@@ -212,16 +212,25 @@ pub struct Activity {
     pub updated_at: DateTime<Utc>,
 }
 
+/// An activity's type override, when it is not blank: a blank override is
+/// none, wherever the type is read (engine rules §5). SQL reads it through
+/// the storage crate's `effective_type_sql`, the frontend through
+/// `getEffectiveType`.
+pub fn type_override(type_override: Option<&str>) -> Option<&str> {
+    type_override.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// The type an activity computes as: its override when not blank, else its
+/// stored type.
+pub fn effective_activity_type<'a>(activity_type: &'a str, override_: Option<&'a str>) -> &'a str {
+    type_override(override_).unwrap_or(activity_type)
+}
+
 impl Activity {
     /// Returns the effective activity type, respecting user overrides.
-    /// This is what the compiler and calculator should use. A blank
-    /// override is none, as the portfolio engine reads it.
+    /// This is what the compiler and calculator should use.
     pub fn effective_type(&self) -> &str {
-        self.activity_type_override
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&self.activity_type)
+        effective_activity_type(&self.activity_type, self.activity_type_override.as_deref())
     }
 
     /// Returns the effective date for this activity
@@ -251,7 +260,7 @@ impl Activity {
 
     /// Check if this activity has a user override
     pub fn has_override(&self) -> bool {
-        self.activity_type_override.is_some()
+        type_override(self.activity_type_override.as_deref()).is_some()
     }
 
     /// Get quantity, defaulting to zero if not set.
