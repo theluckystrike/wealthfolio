@@ -37,21 +37,21 @@ account brings its first snapshot's value (undetermined when not fully priced).
 Fixtures: EDGE-MIX-02, LIFE-EMPTY-01.
 
 **R1.5 Splits are facts about the asset.** Rows recording a split of the same
-asset with the same ratio within one day of each other are one split, dated by
-its most authoritative row (user-edited, manual or imported before a provider's,
-then the latest updated); rows with different ratios are different splits. A
-split recorded on any account, a holdings account included, applies to every
-holdings account that holds the asset, and decides whether the data provider
-adjusted its prices. A holdings snapshot states quantities as of its own date:
-read on any later day, by valuations, holdings, account values and net worth
-alike, they are multiplied by every split after that date up to the day, whether
-the provider adjusted its prices or not, and the next snapshot is compared with
-them that way. Prices from before a split that the provider adjusted are read
-back at their unadjusted level. A transactions account's lots split on the split
-day of a split it records itself (as before): brokers record a split on each
-account, not always on the same day, so another account's row would split its
-lots twice (§7). Fixtures: EDGE-SPLIT-01, EDGE-SPLIT-02, EDGE-SPLIT-03,
-EDGE-SPLIT-04.
+asset within one day of each other are one split: its most authoritative row
+(user-edited, manual or imported before a provider's, then the latest updated)
+gives its day and ratio, so a provider's wrong row next to the user's correction
+is not applied twice (EDGE-QT-05). A split recorded on any account, a holdings
+account included, applies to every holdings account that holds the asset, and
+decides whether the data provider adjusted its prices. A holdings snapshot
+states quantities as of its own date: read on any later day, by valuations,
+holdings, account values and net worth alike, they are multiplied by every split
+after that date up to the day, whether the provider adjusted its prices or not,
+and the next snapshot is compared with them that way. Prices from before a split
+that the provider adjusted are read back at their unadjusted level. A
+transactions account's lots split on the split day of a split it records itself
+(as before): brokers record a split on each account, not always on the same day,
+so another account's row would split its lots twice (§7). Fixtures:
+EDGE-SPLIT-01, EDGE-SPLIT-02, EDGE-SPLIT-03, EDGE-QT-05.
 
 ## 2. Transfers
 
@@ -187,8 +187,8 @@ account; both owners are invalidated (§5).
   at the next snapshot, as an unrecorded one does (R1.2: activities never change
   a holdings account's numbers).
 - Units in transit between transfer legs are not valued (R4.2).
-- Rows recording the same split with the same ratio more than a day apart count
-  as two splits (R1.5).
+- Two splits of one asset recorded within a day of each other read as one, and
+  rows recording one split more than a day apart count as two (R1.5).
 - A split is entered on a holdings account with the activity form; importing a
   CSV from a holdings account imports snapshots.
 - A split recorded on one transactions account does not split another's lots
