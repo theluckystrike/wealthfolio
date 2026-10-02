@@ -112,6 +112,13 @@ mod tests {
     }
 
     #[test]
+    fn test_effective_type_with_blank_override() {
+        let mut activity = create_test_activity();
+        activity.activity_type_override = Some(" ".to_string());
+        assert_eq!(activity.effective_type(), "BUY");
+    }
+
+    #[test]
     fn test_effective_date() {
         let activity = create_test_activity();
         let date = activity.effective_date();

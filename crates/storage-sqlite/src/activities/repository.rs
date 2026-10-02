@@ -1546,7 +1546,7 @@ impl ActivityRepositoryTrait for ActivityRepository {
             let activities_db = activities::table
                 .filter(activities::asset_id.eq_any(chunk))
                 .filter(diesel::dsl::sql::<Bool>(
-                    "COALESCE(activity_type_override, activity_type) = 'SPLIT'",
+                    "COALESCE(NULLIF(TRIM(activity_type_override, char(32, 9, 10, 13)), ''), activity_type) = 'SPLIT'",
                 ))
                 .select(ActivityDB::as_select())
                 .order(activities::activity_date.asc())

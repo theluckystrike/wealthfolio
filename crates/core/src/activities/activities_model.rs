@@ -214,10 +214,13 @@ pub struct Activity {
 
 impl Activity {
     /// Returns the effective activity type, respecting user overrides.
-    /// This is what the compiler and calculator should use.
+    /// This is what the compiler and calculator should use. A blank
+    /// override is none, as the portfolio engine reads it.
     pub fn effective_type(&self) -> &str {
         self.activity_type_override
             .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
             .unwrap_or(&self.activity_type)
     }
 

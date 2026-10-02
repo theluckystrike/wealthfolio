@@ -43,7 +43,7 @@ BEGIN
         version = projection_state.version + 1;
     INSERT INTO projection_state (scope, dirty_from, version)
     SELECT 'a:' || NEW.asset_id, '0001-01-01', 1
-    WHERE coalesce(NEW.activity_type_override, NEW.activity_type) = 'SPLIT' AND NEW.asset_id IS NOT NULL
+    WHERE coalesce(nullif(trim(NEW.activity_type_override, char(32, 9, 10, 13)), ''), NEW.activity_type) = 'SPLIT' AND NEW.asset_id IS NOT NULL
     ON CONFLICT (scope) DO UPDATE SET
         dirty_from = '0001-01-01',
         version = projection_state.version + 1;
@@ -72,13 +72,13 @@ BEGIN
         version = projection_state.version + 1;
     INSERT INTO projection_state (scope, dirty_from, version)
     SELECT 'a:' || OLD.asset_id, '0001-01-01', 1
-    WHERE coalesce(OLD.activity_type_override, OLD.activity_type) = 'SPLIT' AND OLD.asset_id IS NOT NULL
+    WHERE coalesce(nullif(trim(OLD.activity_type_override, char(32, 9, 10, 13)), ''), OLD.activity_type) = 'SPLIT' AND OLD.asset_id IS NOT NULL
     ON CONFLICT (scope) DO UPDATE SET
         dirty_from = '0001-01-01',
         version = projection_state.version + 1;
     INSERT INTO projection_state (scope, dirty_from, version)
     SELECT 'a:' || NEW.asset_id, '0001-01-01', 1
-    WHERE coalesce(NEW.activity_type_override, NEW.activity_type) = 'SPLIT' AND NEW.asset_id IS NOT NULL
+    WHERE coalesce(nullif(trim(NEW.activity_type_override, char(32, 9, 10, 13)), ''), NEW.activity_type) = 'SPLIT' AND NEW.asset_id IS NOT NULL
     ON CONFLICT (scope) DO UPDATE SET
         dirty_from = '0001-01-01',
         version = projection_state.version + 1;
@@ -100,7 +100,7 @@ BEGIN
         version = projection_state.version + 1;
     INSERT INTO projection_state (scope, dirty_from, version)
     SELECT 'a:' || OLD.asset_id, '0001-01-01', 1
-    WHERE coalesce(OLD.activity_type_override, OLD.activity_type) = 'SPLIT' AND OLD.asset_id IS NOT NULL
+    WHERE coalesce(nullif(trim(OLD.activity_type_override, char(32, 9, 10, 13)), ''), OLD.activity_type) = 'SPLIT' AND OLD.asset_id IS NOT NULL
     ON CONFLICT (scope) DO UPDATE SET
         dirty_from = '0001-01-01',
         version = projection_state.version + 1;

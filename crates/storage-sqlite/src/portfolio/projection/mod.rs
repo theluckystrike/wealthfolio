@@ -741,6 +741,26 @@ mod tests {
         clear().await;
         sql(&db, "DELETE FROM activities WHERE id = 'split-1'");
         assert_eq!(dirty(&db, "a:AAPL").as_deref(), Some("0001-01-01"));
+
+        // A blank override is none: the row is the split it stores (§5).
+        clear().await;
+        sql(
+            &db,
+            "INSERT INTO activities (id, account_id, asset_id, activity_type, activity_type_override, \
+             status, activity_date, currency, is_user_modified, needs_review, created_at, updated_at) \
+             VALUES ('split-2', 'acc1', 'AAPL', 'SPLIT', ' ', 'POSTED', '2025-01-20T15:00:00Z', 'USD', \
+             0, 0, datetime('now'), datetime('now'))",
+        );
+        assert_eq!(dirty(&db, "a:AAPL").as_deref(), Some("0001-01-01"));
+        clear().await;
+        sql(
+            &db,
+            "UPDATE activities SET amount = '3' WHERE id = 'split-2'",
+        );
+        assert_eq!(dirty(&db, "a:AAPL").as_deref(), Some("0001-01-01"));
+        clear().await;
+        sql(&db, "DELETE FROM activities WHERE id = 'split-2'");
+        assert_eq!(dirty(&db, "a:AAPL").as_deref(), Some("0001-01-01"));
     }
 
     #[tokio::test]
