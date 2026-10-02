@@ -36,17 +36,22 @@ brought in that day, or its net contribution when it recorded none; a holdings
 account brings its first snapshot's value (undetermined when not fully priced).
 Fixtures: EDGE-MIX-02, LIFE-EMPTY-01.
 
-**R1.5 Splits are facts about the asset.** A split recorded on any account, a
-holdings account included, applies to every holdings account that holds the
-asset, and decides whether the data provider adjusted its prices. A holdings
-snapshot states quantities as of its own date: on any later day, they are
-multiplied by every split after that date up to the day, whether the provider
-adjusted its prices or not, and the next snapshot is compared with them that
-way. Prices from before a split that the provider adjusted are read back at
-their unadjusted level. A transactions account's lots split on the split day of
-a split it records itself (as before): brokers record a split on each account,
-not always on the same day, so another account's row would split its lots twice
-(§7). Fixtures: EDGE-SPLIT-01, EDGE-SPLIT-02, EDGE-SPLIT-03.
+**R1.5 Splits are facts about the asset.** Rows recording a split of the same
+asset with the same ratio within one day of each other are one split, dated by
+its most authoritative row (user-edited, manual or imported before a provider's,
+then the latest updated); rows with different ratios are different splits. A
+split recorded on any account, a holdings account included, applies to every
+holdings account that holds the asset, and decides whether the data provider
+adjusted its prices. A holdings snapshot states quantities as of its own date:
+read on any later day, by valuations, holdings, account values and net worth
+alike, they are multiplied by every split after that date up to the day, whether
+the provider adjusted its prices or not, and the next snapshot is compared with
+them that way. Prices from before a split that the provider adjusted are read
+back at their unadjusted level. A transactions account's lots split on the split
+day of a split it records itself (as before): brokers record a split on each
+account, not always on the same day, so another account's row would split its
+lots twice (§7). Fixtures: EDGE-SPLIT-01, EDGE-SPLIT-02, EDGE-SPLIT-03,
+EDGE-SPLIT-04.
 
 ## 2. Transfers
 
@@ -63,8 +68,8 @@ not always on the same day, so another account's row would split its lots twice
   sender gave (out units ÷ in units); valued at cost (R2.4), it nets the cost
   the sender removed, so the cost booked for the units it lacked remains. A cash
   pair nets whole: a rate difference between its legs is a gain (#1655).
-- Each leg is equal and opposite to the other in units, not in amount: each is
-  priced on its own day.
+- Each leg is priced on its own day, so the legs' amounts differ when the price
+  moves; their units differ only by what the sender lacked.
 - Fixtures: EDGE-TXF-02, EDGE-TXF-09, EDGE-TXF-12, EDGE-TXF-14, EDGE-TXF-19.
 
 **R2.2 A currency conversion inside one account.** When the import linker
@@ -82,19 +87,27 @@ or out (§7). Fixtures: EDGE-MIX-03, EDGE-MIX-05, EDGE-MIX-06.
 
 **R2.4 A transfer without a quote** is valued at cost.
 
-- The outgoing leg flows the cost it removed.
-- The incoming leg flows the cost of every unit it delivered: the lots it
-  opened, plus the units that covered a short in the receiving account, less the
-  part of its own fee capitalised into those lots. A transfer that only covers
-  opens no lot and capitalises nothing: its fee is a charge, not money out.
-- Both legs carry the sender's cost at its historical rates to the base
-  currency, as opened lots do, whether or not a rate exists on the transfer day:
-  the outgoing leg realizes nothing, and a transfer cover's realized P&L in base
-  uses that cost.
-- Fixtures: EDGE-TXF-15, EDGE-TXF-16, EDGE-TXF-17, EDGE-TXF-18.
+- The outgoing leg flows the cost it removed. Each lot it removes gives its own
+  cost, so it realizes nothing, in base as in its currency.
+- The incoming leg books the sender's lots at their cost, and units with no
+  sender lot (the sender lacked them, is a holdings account, or the transfer is
+  unpaired) at its own price. Units arriving into a short cover it first. Its
+  whole fee is capitalised into the lots it opens, at their rates to the base
+  currency; a leg that opens none capitalises nothing, and its fee is a charge.
+- The incoming leg flows the cost of every unit it delivered, the lots it opened
+  and the units that covered a short, less its fee as capitalised into those
+  lots.
+- Costs keep the sender's historical rates to the base currency, as opened lots
+  do, whether or not a rate exists on the transfer day. A cover's proceeds in
+  base are that delivered cost even when the covered short's own cost has no
+  rate; its realized P&L in base is then unknown (R3.4).
+- Fixtures: EDGE-TXF-15, EDGE-TXF-16, EDGE-TXF-17, EDGE-TXF-18, EDGE-TXF-20,
+  EDGE-TXF-21, EDGE-TXF-22, EDGE-MIX-06, EDGE-MIX-07.
 
 **R2.5 Moving a short** is a liability changing hands: sending it is money in,
-receiving it money out. Fixtures: EDGE-TXF-07, EDGE-TXF-08.
+receiving it money out. The receiver books the short units its activity records,
+those the sender lacked at the transfer's price (R2.1). Fixtures: EDGE-TXF-07,
+EDGE-TXF-08, EDGE-TXF-23.
 
 ## 3. Dates and currencies
 
@@ -106,12 +119,14 @@ consistently; synced rows are normalized where applied (R6.1).
 
 **R3.3** A sale's or cover's proceeds convert to the base currency at the
 disposal day's rate; costs at their acquisition rate, so realized P&L in base
-includes the currency move. Exception: R2.4's covered units.
+includes the currency move. Exception: transfer legs (R2.4).
 
-**R3.4** A rate is the exact day's, else the nearest observation before or after
-(on a tie, the one before), direct, inverse or through other currencies. Only
-when no path exists at all is an amount in the base currency unknown: it is
-recorded as zero, with a currency warning.
+**R3.4** A rate is the direct pair's (or its inverse's) observation on the day,
+else its nearest observation before or after (on a tie, the one before), however
+far. Without any direct observation, it goes through other currencies by the
+path with the fewest hops (equal paths in currency-code order), each hop at its
+own nearest observation. Only when no path exists at all is an amount in the
+base currency unknown: it is recorded as zero, with a currency warning.
 
 ## 4. Dated reads
 
@@ -142,17 +157,23 @@ is `0001-01-01`; `@all` refolds every account from `GENESIS`.
 | Snapshot position | insert, update, delete                                                                            | its old and new snapshots' accounts, each from its snapshot's date                                                                                                                             |
 | Settings          | base currency or time zone inserted, changed, renamed to or from, or deleted                      | `@all`                                                                                                                                                                                         |
 
-A run consumes a marker only after writing what it covers. An account or asset
-that arrives after facts naming it marks itself on insert (rows above), so a run
-that could not project it yet projects it once it exists.
+An activity's type is its override when the override is not blank, else its
+stored type, wherever it is read. A run consumes a marker only after writing
+what it covers. An account or asset that arrives after facts naming it marks
+itself on insert (rows above), so a run that could not project it yet projects
+it once it exists.
 
 ## 6. Data normalized where written
 
 **R6.1** When sync applies a quote, incrementally or by restoring a snapshot,
 its timestamp is rewritten as a UTC instant and its day set from it (R3.2). A
-synced quote whose timestamp cannot be read is skipped, with a log entry. Synced
-quote updates carry complete rows. Rows already stored are not repaired: local
-writes keep them consistent, and only sync could have written inconsistent ones.
+synced quote whose timestamp cannot be read is skipped, with a log entry. When
+two quotes would then share an asset, day and source (a quote's id names its
+day, so only a row whose day disagreed with its timestamp can), the row already
+at that day is kept and the other skipped with a log entry; among rows a restore
+rewrites, the lowest id is kept. Synced quote updates carry complete rows. Rows
+already stored are not repaired: local writes keep them consistent, and only
+sync could have written inconsistent ones.
 
 **R6.2** Sync may move a quote to another asset or a snapshot to another
 account; both owners are invalidated (§5).
@@ -166,6 +187,10 @@ account; both owners are invalidated (§5).
   at the next snapshot, as an unrecorded one does (R1.2: activities never change
   a holdings account's numbers).
 - Units in transit between transfer legs are not valued (R4.2).
+- Rows recording the same split with the same ratio more than a day apart count
+  as two splits (R1.5).
+- A split is entered on a holdings account with the activity form; importing a
+  CSV from a holdings account imports snapshots.
 - A split recorded on one transactions account does not split another's lots
   (R1.5): each account records its own.
 
