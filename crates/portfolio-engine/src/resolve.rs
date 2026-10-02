@@ -287,7 +287,12 @@ mod tests {
 
 // ------------------------------------------------------------------ quotes
 
-use crate::model::{ActivityKind, AssetId, CanonicalFacts, DateRange, QuoteObservation};
+use crate::model::{
+    Activity, ActivityKind, AssetId, CanonicalFacts, DateRange, QuoteObservation, RawActivity,
+};
+use crate::normalize::{effective_type, is_posted, local_date};
+use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 
 /// Quote observations per asset, sorted by day (`normalize` keeps one per
 /// asset and day).
@@ -388,14 +393,7 @@ impl ResolvedSurfaces {
         from: NaiveDate,
         to: NaiveDate,
     ) -> Option<Decimal> {
-        self.recorded_splits
-            .iter()
-            .filter(|event| {
-                event.asset == *asset && from < event.split_date && event.split_date <= to
-            })
-            .try_fold(Decimal::ONE, |factor, event| {
-                arith::mul(factor, event.ratio)
-            })
+        split_quantity_factor(&self.recorded_splits, asset, from, to)
     }
 }
 
@@ -422,38 +420,98 @@ pub fn resolve_surfaces(facts: &CanonicalFacts, range: DateRange) -> ResolvedSur
     }
 }
 
-/// Legacy `select_shared_split_activities` + `quotes_appear_split_adjusted`:
-/// per asset, split rows within one day of each other form one cluster; the
-/// best-ranked row (user-modified / MANUAL / CSV / untagged, then latest
-/// update, then id) represents it. `resolve_surfaces` keeps as adjusted the
-/// events whose quote series already looks adjusted around the split date.
-fn split_events(facts: &CanonicalFacts, range: DateRange) -> Vec<SplitEvent> {
-    const MERGE_GAP_DAYS: i64 = 1;
-    let mut candidates: BTreeMap<&AssetId, Vec<(&crate::model::Activity, Decimal)>> =
-        BTreeMap::new();
-    for activity in &facts.activities {
-        if activity.kind != ActivityKind::Split {
-            continue;
+/// A row recording a split, as split grouping reads it.
+#[derive(Debug, Clone)]
+pub struct SplitRow {
+    pub id: String,
+    pub asset: AssetId,
+    /// Its business date.
+    pub date: NaiveDate,
+    pub ratio: Decimal,
+    pub is_user_modified: bool,
+    pub source_system: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl SplitRow {
+    /// A stored activity read as `normalize` reads it, when it is a posted
+    /// split of an asset with a positive ratio: dated in `timezone`, its
+    /// ratio its amount, else its quantity.
+    pub fn from_raw(raw: &RawActivity, timezone: &Tz) -> Option<Self> {
+        if !is_posted(&raw.status)
+            || ActivityKind::parse(effective_type(raw)) != Some(ActivityKind::Split)
+        {
+            return None;
         }
-        let Some(asset) = &activity.asset else {
-            continue;
-        };
-        let ratio = if activity.amount.is_some_and(|a| a > Decimal::ZERO) {
-            activity.amount.unwrap_or_default()
-        } else {
-            activity.quantity
-        };
-        if ratio <= Decimal::ZERO {
-            continue;
-        }
-        candidates.entry(asset).or_default().push((activity, ratio));
+        let asset = raw
+            .asset_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        Self::new(
+            raw.id.clone(),
+            AssetId::new(asset),
+            local_date(raw.timestamp, timezone),
+            raw.amount.map(|amount| amount.abs()),
+            raw.quantity.unwrap_or_default().abs(),
+            raw.is_user_modified,
+            raw.source_system
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            raw.updated_at,
+        )
     }
 
-    let rank = |activity: &crate::model::Activity| -> u8 {
-        if activity.is_user_modified {
+    fn from_activity(activity: &Activity) -> Option<Self> {
+        if activity.kind != ActivityKind::Split {
+            return None;
+        }
+        Self::new(
+            activity.id.as_str().to_string(),
+            activity.asset.clone()?,
+            activity.date,
+            activity.amount,
+            activity.quantity,
+            activity.is_user_modified,
+            activity.source_system.clone(),
+            activity.updated_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        id: String,
+        asset: AssetId,
+        date: NaiveDate,
+        amount: Option<Decimal>,
+        quantity: Decimal,
+        is_user_modified: bool,
+        source_system: Option<String>,
+        updated_at: DateTime<Utc>,
+    ) -> Option<Self> {
+        let ratio = amount
+            .filter(|amount| *amount > Decimal::ZERO)
+            .unwrap_or(quantity);
+        (ratio > Decimal::ZERO).then_some(Self {
+            id,
+            asset,
+            date,
+            ratio,
+            is_user_modified,
+            source_system,
+            updated_at,
+        })
+    }
+
+    /// Legacy source ranking: user-modified / MANUAL / CSV / untagged first,
+    /// then other sources, then GENERATED.
+    fn rank(&self) -> u8 {
+        if self.is_user_modified {
             return 3;
         }
-        match activity.source_system.as_deref() {
+        match self.source_system.as_deref() {
             None => 3,
             Some(source)
                 if source.eq_ignore_ascii_case("MANUAL") || source.eq_ignore_ascii_case("CSV") =>
@@ -463,17 +521,28 @@ fn split_events(facts: &CanonicalFacts, range: DateRange) -> Vec<SplitEvent> {
             Some(source) if source.eq_ignore_ascii_case("GENERATED") => 1,
             Some(_) => 2,
         }
-    };
+    }
+}
 
+/// One event per split the rows record (rules R1.5; legacy
+/// `select_shared_split_activities`): rows of one asset within a day of
+/// each other are one split, and its best-ranked row (then the latest
+/// updated, then the id) gives its day and ratio. Sorted by day, then asset.
+pub fn group_splits(rows: impl IntoIterator<Item = SplitRow>) -> Vec<SplitEvent> {
+    const MERGE_GAP_DAYS: i64 = 1;
+    let mut by_asset: BTreeMap<AssetId, Vec<SplitRow>> = BTreeMap::new();
+    for row in rows {
+        by_asset.entry(row.asset.clone()).or_default().push(row);
+    }
     let mut events = Vec::new();
-    for (asset, mut rows) in candidates {
-        rows.sort_by_key(|(activity, _)| activity.date);
-        let mut clusters: Vec<Vec<(&crate::model::Activity, Decimal)>> = Vec::new();
+    for (asset, mut rows) in by_asset {
+        rows.sort_by_key(|row| row.date);
+        let mut clusters: Vec<Vec<SplitRow>> = Vec::new();
         for row in rows {
             match clusters.last_mut() {
                 Some(cluster)
-                    if cluster.last().is_some_and(|(last, _)| {
-                        (row.0.date - last.date).num_days() <= MERGE_GAP_DAYS
+                    if cluster.last().is_some_and(|last| {
+                        (row.date - last.date).num_days() <= MERGE_GAP_DAYS
                     }) =>
                 {
                     cluster.push(row)
@@ -481,22 +550,20 @@ fn split_events(facts: &CanonicalFacts, range: DateRange) -> Vec<SplitEvent> {
                 _ => clusters.push(vec![row]),
             }
         }
-        for mut cluster in clusters {
-            cluster.sort_by(|(left, _), (right, _)| {
-                rank(right)
-                    .cmp(&rank(left))
+        for cluster in clusters {
+            let Some(selected) = cluster.iter().min_by(|left, right| {
+                right
+                    .rank()
+                    .cmp(&left.rank())
                     .then_with(|| right.updated_at.cmp(&left.updated_at))
                     .then_with(|| left.id.cmp(&right.id))
-            });
-            let (selected, ratio) = cluster[0];
-            let split_date = selected.date;
-            if split_date < range.start || split_date > range.end {
+            }) else {
                 continue;
-            }
+            };
             events.push(SplitEvent {
                 asset: asset.clone(),
-                split_date,
-                ratio,
+                split_date: selected.date,
+                ratio: selected.ratio,
             });
         }
     }
@@ -506,6 +573,33 @@ fn split_events(facts: &CanonicalFacts, range: DateRange) -> Vec<SplitEvent> {
             .then_with(|| a.asset.cmp(&b.asset))
     });
     events
+}
+
+/// Product of the ratios of `splits` of `asset` after `from` up to `to`:
+/// what units held on `from` are on `to` (rules R1.5); `None` when the
+/// product leaves the kernel range.
+pub fn split_quantity_factor(
+    splits: &[SplitEvent],
+    asset: &AssetId,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Option<Decimal> {
+    splits
+        .iter()
+        .filter(|event| event.asset == *asset && from < event.split_date && event.split_date <= to)
+        .try_fold(Decimal::ONE, |factor, event| {
+            arith::mul(factor, event.ratio)
+        })
+}
+
+/// Every split the facts record inside `range`; `resolve_surfaces` keeps as
+/// adjusted those whose quote series already looks adjusted around them
+/// (legacy `quotes_appear_split_adjusted`).
+fn split_events(facts: &CanonicalFacts, range: DateRange) -> Vec<SplitEvent> {
+    group_splits(facts.activities.iter().filter_map(SplitRow::from_activity))
+        .into_iter()
+        .filter(|event| range.start <= event.split_date && event.split_date <= range.end)
+        .collect()
 }
 
 fn relative_distance(value: Decimal, target: Decimal) -> Decimal {

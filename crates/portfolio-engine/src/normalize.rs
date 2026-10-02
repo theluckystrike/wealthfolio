@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, NaiveDate, Utc};
+use chrono_tz::Tz;
 use rust_decimal::Decimal;
 
 use crate::diagnostics::{Diagnostic, DiagnosticCode};
@@ -333,7 +334,7 @@ pub fn fx_conflicts(observations: &[FxObservation]) -> Vec<FxConflict> {
     conflicts.into_values().collect()
 }
 
-fn is_posted(status: &str) -> bool {
+pub(crate) fn is_posted(status: &str) -> bool {
     status.trim().eq_ignore_ascii_case("POSTED")
 }
 
@@ -522,6 +523,16 @@ fn snapshot_out_of_range(snapshot: &RawObservedSnapshot) -> bool {
         })
 }
 
+/// The type an activity computes as: its override when not blank, else its
+/// stored type.
+pub(crate) fn effective_type(raw: &RawActivity) -> &str {
+    raw.activity_type_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(raw.activity_type.as_str())
+}
+
 fn canonical_activity(
     raw: RawActivity,
     account: &AccountFacts,
@@ -529,12 +540,7 @@ fn canonical_activity(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Activity {
     let id = ActivityId::new(raw.id.clone());
-    let effective_type = raw
-        .activity_type_override
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(raw.activity_type.as_str());
+    let effective_type = effective_type(&raw);
     let kind = ActivityKind::parse(effective_type).unwrap_or_else(|| {
         diagnostics.push(Diagnostic::error(
             DiagnosticCode::UnknownActivityType,
@@ -572,7 +578,7 @@ fn canonical_activity(
         asset,
         kind,
         subtype,
-        date: local_date(raw.timestamp, policy),
+        date: local_date(raw.timestamp, &policy.timezone),
         timestamp: raw.timestamp,
         created_at: raw.created_at,
         quantity: abs(raw.quantity),
@@ -599,8 +605,8 @@ fn canonical_activity(
 }
 
 /// UTC instant → user-local business date, exactly once (architecture §4.7).
-pub(crate) fn local_date(instant: DateTime<Utc>, policy: &Policy) -> NaiveDate {
-    instant.with_timezone(&policy.timezone).date_naive()
+pub(crate) fn local_date(instant: DateTime<Utc>, timezone: &Tz) -> NaiveDate {
+    instant.with_timezone(timezone).date_naive()
 }
 
 /// `$CASH-USD`, `CASH_USD`, `CASH:USD` placeholders (case-insensitive).
@@ -893,6 +899,66 @@ mod tests {
             fx_rates: vec![],
             observed_snapshots: vec![],
         }
+    }
+
+    #[test]
+    fn a_stored_split_row_reads_as_normalize_reads_it() {
+        use crate::model::DateRange;
+        use crate::resolve::{group_splits, resolve_surfaces, SplitEvent, SplitRow};
+        let tz = chrono_tz::America::New_York;
+        let split = |id: &str, ts: &str, asset: &str| RawActivity {
+            asset_id: Some(asset.into()),
+            amount: Some(dec!(-2)),
+            ..activity(id, "a1", "SPLIT", ts)
+        };
+        // 03:00 UTC on 01-03 is 01-02 in New York.
+        let user = split("s1", "2025-01-03T03:00:00Z", "x");
+        // A blank override is none; a provider's row a day later is the
+        // same split, and the user's wins.
+        let provider = RawActivity {
+            activity_type_override: Some(" ".into()),
+            source_system: Some("GENERATED".into()),
+            amount: Some(dec!(3)),
+            ..split("s2", "2025-01-03T15:00:00Z", "x")
+        };
+        let draft = RawActivity {
+            status: "DRAFT".into(),
+            ..split("s3", "2025-01-10T15:00:00Z", "x")
+        };
+        let by_quantity = RawActivity {
+            amount: None,
+            quantity: Some(dec!(4)),
+            ..split("s4", "2025-01-20T15:00:00Z", "y")
+        };
+        let buy = activity("b1", "a1", "BUY", "2025-01-05T15:00:00Z");
+        let rows = vec![user, provider, draft, by_quantity, buy];
+
+        let stored: Vec<SplitRow> = rows
+            .iter()
+            .filter_map(|row| SplitRow::from_raw(row, &tz))
+            .collect();
+        let normalized = normalize(facts(rows, tz)).unwrap();
+        let range = DateRange {
+            start: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            end: NaiveDate::from_ymd_opt(2025, 12, 31).unwrap(),
+        };
+        let resolved = resolve_surfaces(&normalized.facts, range).recorded_splits;
+        assert_eq!(group_splits(stored), resolved);
+        assert_eq!(
+            resolved,
+            vec![
+                SplitEvent {
+                    asset: AssetId::new("x"),
+                    split_date: NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+                    ratio: dec!(2),
+                },
+                SplitEvent {
+                    asset: AssetId::new("y"),
+                    split_date: NaiveDate::from_ymd_opt(2025, 1, 20).unwrap(),
+                    ratio: dec!(4),
+                },
+            ]
+        );
     }
 
     #[test]
