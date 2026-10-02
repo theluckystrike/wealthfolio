@@ -1301,8 +1301,9 @@ impl Projector<'_> {
             .map(|lot| lot.quantity.is_sign_negative())
             .unwrap_or(false);
         let staged_abs: Decimal = lots.iter().map(|l| l.effective_quantity().abs()).sum();
-        // A shortfall below the fold's dust (a split's rounding) is none.
-        let missing = if incoming_negative || !is_significant(quantity - staged_abs) {
+        // A shortfall below the fold's dust (a split's rounding) is none. A
+        // short arrives in full too, the lacked units as a short (rules R2.5).
+        let missing = if !is_significant(quantity - staged_abs) {
             Decimal::ZERO
         } else {
             (quantity - staged_abs).max(Decimal::ZERO)
@@ -1318,7 +1319,7 @@ impl Projector<'_> {
             lots.push(self.transfer_lot(
                 event,
                 &info,
-                missing,
+                if incoming_negative { -missing } else { missing },
                 quantity,
                 unit_price,
                 legacy_amount,

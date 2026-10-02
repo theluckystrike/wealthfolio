@@ -2114,19 +2114,23 @@ fn p_txf_legs_transfers_carry_their_lots() {
                 .map(|l| l.original_quantity * l.split_ratio)
                 .sum::<Decimal>()
                 - covering.iter().map(|d| d.quantity).sum::<Decimal>();
-            // The receiver books the units its own activity records; the
-            // sender gives what it held (nothing when it held none), so a
-            // shortfall (a history that starts after the units were acquired)
-            // arrives at the transfer's price and is the only difference.
+            // The receiver books the units its own activity records, a short
+            // as a short; the sender gives what it held (nothing when it held
+            // none), so a shortfall (a history that starts after the units
+            // were acquired) arrives at the transfer's price and is the only
+            // difference (rules R2.1, R2.5).
             let missing = *quantity - sent_units.abs();
             let topped_up = missing > DUST;
+            let sign = if sent_units.is_sign_negative() {
+                Decimal::NEGATIVE_ONE
+            } else {
+                Decimal::ONE
+            };
             if !split_since {
-                if sent_units.is_sign_positive() {
-                    assert!(
-                        (received_units - quantity).abs() <= DUST,
-                        "{id}: units {received_units} received, the activity records {quantity}"
-                    );
-                }
+                assert!(
+                    (received_units - sign * quantity).abs() <= DUST,
+                    "{id}: units {received_units} received, the activity records {quantity}"
+                );
                 assert!(
                     topped_up || (received_units - sent_units).abs() <= DUST,
                     "{id}: units {received_units} received, {sent_units} sent"
@@ -2136,9 +2140,8 @@ fn p_txf_legs_transfers_carry_their_lots() {
             // Cost in base: what the sender removed, plus the units it lacked
             // at the transfer's price. A leg's fee is capitalised into the
             // lots it delivers (§ the TRANSFER_IN row): costs compare only
-            // without one; a short's shortfall is left to the goldens. Units
-            // that cover keep their cost at the rates they were acquired at,
-            // as opened lots do (rules R2.4, EDGE-TXF-16).
+            // without one. Units that cover keep their cost at the rates they
+            // were acquired at, as opened lots do (rules R2.4, EDGE-TXF-16).
             let fees = !out.charges.fee.is_zero() || !incoming.charges.fee.is_zero();
             let sent_base: Decimal = removed.iter().map(|d| d.cost_basis_base).sum();
             let topped_up_base = if topped_up {
@@ -2156,7 +2159,7 @@ fn p_txf_legs_transfers_carry_their_lots() {
                             .map(|a| a.contract_multiplier)
                             .unwrap_or(Decimal::ONE);
                         fx.convert(
-                            missing * activity.unit_price * unit * multiplier,
+                            sign * missing * activity.unit_price * unit * multiplier,
                             major,
                             base,
                             incoming.date,
@@ -2166,7 +2169,7 @@ fn p_txf_legs_transfers_carry_their_lots() {
                 Some(Decimal::ZERO)
             };
             let moved_base = topped_up_base
-                .filter(|_| !fees && (!topped_up || !sent_units.is_sign_negative()))
+                .filter(|_| !fees)
                 .map(|topped_up_base| sent_base + topped_up_base);
             if let Some(moved_base) = moved_base {
                 let covered_base: Decimal = covering
