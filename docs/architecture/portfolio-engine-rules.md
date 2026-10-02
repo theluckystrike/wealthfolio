@@ -24,8 +24,9 @@ that day's prices; if either side is not fully priced, the flow is undetermined.
 Users may record any activity on a holdings account, transfers included, but the
 engine never uses a holdings account's activities for those numbers: deposits
 and withdrawals are inside the next snapshot, and dividends, interest, fees and
-taxes feed only the income, fees and taxes reports. Fixtures: EDGE-MIX-04,
-NOM-MIX-01.
+taxes feed only the income, fees and taxes reports. The one exception is a
+split, which is a fact about the asset, not an account activity (R1.5).
+Fixtures: EDGE-MIX-04, NOM-MIX-01.
 
 **R1.3 A scope's first day** carries no flow: it is where returns start.
 
@@ -35,6 +36,15 @@ brought in that day, or its net contribution when it recorded none; a holdings
 account brings its first snapshot's value (undetermined when not fully priced).
 Fixtures: EDGE-MIX-02, LIFE-EMPTY-01.
 
+**R1.5 Splits are facts about the asset.** A split recorded on any account, a
+holdings account included, applies to every holder of the asset. A transactions
+account's lots split on the split day. A holdings snapshot states quantities as
+of its own date: on any later day, they are multiplied by every split after that
+date up to the day, whether the data provider adjusted its prices or not, and
+the next snapshot is compared with them that way. Prices from before a split
+that the provider adjusted are read back at their unadjusted level. Fixtures:
+EDGE-SPLIT-01, EDGE-SPLIT-02, EDGE-SPLIT-03.
+
 ## 2. Transfers
 
 **R2.1 Between two transactions accounts in the scope.**
@@ -43,11 +53,16 @@ Fixtures: EDGE-MIX-02, LIFE-EMPTY-01.
   priced on the units it actually removed, and is no flow when it held none. The
   receiver books the quantity its own activity records; units the sender lacked
   arrive at the transfer's price.
-- At the scope, the outgoing leg nets whole and the incoming leg nets in the
-  share of units the sender gave (out units ÷ in units), computed from both legs
-  whatever a dated read cuts. What remains is money from outside the history. A
-  cash pair nets whole: a rate difference between its legs is a gain (#1655).
-- Fixtures: EDGE-TXF-02, EDGE-TXF-09, EDGE-TXF-12, EDGE-TXF-14.
+- At the scope, the outgoing leg nets whole, and so does the incoming leg when
+  the sender gave every unit. When the sender lacked some, what remains of the
+  incoming leg is money from outside the history, from both legs whatever a
+  dated read cuts: priced at a quote, the leg nets in the share of units the
+  sender gave (out units ÷ in units); valued at cost (R2.4), it nets the cost
+  the sender removed, so the cost booked for the units it lacked remains. A cash
+  pair nets whole: a rate difference between its legs is a gain (#1655).
+- Each leg is equal and opposite to the other in units, not in amount: each is
+  priced on its own day.
+- Fixtures: EDGE-TXF-02, EDGE-TXF-09, EDGE-TXF-12, EDGE-TXF-14, EDGE-TXF-19.
 
 **R2.2 A currency conversion inside one account.** When the import linker
 recorded it, it moves no money in or out and a better rate than the market's is
@@ -65,13 +80,14 @@ or out (§7). Fixtures: EDGE-MIX-03, EDGE-MIX-05.
 **R2.4 A transfer without a quote** is valued at cost.
 
 - The outgoing leg flows the cost it removed.
-- The incoming leg flows the cost of every unit it delivered, less its own
-  capitalised fee: the lots it opened, plus the units that covered a short in
-  the receiving account.
+- The incoming leg flows the cost of every unit it delivered: the lots it
+  opened, plus the units that covered a short in the receiving account, less the
+  part of its own fee capitalised into those lots. A transfer that only covers
+  opens no lot and capitalises nothing: its fee is a charge, not money out.
 - Covered units carry the sender's cost at its historical rates to the base
-  currency, as opened lots do; a transfer cover's realized P&L in base uses that
-  cost.
-- Fixtures: EDGE-TXF-15, EDGE-TXF-16.
+  currency, as opened lots do, whether or not a rate exists on the transfer day;
+  a transfer cover's realized P&L in base uses that cost.
+- Fixtures: EDGE-TXF-15, EDGE-TXF-16, EDGE-TXF-17, EDGE-TXF-18.
 
 **R2.5 Moving a short** is a liability changing hands: sending it is money in,
 receiving it money out. Fixtures: EDGE-TXF-07, EDGE-TXF-08.
@@ -80,12 +96,18 @@ receiving it money out. Fixtures: EDGE-TXF-07, EDGE-TXF-08.
 
 **R3.1** An activity's day is its business date in the portfolio's time zone.
 
-**R3.2** A quote's day is the UTC date of its timestamp. Normal writes store
-both consistently; synced rows are normalized where applied (R6.1).
+**R3.2** A quote's timestamp is an instant in UTC (one without a time zone means
+UTC), and its day is that instant's UTC date. Normal writes store both
+consistently; synced rows are normalized where applied (R6.1).
 
 **R3.3** A sale's or cover's proceeds convert to the base currency at the
 disposal day's rate; costs at their acquisition rate, so realized P&L in base
 includes the currency move. Exception: R2.4's covered units.
+
+**R3.4** A rate is the exact day's, else the nearest observation before or after
+(on a tie, the one before), direct, inverse or through other currencies. Only
+when no path exists at all is an amount in the base currency unknown: it is
+recorded as zero, with a currency warning.
 
 ## 4. Dated reads
 
@@ -102,18 +124,19 @@ Every fact the engine reads leaves a marker in `projection_state` when it
 changes, in the same transaction, from the earliest day it can affect. `GENESIS`
 is `0001-01-01`; `@all` refolds every account from `GENESIS`.
 
-| Fact              | Change                                                                                                    | Marker and earliest day                                                                                                                            |
-| ----------------- | --------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Account           | insert                                                                                                    | the account, from `GENESIS` (sync can deliver its snapshots first)                                                                                 |
-| Account           | currency, type, tracking mode, archived, accounting method, profile, pooling scope, lot selection         | the account, from `GENESIS`                                                                                                                        |
-| Activity          | insert, update, delete (any field)                                                                        | old and new accounts, from the day before their old and new dates; transfer partners likewise; a split's old and new assets from `GENESIS`         |
-| Asset             | insert                                                                                                    | its holders, from `GENESIS` (sync can deliver snapshots naming it first; an FX asset's rates cannot precede it, quotes reference their asset)      |
-| Asset             | kind, quote currency, instrument type, option, contract multiplier, and an FX asset's `instrument_symbol` | its holders from `GENESIS`; an FX asset, or one becoming or ceasing to be FX: `@all`                                                               |
-| Asset             | delete                                                                                                    | as its kind was: its holders from `GENESIS`, or `@all` for an FX asset                                                                             |
-| Quote             | insert, update, delete                                                                                    | its asset's prices (an FX asset's: conversions) from the earliest of its old and new `day` and timestamp dates; old and new assets when reassigned |
-| Observed snapshot | insert, update, delete                                                                                    | its account from its date; old and new accounts, each from its own date, when reassigned                                                           |
-| Snapshot position | insert, update, delete                                                                                    | its snapshot's account from the snapshot's date                                                                                                    |
-| Settings          | base currency, time zone                                                                                  | `@all`                                                                                                                                             |
+| Fact              | Change                                                                                            | Marker and earliest day                                                                                                                                                                        |
+| ----------------- | ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Account           | insert                                                                                            | the account, from `GENESIS` (sync can deliver its snapshots first)                                                                                                                             |
+| Account           | currency, type, tracking mode, archived, accounting method, profile, pooling scope, lot selection | the account, from `GENESIS`                                                                                                                                                                    |
+| Activity          | insert, update, delete (any field)                                                                | old and new accounts, from the day before their old and new dates; transfer partners likewise; a split's old and new assets from `GENESIS`                                                     |
+| Asset             | insert                                                                                            | its holders, from `GENESIS` (sync can deliver snapshots naming it first); an FX asset whose rates arrived before it (a sync batch defers foreign keys): its conversions from its earliest rate |
+| Asset             | kind, quote currency, instrument type, option, contract multiplier                                | its holders, from `GENESIS`                                                                                                                                                                    |
+| Asset             | an FX asset's pair (`instrument_symbol`, `quote_ccy`), or an asset becoming or ceasing to be FX   | `@all`                                                                                                                                                                                         |
+| Asset             | delete                                                                                            | as its kind was: its holders from `GENESIS`, or `@all` for an FX asset                                                                                                                         |
+| Quote             | insert, update, delete                                                                            | its asset's prices (an FX asset's: conversions) from the earliest of its old and new `day` and timestamp dates; old and new assets when reassigned                                             |
+| Observed snapshot | insert, update, delete                                                                            | its account from its date; old and new accounts, each from its own date, when reassigned                                                                                                       |
+| Snapshot position | insert, update, delete                                                                            | its old and new snapshots' accounts, each from its snapshot's date                                                                                                                             |
+| Settings          | base currency or time zone inserted, changed, renamed to or from, or deleted                      | `@all`                                                                                                                                                                                         |
 
 A run consumes a marker only after writing what it covers. An account or asset
 that arrives after facts naming it marks itself on insert (rows above), so a run
@@ -121,7 +144,11 @@ that could not project it yet projects it once it exists.
 
 ## 6. Data normalized where written
 
-**R6.1** When sync applies a quote, its day is set from its timestamp (R3.2).
+**R6.1** When sync applies a quote, incrementally or by restoring a snapshot,
+its timestamp is rewritten as a UTC instant and its day set from it (R3.2). A
+synced quote whose timestamp cannot be read is skipped, with a log entry. Synced
+quote updates carry complete rows. Rows already stored are not repaired: local
+writes keep them consistent, and only sync could have written inconsistent ones.
 
 **R6.2** Sync may move a quote to another asset or a snapshot to another
 account; both owners are invalidated (§5).
@@ -144,4 +171,5 @@ account; both owners are invalidated (§5).
   with itself (determinism, windows, renaming), it proves consistency, not these
   rules; the fixtures above prove the rules.
 - §5 is checked mechanically: a storage test changes every column the engine
-  reads, one at a time, and fails when the change leaves no marker.
+  reads, one at a time, and fails unless the change leaves the marker scope and
+  earliest day the table states.
