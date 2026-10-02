@@ -19,7 +19,7 @@ use crate::compile::CompiledLedger;
 use crate::diagnostics::{Diagnostic, DiagnosticCode};
 use crate::error::EngineError;
 use crate::model::*;
-use crate::project::{lot_records, position_book_cost};
+use crate::project::{in_position_currency, lot_records, position_book_cost};
 use crate::resolve::{FxResolver, ResolvedSurfaces};
 
 /// A quote or FX rate carried at least this many days is reported once per
@@ -1155,14 +1155,32 @@ impl<'a> Valuer<'a> {
                 let booked = self
                     .booked
                     .and_then(|b| b.get(&(event.account.clone(), event.source.clone())))
-                    .copied();
+                    .cloned();
                 if let (true, Some(booked)) = (paired, booked) {
-                    let fee = if booked.opened_lots {
-                        event.charges.fee
-                    } else {
-                        Decimal::ZERO
+                    // The fee comes off as it was capitalised: in the lots'
+                    // currency, at their rates (rules R2.4).
+                    let fee = match &booked.fee_rate {
+                        Some((currency, rate)) if !event.charges.fee.is_zero() => {
+                            let account_currency = self
+                                .resolved
+                                .facts
+                                .accounts
+                                .get(&event.account)
+                                .map(|account| account.currency.as_str())
+                                .unwrap_or_default();
+                            in_position_currency(
+                                &self.fx,
+                                event,
+                                [Decimal::ZERO, event.charges.fee, Decimal::ZERO],
+                                currency.as_str(),
+                                account_currency,
+                            )
+                            .ok()
+                            .and_then(|(_, fee, _, _)| arith::mul(fee, *rate))
+                        }
+                        _ => Some(Decimal::ZERO),
                     };
-                    if let Some(fee) = self.flow_to_base(fee, event.currency.as_str(), event) {
+                    if let Some(fee) = fee {
                         // A short's cost is negative; its direction is the
                         // leg's (`TransferRecords::short`).
                         return ((booked.cost - fee).abs(), source);
@@ -1307,14 +1325,29 @@ struct TransferRecords {
     booked: BTreeMap<(AccountId, ActivityId), BookedCost>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct BookedCost {
     /// Cost in base of the lots the leg opened and the opposite position it
     /// covered.
     cost: Decimal,
-    /// Whether it opened lots: its fee is capitalised into them, so a leg
-    /// that only covered carries no fee in its cost.
-    opened_lots: bool,
+    /// The opened lots' currency and their rate to the base weighted by
+    /// units, as the fee capitalised into them is shared; `None` when the
+    /// leg opened none, so its cost carries no fee.
+    fee_rate: FeeRate,
+}
+
+type FeeRate = Option<(Currency, Decimal)>;
+
+/// What an incoming leg opened in its account.
+struct Opened {
+    units: Decimal,
+    /// `None` when a lot has no rate to the base, or its weight leaves the
+    /// kernel range.
+    cost: Option<Decimal>,
+    currency: Currency,
+    /// Σ units × rate to the base, and Σ units, of its lots.
+    rated: Decimal,
+    weight: Decimal,
 }
 
 fn transfer_records(
@@ -1322,20 +1355,33 @@ fn transfer_records(
     lots: &[LotRecord],
     disposals: &[LotDisposal],
 ) -> TransferRecords {
-    // Signed units and base cost each activity opened in each account; the
-    // cost is unknown (`None`) when a lot has no rate to the base.
-    let mut opened: BTreeMap<(AccountId, ActivityId), (Decimal, Option<Decimal>)> = BTreeMap::new();
+    let mut opened: BTreeMap<(AccountId, ActivityId), Opened> = BTreeMap::new();
     for lot in lots {
         if let Some(activity) = &lot.open_activity {
             let entry = opened
                 .entry((lot.account.clone(), activity.clone()))
-                .or_insert((Decimal::ZERO, Some(Decimal::ZERO)));
-            entry.0 += lot.original_quantity;
+                .or_insert_with(|| Opened {
+                    units: Decimal::ZERO,
+                    cost: Some(Decimal::ZERO),
+                    currency: lot.currency.clone(),
+                    rated: Decimal::ZERO,
+                    weight: Decimal::ZERO,
+                });
+            entry.units += lot.original_quantity;
             let known = !lot.fx_rate_to_base.is_zero() || lot.original_cost_basis.is_zero();
-            entry.1 = entry
-                .1
-                .filter(|_| known)
+            // The fee is shared by the units each lot held when it opened.
+            let weighted = arith::mul(lot.original_quantity, lot.split_ratio).and_then(|weight| {
+                let weight = weight.abs();
+                Some((weight, arith::mul(weight, lot.fx_rate_to_base)?))
+            });
+            entry.cost = entry
+                .cost
+                .filter(|_| known && weighted.is_some())
                 .map(|cost| cost + lot.original_cost_basis_base);
+            if let Some((weight, rated)) = weighted {
+                entry.weight += weight;
+                entry.rated += rated;
+            }
         }
     }
     let mut short = BTreeSet::new();
@@ -1370,7 +1416,7 @@ fn transfer_records(
         let moved_short = match direction {
             Direction::Out => !disposed.is_empty() && disposed.iter().all(|q| q.is_sign_negative()),
             Direction::In => match opened.get(&(event.account.clone(), event.source.clone())) {
-                Some((units, _)) if !units.is_zero() => units.is_sign_negative(),
+                Some(opened) if !opened.units.is_zero() => opened.units.is_sign_negative(),
                 _ => !disposed.is_empty() && disposed.iter().all(|q| q.is_sign_positive()),
             },
         };
@@ -1378,20 +1424,24 @@ fn transfer_records(
             short.insert(event.source.clone());
         }
     }
-    let mut booked: BTreeMap<(AccountId, ActivityId), (Option<Decimal>, bool)> = opened
+    let mut booked: BTreeMap<(AccountId, ActivityId), (Option<Decimal>, FeeRate)> = opened
         .into_iter()
-        .map(|(key, (_, cost))| (key, (cost, true)))
+        .map(|(key, opened)| {
+            let fee_rate =
+                arith::div(opened.rated, opened.weight).map(|rate| (opened.currency, rate));
+            (key, (opened.cost, fee_rate))
+        })
         .collect();
     for (key, cost) in covered {
-        let total = booked.entry(key).or_insert((Some(Decimal::ZERO), false));
+        let total = booked.entry(key).or_insert((Some(Decimal::ZERO), None));
         total.0 = total.0.zip(cost).map(|(opened, covered)| opened + covered);
     }
     TransferRecords {
         short,
         booked: booked
             .into_iter()
-            .filter_map(|(key, (cost, opened_lots))| {
-                cost.map(|cost| (key, BookedCost { cost, opened_lots }))
+            .filter_map(|(key, (cost, fee_rate))| {
+                cost.map(|cost| (key, BookedCost { cost, fee_rate }))
             })
             .collect(),
     }

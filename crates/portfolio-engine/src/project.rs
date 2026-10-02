@@ -1698,35 +1698,13 @@ impl Projector<'_> {
         position_currency: &str,
         account_currency: &str,
     ) -> Result<(Decimal, Decimal, Decimal, Option<Decimal>), String> {
-        let activity_currency = event.currency.as_str();
-        if position_currency.is_empty() || position_currency == activity_currency {
-            return Ok((unit_price, fee, tax, None));
-        }
-        let can_use_rate =
-            position_currency == account_currency || activity_currency == account_currency;
-        if can_use_rate {
-            if let Some(rate) = self.explicit_rate(event) {
-                let at_rate = |amount: Decimal| {
-                    checked(arith::mul(amount, rate), "amount at the supplied rate")
-                };
-                return Ok((
-                    at_rate(unit_price)?,
-                    at_rate(fee)?,
-                    at_rate(tax)?,
-                    Some(rate),
-                ));
-            }
-        }
-        let convert = |amount: Decimal, what: &str| {
-            self.fx
-                .convert(amount, activity_currency, position_currency, event.date)
-                .ok_or_else(|| format!("failed to convert {what} from {activity_currency} to {position_currency} on {}", event.date))
-        };
-        let price = convert(unit_price, "unit_price")?;
-        let fee = convert(fee, "fee")?;
-        let tax = convert(tax, "tax")?;
-        let fx_used = arith::div(price, unit_price);
-        Ok((price, fee, tax, fx_used))
+        in_position_currency(
+            self.fx,
+            event,
+            [unit_price, fee, tax],
+            position_currency,
+            account_currency,
+        )
     }
 
     /// Legacy `convert_activity_amount_to_position_currency` (hard failure).
@@ -2182,6 +2160,51 @@ impl Projector<'_> {
             })
             .unwrap_or(Decimal::ZERO)
     }
+}
+
+/// An activity's unit price, fee and tax in its position's currency, and
+/// the rate used: as recorded when the currencies agree, at the activity's
+/// own rate when one side is the account's currency, else at the day's rate.
+/// Projection and valuation convert alike.
+pub(crate) fn in_position_currency(
+    fx: &FxResolver<'_>,
+    event: &EconomicEvent,
+    [unit_price, fee, tax]: [Decimal; 3],
+    position_currency: &str,
+    account_currency: &str,
+) -> Result<(Decimal, Decimal, Decimal, Option<Decimal>), String> {
+    let activity_currency = event.currency.as_str();
+    if position_currency.is_empty() || position_currency == activity_currency {
+        return Ok((unit_price, fee, tax, None));
+    }
+    let can_use_rate =
+        position_currency == account_currency || activity_currency == account_currency;
+    if can_use_rate {
+        if let Some(rate) = event.fx_rate {
+            let at_rate =
+                |amount: Decimal| checked(arith::mul(amount, rate), "amount at the supplied rate");
+            return Ok((
+                at_rate(unit_price)?,
+                at_rate(fee)?,
+                at_rate(tax)?,
+                Some(rate),
+            ));
+        }
+    }
+    let convert = |amount: Decimal, what: &str| {
+        fx.convert(amount, activity_currency, position_currency, event.date)
+            .ok_or_else(|| {
+                format!(
+                    "failed to convert {what} from {activity_currency} to {position_currency} on {}",
+                    event.date
+                )
+            })
+    };
+    let price = convert(unit_price, "unit_price")?;
+    let fee = convert(fee, "fee")?;
+    let tax = convert(tax, "tax")?;
+    let fx_used = arith::div(price, unit_price);
+    Ok((price, fee, tax, fx_used))
 }
 
 /// What the units a reduction removes receive.
