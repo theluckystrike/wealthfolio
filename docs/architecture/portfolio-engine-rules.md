@@ -78,7 +78,7 @@ netted as a pair. The transactions side is money (or shares) leaving or entering
 the scope on its day, as a transfer to or from outside: the fold does not wait
 for the holdings side. The holdings side counts when its next snapshot shows it
 (R1.2), at that snapshot's prices, so a price move in between reads as money in
-or out (§7). Fixtures: EDGE-MIX-03, EDGE-MIX-05.
+or out (§7). Fixtures: EDGE-MIX-03, EDGE-MIX-05, EDGE-MIX-06.
 
 **R2.4 A transfer without a quote** is valued at cost.
 
