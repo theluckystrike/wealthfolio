@@ -1647,30 +1647,36 @@ fn internal_adjustments<'a>(
         let (incoming, outgoing) = (leg(&pair.transfer_in), leg(&pair.transfer_out));
         // A security pair whose sender held less than it sent books the
         // difference in the receiver (a history that starts after those
-        // units were acquired): only the units the sender gave are internal,
-        // so the incoming leg nets in that share and the rest entered the
-        // scope. Each leg nets at its own day's price, so a price move
-        // between them stays a return. A cash pair nets whole: a rate
-        // difference between its legs is a gain, not a flow (#1655).
-        let incoming_share = match (incoming, outgoing) {
+        // units were acquired): only what the sender gave is internal, and
+        // the rest of the incoming leg entered the scope (rules R2.1). Priced
+        // at a quote, the leg nets in the share of units the sender gave,
+        // each leg at its own day's price, so a price move between them
+        // stays a return; valued at cost, it nets the cost the sender
+        // removed. A cash pair nets whole: a rate difference between its
+        // legs is a gain, not a flow (#1655).
+        let incoming_netted = match (incoming, outgoing) {
             (Some((_, inflow)), Some((_, outflow)))
                 if pair.security && inflow.units > outflow.units =>
             {
-                arith::div(outflow.units, inflow.units).unwrap_or(Decimal::ONE)
+                if inflow.source == FlowSource::QuoteDerivedMarketValue {
+                    arith::div(outflow.units, inflow.units)
+                        .and_then(|share| arith::mul(inflow.amount, share))
+                } else {
+                    Some(outflow.amount.min(inflow.amount))
+                }
             }
-            _ => Decimal::ONE,
+            _ => incoming.map(|(_, inflow)| inflow.amount),
         };
-        for (event, flow, share) in [
-            incoming.map(|(event, flow)| (event, flow, incoming_share)),
-            outgoing.map(|(event, flow)| (event, flow, Decimal::ONE)),
+        for (event, flow, amount) in [
+            incoming
+                .zip(incoming_netted)
+                .map(|((event, flow), amount)| (event, flow, amount)),
+            outgoing.map(|(event, flow)| (event, flow, flow.amount)),
         ]
         .into_iter()
         .flatten()
         .filter(|(event, ..)| window.contains(event.date))
         {
-            let Some(amount) = arith::mul(flow.amount, share) else {
-                continue;
-            };
             if amount.is_zero() {
                 continue;
             }

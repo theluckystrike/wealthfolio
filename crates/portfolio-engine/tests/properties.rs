@@ -1074,7 +1074,8 @@ fn p_agg_scope_aggregation_is_exact() {
             .collect();
         // The legs of transfers inside the scope, signed (incoming adds,
         // outgoing takes away), by account and day: an outgoing leg whole,
-        // an incoming one in the share of units its sender gave.
+        // an incoming one for what its sender gave (rules R2.1): priced at a
+        // quote, in the share of units it gave; at cost, the cost it removed.
         // A transfer with a holdings account is not a pair here: its side
         // shows up in that account's snapshots.
         let mut legs: BTreeMap<(&AccountId, NaiveDate), Decimal> = BTreeMap::new();
@@ -1091,27 +1092,27 @@ fn p_agg_scope_aggregation_is_exact() {
                     .and_then(|event| event.flow.map(|flow| (*event, flow)))
             };
             let (incoming, outgoing) = (leg(&pair.transfer_in), leg(&pair.transfer_out));
-            let share = match (incoming, outgoing) {
+            let given = match (incoming, outgoing) {
                 (Some((_, inflow)), Some((_, outflow)))
                     if pair.security && inflow.units > outflow.units =>
                 {
-                    outflow.units / inflow.units
+                    if inflow.source == FlowSource::QuoteDerivedMarketValue {
+                        inflow.amount * outflow.units / inflow.units
+                    } else {
+                        outflow.amount.min(inflow.amount)
+                    }
                 }
-                _ => Decimal::ONE,
+                _ => incoming.map_or(Decimal::ZERO, |(_, inflow)| inflow.amount),
             };
-            for (event, flow, share) in [
-                incoming.map(|(event, flow)| (event, flow, share)),
-                outgoing.map(|(event, flow)| (event, flow, Decimal::ONE)),
+            for (event, flow, amount) in [
+                incoming.map(|(event, flow)| (event, flow, given)),
+                outgoing.map(|(event, flow)| (event, flow, flow.amount)),
             ]
             .into_iter()
             .flatten()
             {
-                let signed = if flow.leg_outflow {
-                    -flow.amount
-                } else {
-                    flow.amount
-                };
-                *legs.entry((&event.account, event.date)).or_default() += signed * share;
+                let signed = if flow.leg_outflow { -amount } else { amount };
+                *legs.entry((&event.account, event.date)).or_default() += signed;
             }
         }
         // What an account adds to the scope on a day, net: its row's flow,

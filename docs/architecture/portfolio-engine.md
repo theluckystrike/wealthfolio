@@ -444,8 +444,8 @@ pub fn effects(resolved: &Resolved<'_>, disposals: &[LotDisposal]) -> Effects;
 
 /// Scope aggregation: per-day sums in base currency. Each account adds its
 /// own flows less its legs of internal transfers (both legs in scope; an
-/// incoming leg in the share of units its sender gave, wherever a dated read
-/// starts). A transfer with a holdings account is not netted as a pair: its
+/// incoming leg for what its sender gave, wherever a dated read starts: the
+/// share of units when quoted, the cost it removed when at cost). A transfer with a holdings account is not netted as a pair: its
 /// side shows up in that account's snapshots. An account opening inside the
 /// scope adds the money that opened it: a holdings account its first
 /// snapshot's value.
