@@ -363,6 +363,7 @@ fn value_windowed(
             quotes: QuoteSurface::from_observations(&observations),
             fx: pipeline.surfaces().fx.clone(),
             splits: pipeline.surfaces().splits.clone(),
+            recorded_splits: pipeline.surfaces().recorded_splits.clone(),
         };
         let series = value_window(
             &ValueInputs {
@@ -751,7 +752,8 @@ fn p_txf_internal_pairs_cancel_at_portfolio_scope() {
 }
 
 /// P-RECON (I8): a complete day's values re-derive from the keyframe (a
-/// holdings account's observed snapshot) and the public surfaces alone. Investments are Σ quantity × latest close (in the
+/// holdings account's observed snapshot, its units carried across the
+/// recorded splits since) and the public surfaces alone. Investments are Σ quantity × latest close (in the
 /// quote currency's major unit) × contract multiplier × FX into the account
 /// currency; cash is Σ bucket × FX. This walks `project` keyframes and
 /// `resolve` surfaces directly, never `value`'s own bookkeeping, so it is an
@@ -819,7 +821,20 @@ fn p_recon_complete_days_rederive_from_keyframes_and_surfaces() {
                                     .assets()
                                     .get(asset)
                                     .is_some_and(|a| a.alternative);
-                                (asset, p.quantity, alternative)
+                                // Its units, carried across the splits after
+                                // it (rules R1.5).
+                                let split: Decimal = pipeline
+                                    .surfaces()
+                                    .recorded_splits
+                                    .iter()
+                                    .filter(|s| {
+                                        &s.asset == asset
+                                            && snapshot.date < s.split_date
+                                            && s.split_date <= day.date
+                                    })
+                                    .map(|s| s.ratio)
+                                    .product();
+                                (asset, p.quantity * split, alternative)
                             })
                             .collect(),
                         snapshot.cash.iter().map(|(c, a)| (c, *a)).collect(),

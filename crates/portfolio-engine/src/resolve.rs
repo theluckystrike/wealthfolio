@@ -344,8 +344,8 @@ impl QuoteSurface {
     }
 }
 
-/// A split whose quote series is already provider-adjusted, so closes before
-/// `split_date` must be multiplied by `ratio` when pricing pre-split holdings.
+/// A split of an asset: from `split_date`, each earlier unit is `ratio`
+/// units.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SplitEvent {
     pub asset: AssetId,
@@ -358,7 +358,13 @@ pub struct SplitEvent {
 pub struct ResolvedSurfaces {
     pub quotes: QuoteSurface,
     pub fx: FxSurface,
+    /// Splits whose quote series is already provider-adjusted, so closes
+    /// before the split are multiplied by its ratio to price pre-split units.
     pub splits: Vec<SplitEvent>,
+    /// Every split, whichever account recorded it and whether or not the
+    /// provider adjusted its prices: what a holdings snapshot's quantities
+    /// are carried across (rules R1.5).
+    pub recorded_splits: Vec<SplitEvent>,
 }
 
 impl ResolvedSurfaces {
@@ -372,25 +378,56 @@ impl ResolvedSurfaces {
                 arith::mul(factor, event.ratio)
             })
     }
+
+    /// Product of the ratios of recorded splits after `from` up to `to`:
+    /// what quantities held on `from` are on `to`; `None` when the product
+    /// leaves the kernel range.
+    pub fn split_quantity_factor(
+        &self,
+        asset: &AssetId,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Option<Decimal> {
+        self.recorded_splits
+            .iter()
+            .filter(|event| {
+                event.asset == *asset && from < event.split_date && event.split_date <= to
+            })
+            .try_fold(Decimal::ONE, |factor, event| {
+                arith::mul(factor, event.ratio)
+            })
+    }
 }
 
 pub fn resolve_surfaces(facts: &CanonicalFacts, range: DateRange) -> ResolvedSurfaces {
     let quotes = QuoteSurface::from_observations(&facts.quotes);
     let fx = FxSurface::from_observations(&facts.fx_rates);
-    let splits = adjusted_split_events(facts, &quotes, range);
-    ResolvedSurfaces { quotes, fx, splits }
+    let recorded_splits = split_events(facts, range);
+    let splits = recorded_splits
+        .iter()
+        .filter(|event| {
+            quotes_appear_split_adjusted(
+                &quotes.positive_closes(&event.asset),
+                event.split_date,
+                event.ratio,
+            )
+        })
+        .cloned()
+        .collect();
+    ResolvedSurfaces {
+        quotes,
+        fx,
+        splits,
+        recorded_splits,
+    }
 }
 
 /// Legacy `select_shared_split_activities` + `quotes_appear_split_adjusted`:
 /// per asset, split rows within one day of each other form one cluster; the
 /// best-ranked row (user-modified / MANUAL / CSV / untagged, then latest
-/// update, then id) represents it; the event counts only when the quote
-/// series already looks adjusted around the split date.
-fn adjusted_split_events(
-    facts: &CanonicalFacts,
-    quotes: &QuoteSurface,
-    range: DateRange,
-) -> Vec<SplitEvent> {
+/// update, then id) represents it. `resolve_surfaces` keeps as adjusted the
+/// events whose quote series already looks adjusted around the split date.
+fn split_events(facts: &CanonicalFacts, range: DateRange) -> Vec<SplitEvent> {
     const MERGE_GAP_DAYS: i64 = 1;
     let mut candidates: BTreeMap<&AssetId, Vec<(&crate::model::Activity, Decimal)>> =
         BTreeMap::new();
@@ -456,13 +493,11 @@ fn adjusted_split_events(
             if split_date < range.start || split_date > range.end {
                 continue;
             }
-            if quotes_appear_split_adjusted(&quotes.positive_closes(asset), split_date, ratio) {
-                events.push(SplitEvent {
-                    asset: asset.clone(),
-                    split_date,
-                    ratio,
-                });
-            }
+            events.push(SplitEvent {
+                asset: asset.clone(),
+                split_date,
+                ratio,
+            });
         }
     }
     events.sort_by(|a, b| {

@@ -73,7 +73,8 @@ impl Resolved {
     }
 
     /// The surfaces of one window: its quotes (each asset's last observation
-    /// before the window included) over the whole-range FX and splits.
+    /// before the window included) over the whole-range FX and splits (a
+    /// holdings window starts from a snapshot that may predate it).
     pub fn window_surfaces(
         &self,
         quotes: Vec<engine::model::RawQuote>,
@@ -84,6 +85,7 @@ impl Resolved {
             quotes: engine::QuoteSurface::from_observations(&observations),
             fx: self.surfaces.fx.clone(),
             splits: self.surfaces.splits.clone(),
+            recorded_splits: self.surfaces.recorded_splits.clone(),
         }
     }
 }

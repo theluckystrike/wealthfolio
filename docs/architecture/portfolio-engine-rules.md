@@ -37,13 +37,16 @@ account brings its first snapshot's value (undetermined when not fully priced).
 Fixtures: EDGE-MIX-02, LIFE-EMPTY-01.
 
 **R1.5 Splits are facts about the asset.** A split recorded on any account, a
-holdings account included, applies to every holder of the asset. A transactions
-account's lots split on the split day. A holdings snapshot states quantities as
-of its own date: on any later day, they are multiplied by every split after that
-date up to the day, whether the data provider adjusted its prices or not, and
-the next snapshot is compared with them that way. Prices from before a split
-that the provider adjusted are read back at their unadjusted level. Fixtures:
-EDGE-SPLIT-01, EDGE-SPLIT-02, EDGE-SPLIT-03.
+holdings account included, applies to every holdings account that holds the
+asset, and decides whether the data provider adjusted its prices. A holdings
+snapshot states quantities as of its own date: on any later day, they are
+multiplied by every split after that date up to the day, whether the provider
+adjusted its prices or not, and the next snapshot is compared with them that
+way. Prices from before a split that the provider adjusted are read back at
+their unadjusted level. A transactions account's lots split on the split day of
+a split it records itself (as before): brokers record a split on each account,
+not always on the same day, so another account's row would split its lots twice
+(§7). Fixtures: EDGE-SPLIT-01, EDGE-SPLIT-02, EDGE-SPLIT-03.
 
 ## 2. Transfers
 
@@ -85,9 +88,9 @@ or out (§7). Fixtures: EDGE-MIX-03, EDGE-MIX-05.
   part of its own fee capitalised into those lots. A transfer that only covers
   opens no lot and capitalises nothing: its fee is a charge, not money out.
 - Both legs carry the sender's cost at its historical rates to the base
-  currency, as opened lots do, whether or not a rate exists on the transfer
-  day: the outgoing leg realizes nothing, and a transfer cover's realized P&L in
-  base uses that cost.
+  currency, as opened lots do, whether or not a rate exists on the transfer day:
+  the outgoing leg realizes nothing, and a transfer cover's realized P&L in base
+  uses that cost.
 - Fixtures: EDGE-TXF-15, EDGE-TXF-16, EDGE-TXF-17, EDGE-TXF-18.
 
 **R2.5 Moving a short** is a liability changing hands: sending it is money in,
@@ -163,6 +166,8 @@ account; both owners are invalidated (§5).
   at the next snapshot, as an unrecorded one does (R1.2: activities never change
   a holdings account's numbers).
 - Units in transit between transfer legs are not valued (R4.2).
+- A split recorded on one transactions account does not split another's lots
+  (R1.5): each account records its own.
 
 ## 8. How tests use these rules
 

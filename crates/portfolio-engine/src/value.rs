@@ -178,7 +178,7 @@ fn value_series(
             while active + 1 < keyframes.len() && keyframes[active + 1].date <= day {
                 active += 1;
             }
-            days.push(valuer.value_day(&keyframes[active], day, None));
+            days.push(valuer.value_day(&keyframes[active], day));
         }
 
         // Flows: a holdings account's come only from its snapshots, which
@@ -711,14 +711,11 @@ impl<'a> Valuer<'a> {
         }
     }
 
-    /// Legacy `calculate_valuation_with_price_factors`. `factor_date`
-    /// overrides the split-factor anchor (holdings-transition inference).
-    fn value_day(
-        &mut self,
-        keyframe: &ValuationKeyframe,
-        day: NaiveDate,
-        factor_date: Option<NaiveDate>,
-    ) -> DailyValuation {
+    /// Legacy `calculate_valuation_with_price_factors`. A snapshot states
+    /// quantities as of its own date: on a later day they are carried across
+    /// every split in between (rules R1.5). A projected state's lots are
+    /// already split.
+    fn value_day(&mut self, keyframe: &ValuationKeyframe, day: NaiveDate) -> DailyValuation {
         let policy = &self.resolved.facts.policy;
         let account_currency = self.account_currency.clone();
         let base = self.base().to_string();
@@ -771,11 +768,18 @@ impl<'a> Valuer<'a> {
                 );
                 continue;
             };
+            let quantity_factor = if keyframe.observed {
+                surfaces.split_quantity_factor(asset, keyframe.date, day)
+            } else {
+                Some(Decimal::ONE)
+            };
             let market_value = surfaces
-                .split_price_factor(asset, factor_date.unwrap_or(day))
-                .and_then(|split_factor| {
+                .split_price_factor(asset, day)
+                .zip(quantity_factor)
+                .and_then(|(split_factor, quantity_factor)| {
                     arith::product(&[
                         position.quantity,
+                        quantity_factor,
                         quote.close,
                         factor,
                         split_factor,
@@ -1249,7 +1253,7 @@ impl<'a> Valuer<'a> {
             if prev.date == curr.date || !prev.observed || !curr.observed {
                 continue;
             }
-            let prev_at_curr = self.value_day(prev, curr_date, Some(prev.date));
+            let prev_at_curr = self.value_day(prev, curr_date);
             if prev_at_curr.value_status != ValueStatus::Complete
                 || days[index].value_status != ValueStatus::Complete
             {
