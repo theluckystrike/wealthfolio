@@ -84,9 +84,10 @@ or out (§7). Fixtures: EDGE-MIX-03, EDGE-MIX-05.
   opened, plus the units that covered a short in the receiving account, less the
   part of its own fee capitalised into those lots. A transfer that only covers
   opens no lot and capitalises nothing: its fee is a charge, not money out.
-- Covered units carry the sender's cost at its historical rates to the base
-  currency, as opened lots do, whether or not a rate exists on the transfer day;
-  a transfer cover's realized P&L in base uses that cost.
+- Both legs carry the sender's cost at its historical rates to the base
+  currency, as opened lots do, whether or not a rate exists on the transfer
+  day: the outgoing leg realizes nothing, and a transfer cover's realized P&L in
+  base uses that cost.
 - Fixtures: EDGE-TXF-15, EDGE-TXF-16, EDGE-TXF-17, EDGE-TXF-18.
 
 **R2.5 Moving a short** is a liability changing hands: sending it is money in,

@@ -2078,6 +2078,14 @@ fn p_txf_legs_transfers_carry_their_lots() {
                 })
                 .collect();
             let id = format!("{}: P-TXF-LEGS {}", scenario.id, pair.group_id);
+            // A transfer moves cost and sells nothing: the sender's leg
+            // realizes nothing, in base as in its currency (rules R2.4).
+            // Each row is rounded on its own.
+            let realized_base: Decimal = removed.iter().map(|d| d.realized_pnl_base).sum();
+            assert!(
+                realized_base.abs() <= DUST * Decimal::from(removed.len().max(1)),
+                "{id}: the outgoing leg realizes {realized_base} in base"
+            );
             let sent_units: Decimal = removed.iter().map(|d| d.quantity).sum();
             // Disposals count units after splits; a lot keeps its as-acquired
             // units and its ratio.

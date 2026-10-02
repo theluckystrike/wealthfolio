@@ -1341,7 +1341,8 @@ fn transfer_records(
                 .entry((event.account.clone(), event.source.clone()))
                 .or_insert(Some(Decimal::ZERO));
             for disposal in &own {
-                let known = !disposal.fx_rate_to_base.is_zero() || disposal.proceeds.is_zero();
+                // Base proceeds are zero only when unknown (`record_disposals`).
+                let known = !disposal.proceeds_base.is_zero() || disposal.proceeds.is_zero();
                 let delivered = if disposal.quantity.is_sign_negative() {
                     disposal.proceeds_base.abs()
                 } else {

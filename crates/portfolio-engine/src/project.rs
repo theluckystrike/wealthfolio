@@ -1352,17 +1352,9 @@ impl Projector<'_> {
                 .sum::<Decimal>()
                 .abs();
             // Delivered units carry their own cost in base, at the rates they
-            // were acquired at, as the lots they open do (rules R2.4); `None`
-            // when one has no rate.
-            let cover_proceeds_base = cover_lots
-                .iter()
-                .map(|l| {
-                    let rate = self.lot_rate_to_base(l, position_currency.as_str());
-                    (!rate.is_zero())
-                        .then(|| arith::mul(l.cost_basis, rate))
-                        .flatten()
-                })
-                .sum::<Option<Decimal>>()
+            // were acquired at, as the lots they open do (rules R2.4).
+            let cover_proceeds_base = self
+                .historical_base_cost(&cover_lots, position_currency.as_str())
                 .map(|total| total.abs());
             let reduction = if incoming_negative {
                 reduce_positive_lots_fifo(position, cover_abs)?
@@ -1539,13 +1531,19 @@ impl Projector<'_> {
         };
         let removed = reduction.cost_basis_removed;
         let proceeds = if short { removed.abs() } else { removed };
+        // The leg gives the cost it removed, in base at the rates the lots
+        // were acquired at (rules R2.4, R3.3), so it needs no rate on the
+        // transfer day.
+        let proceeds_base = self
+            .historical_base_cost(&reduction.removed_lots, position_currency.as_str())
+            .map(|total| if short { total.abs() } else { total });
         self.record_reduction(
             &account_id,
             asset,
             event,
             &reduction,
             proceeds,
-            None,
+            proceeds_base,
             &position_currency,
             effects,
             run,
@@ -2103,7 +2101,10 @@ impl Projector<'_> {
             .fx
             .rate(position_currency.as_str(), self.base(), event.date)
             .unwrap_or(Decimal::ZERO);
-        if disposal_rate.is_zero() {
+        // A transfer leg disposes at its lots' cost, at the rates they were
+        // acquired at, so it needs no disposal-day rate (rules R2.4).
+        let proceeds_base_known = total_proceeds_base.is_some() || !disposal_rate.is_zero();
+        if !proceeds_base_known {
             run.diagnostics.push(Diagnostic::warning(
                 DiagnosticCode::FxUnavailable,
                 event.source.as_str(),
@@ -2118,10 +2119,8 @@ impl Projector<'_> {
             )?;
             let cost_basis = lot.cost_basis;
             let acquisition_rate = self.lot_rate_to_base(lot, position_currency.as_str());
-            let base_available = !disposal_rate.is_zero() && !acquisition_rate.is_zero();
+            let base_available = proceeds_base_known && !acquisition_rate.is_zero();
             let proceeds_base = match total_proceeds_base {
-                // Units a transfer delivered to cover the position carry their
-                // cost at the rates they were acquired at (rules R2.4).
                 Some(total) if base_available => checked(
                     arith::proportional(total, effective, total_quantity),
                     "disposal base proceeds",
@@ -2164,6 +2163,19 @@ impl Projector<'_> {
             });
         }
         Ok(())
+    }
+
+    /// The lots' cost in base at the rates they were acquired at; `None`
+    /// when one has no rate.
+    fn historical_base_cost(&self, lots: &[Lot], position_currency: &str) -> Option<Decimal> {
+        lots.iter()
+            .map(|lot| {
+                let rate = self.lot_rate_to_base(lot, position_currency);
+                (!rate.is_zero())
+                    .then(|| arith::mul(lot.cost_basis, rate))
+                    .flatten()
+            })
+            .sum()
     }
 
     fn lot_rate_to_base(&self, lot: &Lot, position_currency: &str) -> Decimal {
