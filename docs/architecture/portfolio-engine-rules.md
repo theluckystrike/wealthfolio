@@ -157,11 +157,16 @@ is `0001-01-01`; `@all` refolds every account from `GENESIS`.
 | Snapshot position | insert, update, delete                                                                            | its old and new snapshots' accounts, each from its snapshot's date                                                                                                                             |
 | Settings          | base currency or time zone inserted, changed, renamed to or from, or deleted                      | `@all`                                                                                                                                                                                         |
 
-An activity's type is its override when the override is not blank, else its
-stored type, wherever it is read. A run consumes a marker only after writing
-what it covers. An account or asset that arrives after facts naming it marks
-itself on insert (rows above), so a run that could not project it yet projects
-it once it exists.
+Everything that decides what the engine reads, or which results to mark stale,
+reads an activity's type as the engine does: its override when the override is
+not blank (blank: empty or only whitespace, as Rust's `str::trim` strips it),
+else its stored type. That covers the engine's facts, core's
+`effective_activity_type`, the triggers and the split query; the activity
+repository's queries and the frontend read it the same way. Other parts of the
+app keep their own type reads until blank overrides are no longer stored (§7). A
+run consumes a marker only after writing what it covers. An account or asset
+that arrives after facts naming it marks itself on insert (rows above), so a run
+that could not project it yet projects it once it exists.
 
 ## 6. Data normalized where written
 
@@ -196,6 +201,10 @@ account; both owners are invalidated (§5).
   others closed before it) shifts that weighting, by a part of the fee (R2.4).
 - A split recorded on one transactions account does not split another's lots
   (R1.5): each account records its own.
+- Some app reads outside the engine's (older service checks on the stored type,
+  the addon SDK's `getEffectiveType` and `hasUserOverride`) still treat a blank
+  type override as a type. A follow-up stores a blank override as none on every
+  write path and clears the ones already stored, so no reader sees one.
 
 ## 8. How tests use these rules
 
