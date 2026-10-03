@@ -10,6 +10,10 @@
 //!   splits recorded since its snapshot (engine rules R1.5): readers get them
 //!   from `SnapshotService` (snapshots) or `HoldingsService` (the asset lot
 //!   view); repositories return them as stored.
+//!
+//! The scan matches calls by name, so it catches a reader that calls a
+//! repository's read method or the lot view directly; it cannot see raw SQL
+//! over the snapshot tables, or code after a file's first `#[cfg(test)]`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -130,13 +134,21 @@ fn every_read_of_holdings_positions_goes_through_the_services_that_carry_splits(
         &[
             ".get_latest_snapshot_before_date(",
             ".get_latest_snapshots_before_date(",
+            ".get_all_latest_snapshots(",
+            ".get_all_non_archived_account_snapshots(",
+            ".get_snapshots_by_account(",
             ".get_snapshot_positions(",
             ".get_snapshot_positions_batch(",
         ],
         &[
             // The reader that carries, and the repository it reads.
             "crates/core/src/portfolio/snapshot/snapshot_service.rs",
+            "crates/core/src/portfolio/snapshot/snapshot_traits.rs",
             "crates/storage-sqlite/src/portfolio/snapshot/repository.rs",
+            // The engine's facts are the stored snapshots: the engine carries.
+            "crates/core/src/portfolio/coordinator/facts.rs",
+            "crates/core/src/portfolio/coordinator/run.rs",
+            "crates/storage-sqlite/src/portfolio/projection/mod.rs",
             // Broker sync compares the broker's positions with the stored ones.
             "crates/connect/src/broker/service.rs",
         ],
