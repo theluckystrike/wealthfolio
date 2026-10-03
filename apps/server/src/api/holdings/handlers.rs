@@ -254,7 +254,7 @@ pub async fn get_asset_lots(
     Query(q): Query<AssetLotsQuery>,
 ) -> ApiResult<Json<Vec<AssetLotView>>> {
     let rows = state
-        .lots_repository
+        .holdings_service
         .get_asset_lot_view(&q.asset_id, q.include_snapshot_positions)
         .await?;
     Ok(Json(rows))

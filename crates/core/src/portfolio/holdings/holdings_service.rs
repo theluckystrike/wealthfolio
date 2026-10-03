@@ -9,7 +9,7 @@ use crate::constants::DECIMAL_PRECISION;
 use crate::errors::{CalculatorError, Error as CoreError, Result};
 use crate::fx::currency::{get_normalization_rule, normalize_currency_code};
 use crate::fx::FxServiceTrait;
-use crate::lots::{LotRecord, LotRepositoryTrait};
+use crate::lots::{AssetLotView, LotRecord, LotRepositoryTrait};
 use crate::portfolio::economic_events::ActivityEconomicsResolver;
 use crate::portfolio::holdings::holdings_model::{Holding, HoldingType, Instrument, MonetaryValue};
 use crate::portfolio::snapshot::{self, SnapshotServiceTrait};
@@ -28,6 +28,16 @@ use super::HoldingsValuationServiceTrait;
 #[async_trait]
 pub trait HoldingsServiceTrait: Send + Sync {
     async fn get_holdings(&self, account_id: &str, base_currency: &str) -> Result<Vec<Holding>>;
+
+    /// An asset's lot view: its transaction lots and, when asked, each
+    /// holdings account's latest snapshot position, read today (carried
+    /// across the splits recorded since, engine rules R1.5). The one entry
+    /// to the lot view: the lot repository returns positions as stored.
+    async fn get_asset_lot_view(
+        &self,
+        asset_id: &str,
+        include_snapshot_positions: bool,
+    ) -> Result<Vec<AssetLotView>>;
 
     async fn get_holdings_with_options(
         &self,
@@ -1272,6 +1282,24 @@ mod expired_option_metadata_tests {
 
 #[async_trait]
 impl HoldingsServiceTrait for HoldingsService {
+    async fn get_asset_lot_view(
+        &self,
+        asset_id: &str,
+        include_snapshot_positions: bool,
+    ) -> Result<Vec<AssetLotView>> {
+        let Some(lot_repository) = &self.lot_repository else {
+            return Err(CoreError::Unexpected(
+                "the asset lot view needs the lot repository".to_string(),
+            ));
+        };
+        let mut rows = lot_repository
+            .get_asset_lot_view(asset_id, include_snapshot_positions)
+            .await?;
+        self.snapshot_service
+            .carry_lot_view_rows(&mut rows, self.today_in_user_timezone())?;
+        Ok(rows)
+    }
+
     async fn get_holdings(&self, account_id: &str, base_currency: &str) -> Result<Vec<Holding>> {
         self.get_holdings_with_options(account_id, base_currency, false)
             .await
@@ -1976,6 +2004,14 @@ mod tests {
             _day: NaiveDate,
         ) -> Result<HashMap<String, AccountStateSnapshot>> {
             Ok(HashMap::new())
+        }
+
+        fn carry_lot_view_rows(
+            &self,
+            _rows: &mut [crate::lots::AssetLotView],
+            _day: NaiveDate,
+        ) -> Result<()> {
+            Ok(())
         }
 
         async fn save_manual_snapshot(

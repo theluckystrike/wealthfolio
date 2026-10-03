@@ -658,6 +658,14 @@ pub struct MockHoldingsService {
 
 #[async_trait]
 impl HoldingsServiceTrait for MockHoldingsService {
+    async fn get_asset_lot_view(
+        &self,
+        _asset_id: &str,
+        _include_snapshot_positions: bool,
+    ) -> CoreResult<Vec<wealthfolio_core::lots::AssetLotView>> {
+        Ok(Vec::new())
+    }
+
     async fn get_holdings(
         &self,
         _account_id: &str,

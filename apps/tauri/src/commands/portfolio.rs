@@ -344,7 +344,7 @@ pub async fn get_asset_lots(
     let context = state.context()?;
     debug!("Get lot view rows for asset {}", asset_id);
     context
-        .lots_repository
+        .holdings_service()
         .get_asset_lot_view(&asset_id, include_snapshot_positions)
         .await
         .map_err(|e| e.to_string())

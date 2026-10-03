@@ -104,6 +104,14 @@ mod tests {
             Ok(HashMap::new())
         }
 
+        fn carry_lot_view_rows(
+            &self,
+            _rows: &mut [crate::lots::AssetLotView],
+            _day: NaiveDate,
+        ) -> Result<()> {
+            Ok(())
+        }
+
         async fn save_manual_snapshot(
             &self,
             _account_id: &str,

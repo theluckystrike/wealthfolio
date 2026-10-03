@@ -195,13 +195,18 @@ first after it, however far away. Window invariance (P-WIN) makes a windowed run
 equal to one run over the range, and the app parity law (§5) holds the
 coordinator and the read path to the same answer.
 
-**Snapshot reads.** Services outside the engine that read positions (holdings,
-account values, net worth) read them through `SnapshotService`
-(`get_latest_snapshots_as_of`, `get_latest_holdings_snapshot`): a holdings
-account's snapshot read on a later day has its quantities carried across the
-splits recorded since its date, with the engine's own grouping (`SplitRow`,
-`group_splits`, rules R1.5), so every screen agrees with the stored valuations.
-Stored snapshots stay as entered.
+**Snapshot reads.** Repositories return snapshot positions as stored. Every
+reader that shows or values a holdings account's positions on a later day gets
+them through `SnapshotService` (`get_latest_snapshots_as_of`,
+`get_latest_holdings_snapshot`: holdings, account values, net worth) or
+`HoldingsService::get_asset_lot_view` (the asset page's lots), which carry the
+quantities across the splits recorded since the snapshot's date with the
+engine's own grouping (`SplitRow`, `group_splits`, rules R1.5), so every screen
+agrees with the stored valuations. Readers that need what was entered (the
+snapshot history and edit views, broker sync, the engine's facts, import
+validation) or only whether an asset is held read the stored rows. The
+`read_contracts` tests in the storage crate fail on a new reader that bypasses
+these services.
 
 **Completion.** After the last window a run commits, in one transaction, the lot
 books of the refolded accounts (open lots and lots closed since the stale day),

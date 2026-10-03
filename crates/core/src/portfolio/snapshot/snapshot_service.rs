@@ -18,6 +18,7 @@ use crate::accounts::{Account, AccountRepositoryTrait, TrackingMode};
 use crate::activities::ActivityRepositoryTrait;
 use crate::errors::{Error, Result};
 use crate::events::{DomainEvent, DomainEventSink, NoOpDomainEventSink};
+use crate::lots::{AssetLotSource, AssetLotView};
 use crate::portfolio::coordinator::raw_activity;
 use crate::utils::time_utils::{parse_user_timezone_or_default, user_today};
 use wealthfolio_portfolio_engine as engine;
@@ -72,6 +73,11 @@ pub trait SnapshotServiceTrait: Send + Sync {
         day: NaiveDate,
     ) -> Result<HashMap<String, AccountStateSnapshot>>;
 
+    /// Carries the snapshot rows of an asset's lot view, read on `day`, as
+    /// [`Self::get_latest_snapshots_as_of`] carries snapshots: units multiply
+    /// by the splits recorded since the snapshot's date, unit costs divide.
+    fn carry_lot_view_rows(&self, rows: &mut [AssetLotView], day: NaiveDate) -> Result<()>;
+
     /// Saves a manual snapshot for the given account.
     /// - The snapshot's source is preserved from the input (e.g., ManualEntry or CsvImport).
     /// - If a snapshot exists for the same date, it is updated in place.
@@ -125,6 +131,53 @@ pub struct SnapshotService {
     event_sink: Arc<dyn DomainEventSink>,
 }
 
+/// What [`SnapshotService`] carries holdings positions across (engine rules
+/// R1.5).
+#[derive(Default)]
+struct SplitCarry {
+    holdings: HashSet<String>,
+    splits: Vec<engine::SplitEvent>,
+}
+
+impl SplitCarry {
+    /// The factor of the splits after `as_of` up to `day` for `asset` held
+    /// by `account`: one for an account that is not a holdings account (its
+    /// lots are already split); `None` when out of range.
+    fn factor(
+        &self,
+        account: &str,
+        asset: &str,
+        as_of: NaiveDate,
+        day: NaiveDate,
+    ) -> Option<Decimal> {
+        if !self.holdings.contains(account) {
+            return Some(Decimal::ONE);
+        }
+        engine::split_quantity_factor(
+            &self.splits,
+            &engine::model::AssetId::new(asset),
+            as_of,
+            day,
+        )
+    }
+}
+
+/// A quantity and its unit cost carried by `factor`: units multiply, unit
+/// cost divides, total cost is unchanged. `None` when out of range.
+fn carried(
+    quantity: Decimal,
+    unit_cost: Decimal,
+    factor: Option<Decimal>,
+) -> Option<(Decimal, Decimal)> {
+    match factor? {
+        factor if factor == Decimal::ONE => Some((quantity, unit_cost)),
+        factor => Some((
+            quantity.checked_mul(factor)?,
+            unit_cost.checked_div(factor)?,
+        )),
+    }
+}
+
 impl SnapshotService {
     pub fn new(
         timezone: Arc<RwLock<String>>,
@@ -141,18 +194,27 @@ impl SnapshotService {
         }
     }
 
-    /// Carries holdings accounts' snapshot quantities to `day` across the
-    /// splits recorded after each snapshot's date (engine rules R1.5), with
-    /// the engine's own split grouping. Total cost is unchanged, so the
-    /// average cost per unit moves the other way.
-    fn carry_splits(
+    /// The splits a read on `day` carries holdings positions across (engine
+    /// rules R1.5): those of the assets `held` by holdings accounts as of an
+    /// earlier day, `(account, asset, as_of)`, grouped as the engine groups
+    /// them.
+    fn split_carry<'a>(
         &self,
-        snapshots: &mut HashMap<String, AccountStateSnapshot>,
+        held: impl IntoIterator<Item = (&'a str, &'a str, NaiveDate)>,
         day: NaiveDate,
-    ) -> Result<()> {
-        let account_ids: Vec<String> = snapshots.keys().cloned().collect();
+    ) -> Result<SplitCarry> {
+        let held: Vec<(&str, &str, NaiveDate)> = held
+            .into_iter()
+            .filter(|(_, _, as_of)| *as_of < day)
+            .collect();
+        let account_ids: Vec<String> = held
+            .iter()
+            .map(|(account, _, _)| account.to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         if account_ids.is_empty() {
-            return Ok(());
+            return Ok(SplitCarry::default());
         }
         let holdings: HashSet<String> = self
             .account_repository
@@ -161,17 +223,15 @@ impl SnapshotService {
             .filter(|account| account.tracking_mode == TrackingMode::Holdings)
             .map(|account| account.id)
             .collect();
-        let assets: Vec<String> = snapshots
-            .values()
-            .filter(|snapshot| {
-                holdings.contains(&snapshot.account_id) && snapshot.snapshot_date < day
-            })
-            .flat_map(|snapshot| snapshot.positions.keys().cloned())
+        let assets: Vec<String> = held
+            .iter()
+            .filter(|(account, _, _)| holdings.contains(*account))
+            .map(|(_, asset, _)| asset.to_string())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
         if assets.is_empty() {
-            return Ok(());
+            return Ok(SplitCarry::default());
         }
         let timezone = parse_user_timezone_or_default(&self.timezone.read().unwrap());
         let splits = engine::group_splits(
@@ -181,24 +241,36 @@ impl SnapshotService {
                 .map(raw_activity)
                 .filter_map(|raw| engine::SplitRow::from_raw(&raw, &timezone)),
         );
-        for snapshot in snapshots
-            .values_mut()
-            .filter(|snapshot| holdings.contains(&snapshot.account_id))
-        {
+        Ok(SplitCarry { holdings, splits })
+    }
+
+    /// Carries holdings accounts' snapshot quantities to `day`.
+    fn carry_splits(
+        &self,
+        snapshots: &mut HashMap<String, AccountStateSnapshot>,
+        day: NaiveDate,
+    ) -> Result<()> {
+        let carry = self.split_carry(
+            snapshots.values().flat_map(|snapshot| {
+                snapshot.positions.keys().map(|asset| {
+                    (
+                        snapshot.account_id.as_str(),
+                        asset.as_str(),
+                        snapshot.snapshot_date,
+                    )
+                })
+            }),
+            day,
+        )?;
+        for snapshot in snapshots.values_mut() {
             for position in snapshot.positions.values_mut() {
-                let asset = engine::model::AssetId::new(position.asset_id.as_str());
-                let factor =
-                    engine::split_quantity_factor(&splits, &asset, snapshot.snapshot_date, day);
-                if factor == Some(Decimal::ONE) {
-                    continue;
-                }
-                let carried = factor.and_then(|factor| {
-                    Some((
-                        position.quantity.checked_mul(factor)?,
-                        position.average_cost.checked_div(factor)?,
-                    ))
-                });
-                match carried {
+                let factor = carry.factor(
+                    &snapshot.account_id,
+                    &position.asset_id,
+                    snapshot.snapshot_date,
+                    day,
+                );
+                match carried(position.quantity, position.average_cost, factor) {
                     Some((quantity, average_cost)) => {
                         position.quantity = quantity;
                         position.average_cost = average_cost;
@@ -482,6 +554,43 @@ impl SnapshotServiceTrait for SnapshotService {
         }
         self.carry_splits(&mut snapshots, day)?;
         Ok(snapshots)
+    }
+
+    fn carry_lot_view_rows(&self, rows: &mut [AssetLotView], day: NaiveDate) -> Result<()> {
+        let as_of = |row: &AssetLotView| {
+            (row.source == AssetLotSource::SnapshotPosition)
+                .then_some(row.snapshot_date.as_deref())
+                .flatten()
+                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+        };
+        let carry = self.split_carry(
+            rows.iter().filter_map(|row| {
+                as_of(row).map(|as_of| (row.account_id.as_str(), row.asset_id.as_str(), as_of))
+            }),
+            day,
+        )?;
+        for row in rows.iter_mut() {
+            let Some(as_of) = as_of(row) else {
+                continue;
+            };
+            let factor = carry.factor(&row.account_id, &row.asset_id, as_of, day);
+            let quantity = carried(row.quantity, row.unit_cost, factor);
+            let valuation_unit_cost = carried(row.quantity, row.valuation_unit_cost, factor);
+            match quantity.zip(valuation_unit_cost) {
+                Some(((quantity, unit_cost), (_, valuation_unit_cost))) => {
+                    row.quantity = quantity;
+                    row.original_quantity = quantity;
+                    row.remaining_quantity = quantity;
+                    row.unit_cost = unit_cost;
+                    row.valuation_unit_cost = valuation_unit_cost;
+                }
+                None => warn!(
+                    "Split factor for {} in lot row {} is out of range; quantities read as stored",
+                    row.asset_id, row.id
+                ),
+            }
+        }
+        Ok(())
     }
 
     async fn save_manual_snapshot(

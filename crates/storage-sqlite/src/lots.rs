@@ -1508,6 +1508,71 @@ mod tests {
         assert_eq!(snapshot_row.snapshot_date.as_deref(), Some("2026-05-20"));
     }
 
+    /// Engine rules R1.5: the repository returns snapshot positions as
+    /// stored; read today through the snapshot service (as the holdings
+    /// service's lot view does), they are carried across the splits since.
+    #[tokio::test]
+    async fn asset_lot_view_snapshot_rows_read_today_carry_later_splits() {
+        use crate::accounts::AccountRepository;
+        use crate::activities::ActivityRepository;
+        use crate::portfolio::snapshot::SnapshotRepository;
+        use diesel::connection::SimpleConnection;
+        use std::sync::RwLock;
+        use wealthfolio_core::portfolio::snapshot::{SnapshotService, SnapshotServiceTrait};
+
+        std::env::set_var("CONNECT_API_URL", "http://test.local");
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        run_migrations(&db_path).unwrap();
+        let pool = create_pool(&db_path).unwrap();
+        let writer = spawn_writer((*pool).clone()).unwrap();
+        insert_account_with_tracking_mode(&pool, "acc_holdings", "HOLDINGS");
+        insert_asset(&pool, "X");
+        let mut conn = get_connection(&pool).unwrap();
+        conn.batch_execute(
+            "INSERT INTO holdings_snapshots (id, account_id, snapshot_date, currency, positions, \
+             cash_balances, cost_basis, net_contribution, calculated_at, net_contribution_base, \
+             cash_total_account_currency, cash_total_base_currency, source) \
+             VALUES ('snap', 'acc_holdings', '2025-01-01', 'USD', '{}', '{}', '1000', '0', \
+             '2025-01-01T12:00:00Z', '0', '0', '0', 'MANUAL_ENTRY'); \
+             INSERT INTO snapshot_positions (snapshot_id, asset_id, quantity, average_cost, \
+             total_cost_basis, currency, inception_date, is_alternative, contract_multiplier, \
+             created_at, last_updated) \
+             VALUES ('snap', 'X', '10', '100', '1000', 'USD', '2025-01-01T12:00:00Z', 0, '1', \
+             '2025-01-01T12:00:00Z', '2025-01-01T12:00:00Z'); \
+             INSERT INTO activities (id, account_id, asset_id, activity_type, activity_date, \
+             amount, currency, status, created_at, updated_at) \
+             VALUES ('split', 'acc_holdings', 'X', 'SPLIT', '2025-01-03T12:00:00Z', '2', 'USD', \
+             'POSTED', '2025-01-03T12:00:00Z', '2025-01-03T12:00:00Z');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let repo = LotsRepository::new(Arc::clone(&pool), writer.clone());
+        let mut rows = repo.get_asset_lot_view("X", true).await.unwrap();
+        let held = |rows: &[AssetLotView]| {
+            rows.iter()
+                .map(|row| (row.quantity, row.unit_cost, row.cost_basis))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(held(&rows), vec![(dec("10"), dec("100"), dec("1000"))]);
+
+        let snapshots = SnapshotService::new(
+            Arc::new(RwLock::new("UTC".to_string())),
+            Arc::new(AccountRepository::new(Arc::clone(&pool), writer.clone())),
+            Arc::new(SnapshotRepository::new(Arc::clone(&pool), writer.clone())),
+            Arc::new(ActivityRepository::new(Arc::clone(&pool), writer.clone())),
+        );
+        snapshots
+            .carry_lot_view_rows(&mut rows, NaiveDate::from_ymd_opt(2025, 1, 5).unwrap())
+            .unwrap();
+        assert_eq!(held(&rows), vec![(dec("20"), dec("50"), dec("1000"))]);
+        assert_eq!(
+            (rows[0].remaining_quantity, rows[0].valuation_unit_cost),
+            (dec("20"), dec("50"))
+        );
+    }
+
     #[tokio::test]
     async fn asset_lot_view_normalizes_snapshot_position_quote_unit_currency() {
         let (repo, pool, _dir) = setup().await;
