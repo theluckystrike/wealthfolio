@@ -25,6 +25,20 @@ describe("effective activity type", () => {
     expect(hasUserOverride({ activityType: "BUY", activityTypeOverride: "SELL" })).toBe(true);
   });
 
+  it("reads every shared case as the backend does", () => {
+    const cases = JSON.parse(
+      readFileSync(
+        join(SOURCE_ROOT, "../../../crates/core/src/activities/type_override_cases.json"),
+        "utf8",
+      ),
+    ) as [string, string][];
+    for (const [override, expected] of cases) {
+      expect(getEffectiveType({ activityType: "DIVIDEND", activityTypeOverride: override })).toBe(
+        expected,
+      );
+    }
+  });
+
   it("is read only through getEffectiveType and hasUserOverride", () => {
     const rawRead = /activityTypeOverride\s*(\?\?|\|\||!==|===)/;
     const violations = sourceFiles(SOURCE_ROOT)

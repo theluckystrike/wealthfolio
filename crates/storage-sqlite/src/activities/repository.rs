@@ -281,13 +281,18 @@ fn effective_activity_type(activity: &ActivityDB) -> &str {
     )
 }
 
+/// The characters Rust's `str::trim` strips (Unicode White_Space), as a
+/// SQLite list, so SQL and Rust agree on what a blank override is. The
+/// projection triggers trim the same list.
+pub(crate) const SQL_WHITESPACE: &str = "char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)";
+
 /// An activity's effective type in SQL, `table` naming the activities table:
 /// its override when not blank, else its stored type, as core's
 /// `effective_activity_type` and the engine read it (engine rules §5). Every
 /// query reads the type through this.
 pub(crate) fn effective_type_sql(table: &str) -> String {
     format!(
-        "COALESCE(NULLIF(TRIM({table}.activity_type_override, char(32, 9, 10, 13)), ''), {table}.activity_type)"
+        "COALESCE(NULLIF(TRIM({table}.activity_type_override, {SQL_WHITESPACE}), ''), {table}.activity_type)"
     )
 }
 
@@ -4835,6 +4840,64 @@ mod tests {
             rows.iter().map(|row| row.amount).sum::<Decimal>(),
             Decimal::from(7)
         );
+    }
+
+    /// Engine rules §5: SQL reads every override in core's shared cases as
+    /// core and the engine do, in the repository's queries and the triggers.
+    #[test]
+    fn sql_reads_type_overrides_as_core_does() {
+        use diesel::Connection;
+        // The SQL list is exactly what Rust's `str::trim` strips.
+        let listed: Vec<u32> = SQL_WHITESPACE
+            .trim_start_matches("char(")
+            .trim_end_matches(')')
+            .split(',')
+            .map(|code| code.trim().parse().unwrap())
+            .collect();
+        let rust: Vec<u32> = (0..=0x10FFFF)
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_whitespace())
+            .map(u32::from)
+            .collect();
+        assert_eq!(listed, rust);
+        // The triggers trim that list too.
+        let triggers = include_str!("../../migrations/2026-09-28-000001_projection_state/up.sql");
+        assert_eq!(
+            triggers.matches("trim(").count(),
+            triggers.matches(&format!(", {SQL_WHITESPACE})")).count()
+        );
+
+        let cases: Vec<(String, String)> = serde_json::from_str(include_str!(
+            "../../../core/src/activities/type_override_cases.json"
+        ))
+        .unwrap();
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        diesel::sql_query(
+            "CREATE TABLE activities (activity_type TEXT, activity_type_override TEXT)",
+        )
+        .execute(&mut conn)
+        .unwrap();
+        #[derive(QueryableByName)]
+        struct Type {
+            #[diesel(sql_type = Text)]
+            effective: String,
+        }
+        for (override_, expected) in cases {
+            diesel::sql_query("DELETE FROM activities")
+                .execute(&mut conn)
+                .unwrap();
+            diesel::sql_query("INSERT INTO activities VALUES ('DIVIDEND', ?)")
+                .bind::<Text, _>(&override_)
+                .execute(&mut conn)
+                .unwrap();
+            let read = diesel::sql_query(format!(
+                "SELECT {} AS effective FROM activities",
+                effective_type_sql("activities")
+            ))
+            .get_result::<Type>(&mut conn)
+            .unwrap();
+            assert_eq!(read.effective, expected, "{override_:?}");
+        }
     }
 
     #[tokio::test]

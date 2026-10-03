@@ -179,11 +179,19 @@ interface TypedActivity {
 }
 
 /**
+ * What Rust's `str::trim` strips (Unicode White_Space), at either end. The
+ * backend reads a blank override with that set; JavaScript's `trim()`
+ * differs (it strips U+FEFF and keeps U+0085).
+ */
+const OVERRIDE_PADDING =
+  /^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g;
+
+/**
  * The user's type override, when it is not blank: a blank override is none,
  * as the backend and the portfolio engine read it.
  */
 function typeOverride(activity: TypedActivity): string | undefined {
-  return activity.activityTypeOverride?.trim() || undefined;
+  return activity.activityTypeOverride?.replace(OVERRIDE_PADDING, "") || undefined;
 }
 
 /**
