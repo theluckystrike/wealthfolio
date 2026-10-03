@@ -483,7 +483,7 @@ fn asset_facts(id: &AssetId, asset: &RawAsset, diagnostics: &mut Vec<Diagnostic>
 /// Why an activity's magnitudes cannot be computed with, if they cannot
 /// (architecture §4.3): a value above `MAX_MAGNITUDE`, or a supplied rate
 /// whose inverse would be.
-fn activity_out_of_range(raw: &RawActivity) -> Option<String> {
+pub(crate) fn activity_out_of_range(raw: &RawActivity) -> Option<String> {
     let fields = [
         ("quantity", raw.quantity),
         ("unit_price", raw.unit_price),
@@ -930,8 +930,13 @@ mod tests {
             quantity: Some(dec!(4)),
             ..split("s4", "2025-01-20T15:00:00Z", "y")
         };
+        // Rejected whole, as normalize rejects it.
+        let out_of_range = RawActivity {
+            fee: Some(Decimal::MAX),
+            ..split("s5", "2025-02-10T15:00:00Z", "z")
+        };
         let buy = activity("b1", "a1", "BUY", "2025-01-05T15:00:00Z");
-        let rows = vec![user, provider, draft, by_quantity, buy];
+        let rows = vec![user, provider, draft, by_quantity, out_of_range, buy];
 
         let stored: Vec<SplitRow> = rows
             .iter()

@@ -290,7 +290,7 @@ mod tests {
 use crate::model::{
     Activity, ActivityKind, AssetId, CanonicalFacts, DateRange, QuoteObservation, RawActivity,
 };
-use crate::normalize::{effective_type, is_posted, local_date};
+use crate::normalize::{activity_out_of_range, effective_type, is_posted, local_date};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 
@@ -435,10 +435,11 @@ pub struct SplitRow {
 
 impl SplitRow {
     /// A stored activity read as `normalize` reads it, when it is a posted
-    /// split of an asset with a positive ratio: dated in `timezone`, its
-    /// ratio its amount, else its quantity.
+    /// split of an asset with a positive ratio and every value in range:
+    /// dated in `timezone`, its ratio its amount, else its quantity.
     pub fn from_raw(raw: &RawActivity, timezone: &Tz) -> Option<Self> {
         if !is_posted(&raw.status)
+            || activity_out_of_range(raw).is_some()
             || ActivityKind::parse(effective_type(raw)) != Some(ActivityKind::Split)
         {
             return None;
