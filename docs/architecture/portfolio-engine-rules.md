@@ -191,6 +191,9 @@ account; both owners are invalidated (§5).
   rows recording one split more than a day apart count as two (R1.5).
 - A split is entered on a holdings account with the activity form; importing a
   CSV from a holdings account imports snapshots.
+- A transfer's fee comes off its flow at the opened lots' rates weighted by
+  their units today: a later split that reaches only some of those lots (the
+  others closed before it) shifts that weighting, by a part of the fee (R2.4).
 - A split recorded on one transactions account does not split another's lots
   (R1.5): each account records its own.
 
