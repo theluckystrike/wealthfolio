@@ -2,6 +2,7 @@ import { createGoal, deleteGoal, getGoals, updateGoal } from "@/adapters";
 import { QueryKeys } from "@/lib/query-keys";
 import type { Goal, NewGoal } from "@/lib/types";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 export function useGoals() {
@@ -32,6 +33,7 @@ export function useGoals() {
 }
 
 export function useGoalMutations() {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
 
   const invalidate = () => {
@@ -42,9 +44,9 @@ export function useGoalMutations() {
     mutationFn: (goal: NewGoal) => createGoal(goal),
     onSuccess: () => {
       invalidate();
-      toast.success("Goal created successfully.");
+      toast.success(t("goals:goal_saved"));
     },
-    onError: () => toast.error("Failed to create goal."),
+    onError: () => toast.error(t("goals:goal_error")),
   });
 
   const updateMutation = useMutation({
@@ -52,18 +54,18 @@ export function useGoalMutations() {
     onSuccess: (_, goal) => {
       invalidate();
       queryClient.invalidateQueries({ queryKey: QueryKeys.goal(goal.id) });
-      toast.success("Goal updated successfully.");
+      toast.success(t("goals:goal_saved"));
     },
-    onError: () => toast.error("Failed to update goal."),
+    onError: () => toast.error(t("goals:goal_error")),
   });
 
   const deleteMutation = useMutation({
     mutationFn: (goalId: string) => deleteGoal(goalId),
     onSuccess: () => {
       invalidate();
-      toast.success("Goal deleted successfully.");
+      toast.success(t("goals:goal_deleted"));
     },
-    onError: () => toast.error("Failed to delete goal."),
+    onError: () => toast.error(t("goals:goal_delete_error")),
   });
 
   return { createMutation, updateMutation, deleteMutation };
